@@ -1,0 +1,7 @@
+---
+source: crates/cockpit-terminal/tests/golden_path_detect.rs
+expression: "snapshot(\"test-failure.txt\")"
+---
+fixture: test-failure.txt
+matches:
+  - path=crates/cockpit-terminal/src/path_detect.rs line=142 col=9 span=247..295

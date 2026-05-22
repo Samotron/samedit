@@ -1,0 +1,13 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"delete_line\", \"one\\ntwo\\nthree\", &chars(\"jdd\"))"
+---
+case:   delete_line
+start:  "one\ntwo\nthree"
+keys:   j d d
+mode:   Normal
+cursor: 1:0
+dirty:  true
+buffer:
+  | one
+  | ‸three

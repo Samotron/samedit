@@ -1,0 +1,16 @@
+[tools]
+rust = "1.95.0"
+
+[tasks.test]
+description = "Run tests"
+run = "cargo test --workspace"
+
+[tasks.lint]
+description = "Run clippy"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[metadata.cockpit]
+name = "Mise Basic"
+default_task = "test"
+terminal_workspace = "zellij"
+zellij_layout = ".config/zellij/dev.kdl"

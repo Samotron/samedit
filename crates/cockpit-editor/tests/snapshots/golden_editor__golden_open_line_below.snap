@@ -1,0 +1,14 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"open_line_below\", \"first\\nlast\", &keys)"
+---
+case:   open_line_below
+start:  "first\nlast"
+keys:   o n e w   l i n e <Esc>
+mode:   Normal
+cursor: 1:8
+dirty:  true
+buffer:
+  | first
+  | new line‸
+  | last

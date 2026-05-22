@@ -1,0 +1,12 @@
+# Build artifacts
+/target
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# insta pending snapshots
+*.pending-snap
+*.snap.new
+
+.antigravitycli/

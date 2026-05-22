@@ -1,0 +1,41 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"normal_motions\", &chars(\"hjklwbe0^$G\"))"
+---
+case: normal_motions
+start_mode: Normal
+steps:
+  - key: Char('h')
+    actions:
+      - MoveLeft
+  - key: Char('j')
+    actions:
+      - MoveLine(Down)
+  - key: Char('k')
+    actions:
+      - MoveLine(Up)
+  - key: Char('l')
+    actions:
+      - MoveRight
+  - key: Char('w')
+    actions:
+      - MoveWordForward
+  - key: Char('b')
+    actions:
+      - MoveWordBackward
+  - key: Char('e')
+    actions:
+      - MoveWordEnd
+  - key: Char('0')
+    actions:
+      - MoveLineStart
+  - key: Char('^')
+    actions:
+      - MoveFirstNonWhitespace
+  - key: Char('$')
+    actions:
+      - MoveLineEnd
+  - key: Char('G')
+    actions:
+      - MoveFileEnd
+final_mode: Normal

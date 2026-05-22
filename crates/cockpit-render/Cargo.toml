@@ -1,0 +1,18 @@
+[package]
+name = "cockpit-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "winit + glow windowing and rendering for Coding Cockpit."
+
+[dependencies]
+cockpit-commands.workspace = true
+cosmic-text = "0.19.0"
+etagere = "0.3.0"
+glow = "0.17.0"
+thiserror = "2.0.18"
+winit = "0.30.5"
+glutin = "0.32.1"
+glutin-winit = "0.5.0"
+raw-window-handle = "0.6.2"

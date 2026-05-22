@@ -1,0 +1,19 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"command_wq\", &keys)"
+---
+case: command_wq
+start_mode: Normal
+steps:
+  - key: Char(':')
+    actions:
+      - EnterMode(Command)
+  - key: Char('w')
+    actions: []
+  - key: Char('q')
+    actions: []
+  - key: Enter
+    actions:
+      - EnterMode(Normal)
+      - AppCommand(SaveQuit)
+final_mode: Normal

@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "tests/test_api.py", line 120, in test_create_user
+    assert response.status_code == 201
+AssertionError: assert 500 == 201

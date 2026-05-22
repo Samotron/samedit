@@ -1,0 +1,13 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"yank_and_paste\", \"duplicate\", &chars(\"yyp\"))"
+---
+case:   yank_and_paste
+start:  "duplicate"
+keys:   y y p
+mode:   Normal
+cursor: 1:0
+dirty:  true
+buffer:
+  | duplicate
+  | ‸duplicate

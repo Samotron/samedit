@@ -1,0 +1,15 @@
+---
+source: crates/cockpit-ui/tests/golden_palette.rs
+expression: "snapshot(\"rt\")"
+---
+query: "rt"
+matches: 9
+  - [200] File: Reveal in Tree (file.reveal)
+  - [200] Mise: Run Task (mise.run_task)
+  - [ 99] Project: Open Project (project.open)
+  - [ 99] Project: Recent Projects (project.recent)
+  - [ 99] Project: Close Project (project.close)
+  - [ 98] Terminal: Restart Zellij (terminal.restart_zellij)
+  - [ 95] Editor: Toggle Relative Line Numbers (editor.toggle_relative_line_numbers)
+  - [ 94] Test: Run Current File (test.run_current_file)
+  - [ 94] Test: Run Nearest (test.run_nearest)

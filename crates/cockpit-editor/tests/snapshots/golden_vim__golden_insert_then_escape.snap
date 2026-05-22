@@ -1,0 +1,26 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"insert_then_escape\", &keys)"
+---
+case: insert_then_escape
+start_mode: Normal
+steps:
+  - key: Char('i')
+    actions:
+      - EnterMode(Insert)
+  - key: Char('h')
+    actions:
+      - InsertChar('h')
+  - key: Char('i')
+    actions:
+      - InsertChar('i')
+  - key: Enter
+    actions:
+      - InsertChar('\n')
+  - key: Char('!')
+    actions:
+      - InsertChar('!')
+  - key: Escape
+    actions:
+      - EnterMode(Normal)
+final_mode: Normal

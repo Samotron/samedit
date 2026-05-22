@@ -1,0 +1,10 @@
+---
+source: crates/cockpit-ui/tests/golden_palette.rs
+expression: "snapshot(\"term\")"
+---
+query: "term"
+matches: 4
+  - [300] Terminal: Focus (terminal.focus)
+  - [300] Terminal: Restart Zellij (terminal.restart_zellij)
+  - [300] Terminal: New Zellij Session (terminal.new_zellij_session)
+  - [ 97] Editor: Toggle Relative Line Numbers (editor.toggle_relative_line_numbers)

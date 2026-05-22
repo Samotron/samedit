@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"search_jumps_to_match\", \"one two three\", &keys)"
+---
+case:   search_jumps_to_match
+start:  "one two three"
+keys:   / t h r e e <CR>
+mode:   Normal
+cursor: 0:8
+dirty:  false
+buffer:
+  | one two ‸three

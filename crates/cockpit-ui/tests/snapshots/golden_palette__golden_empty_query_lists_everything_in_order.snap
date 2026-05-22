@@ -1,0 +1,23 @@
+---
+source: crates/cockpit-ui/tests/golden_palette.rs
+expression: "snapshot(\"\")"
+---
+query: ""
+matches: 17
+  - [  0] Project: Open Project (project.open)
+  - [  0] Project: Recent Projects (project.recent)
+  - [  0] Project: Close Project (project.close)
+  - [  0] File: Open (file.open)
+  - [  0] File: Save (file.save)
+  - [  0] File: Reveal in Tree (file.reveal)
+  - [  0] Editor: Toggle Relative Line Numbers (editor.toggle_relative_line_numbers)
+  - [  0] Terminal: Focus (terminal.focus)
+  - [  0] Terminal: Restart Zellij (terminal.restart_zellij)
+  - [  0] Terminal: New Zellij Session (terminal.new_zellij_session)
+  - [  0] Mise: Run Task (mise.run_task)
+  - [  0] Mise: Install Tools (mise.install_tools)
+  - [  0] Mise: Open Config (mise.open_config)
+  - [  0] Mise: Show Tools (mise.show_tools)
+  - [  0] Test: Run All (test.run_all)
+  - [  0] Test: Run Current File (test.run_current_file)
+  - [  0] Test: Run Nearest (test.run_nearest)

@@ -1,0 +1,63 @@
+# Coding Cockpit — single task runner.
+#
+# The Rust toolchain itself is pinned in `rust-toolchain.toml`, which rustup
+# reads automatically — that is the single source of truth for the compiler.
+#
+# Every developer workflow goes through `mise run <task>`. There is no
+# `justfile`; mise is the only task runner.
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build --workspace"
+
+[tasks.run]
+description = "Run the app (pass extra args after --)"
+run = "cargo run -p cockpit --"
+
+[tasks.run-fixture]
+description = "Run the app against a bundled fixture project (mise run run-fixture -- <name>)"
+run = "cargo run -p cockpit -- --fixture"
+
+[tasks.test]
+description = "Run all fast tests"
+run = "cargo test --workspace"
+
+[tasks.test-unit]
+description = "Run library unit tests only"
+run = "cargo test --workspace --lib"
+
+[tasks.test-golden]
+description = "Run golden/snapshot tests"
+run = "cargo test --workspace -- golden"
+
+[tasks.test-integration]
+description = "Integration tests (opt-in; lands in v0.2)"
+run = "echo 'test-integration: not wired up yet — feature `integration` arrives in v0.2'"
+
+[tasks.test-ui-smoke]
+description = "UI smoke tests (opt-in; lands in v0.3)"
+run = "echo 'test-ui-smoke: not wired up yet — feature `ui-smoke` arrives in v0.3'"
+
+[tasks.test-all]
+description = "Everything runnable today"
+depends = ["test"]
+
+[tasks.fmt]
+description = "Format all code"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check formatting without writing"
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+description = "Lint with clippy, warnings as errors"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.package]
+description = "Build optimised release binaries"
+run = "cargo build --workspace --release"
+
+[tasks.ci]
+description = "Run the full CI suite locally"
+depends = ["fmt-check", "lint", "build", "test"]

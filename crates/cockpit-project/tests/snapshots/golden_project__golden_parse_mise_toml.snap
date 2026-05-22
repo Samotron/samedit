@@ -1,0 +1,15 @@
+---
+source: crates/cockpit-project/tests/golden_project.rs
+expression: render_mise(&mise)
+---
+mise.detected: true
+mise.config:   None
+mise.tools:
+  node = 22.0.0
+  rust = 1.95.0
+mise.tasks:
+  build | desc=Some("Build the workspace") | run=Some("cargo build --workspace")
+  test | desc=None | run=Some("cargo test")
+mise.env:
+  RUST_LOG = debug
+mise.metadata: Some(CockpitMetadata { name: Some("Sample Project"), default_task: Some("test"), terminal_workspace: Some("zellij"), zellij_layout: None })

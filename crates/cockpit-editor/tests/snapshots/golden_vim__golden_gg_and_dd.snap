@@ -1,0 +1,18 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"gg_dd\", &chars(\"ggdd\"))"
+---
+case: gg_dd
+start_mode: Normal
+steps:
+  - key: Char('g')
+    actions: []
+  - key: Char('g')
+    actions:
+      - MoveFileStart
+  - key: Char('d')
+    actions: []
+  - key: Char('d')
+    actions:
+      - DeleteLine
+final_mode: Normal

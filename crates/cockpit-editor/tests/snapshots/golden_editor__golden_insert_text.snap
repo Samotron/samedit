@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"insert_text\", \"\", &keys)"
+---
+case:   insert_text
+start:  ""
+keys:   i h e l l o <Esc>
+mode:   Normal
+cursor: 0:5
+dirty:  true
+buffer:
+  | hello‸

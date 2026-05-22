@@ -1,0 +1,20 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"undo_redo_delete_paste\", &keys)"
+---
+case: undo_redo_delete_paste
+start_mode: Normal
+steps:
+  - key: Char('x')
+    actions:
+      - DeleteChar
+  - key: Char('p')
+    actions:
+      - PasteAfter
+  - key: Char('u')
+    actions:
+      - Undo
+  - key: Ctrl('r')
+    actions:
+      - Redo
+final_mode: Normal

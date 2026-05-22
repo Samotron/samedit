@@ -1,0 +1,18 @@
+[package]
+name = "cockpit-project"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Project detection, mise integration, and file tree for Coding Cockpit."
+
+[dependencies]
+directories = "6.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+toml = "0.9.8"
+
+[dev-dependencies]
+cockpit-testkit.workspace = true
+insta = "1.43.2"
+tempfile = "3.27.0"

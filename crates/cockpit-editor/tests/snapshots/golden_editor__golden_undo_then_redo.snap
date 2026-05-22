@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"undo_then_redo\", \"abcdef\", &keys)"
+---
+case:   undo_then_redo
+start:  "abcdef"
+keys:   x x u ^r
+mode:   Normal
+cursor: 0:0
+dirty:  true
+buffer:
+  | ‸cdef

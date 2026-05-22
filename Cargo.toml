@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal crates — referenced by members as `cockpit-foo.workspace = true`.
+cockpit-config = { path = "crates/cockpit-config" }
+cockpit-commands = { path = "crates/cockpit-commands" }
+cockpit-project = { path = "crates/cockpit-project" }
+cockpit-editor = { path = "crates/cockpit-editor" }
+cockpit-terminal = { path = "crates/cockpit-terminal" }
+cockpit-ui = { path = "crates/cockpit-ui" }
+cockpit-render = { path = "crates/cockpit-render" }
+cockpit-testkit = { path = "crates/cockpit-testkit" }
+
+[profile.release]
+lto = "thin"

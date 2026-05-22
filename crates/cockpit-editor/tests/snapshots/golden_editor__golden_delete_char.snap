@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"delete_char\", \"abcdef\", &chars(\"xx\"))"
+---
+case:   delete_char
+start:  "abcdef"
+keys:   x x
+mode:   Normal
+cursor: 0:0
+dirty:  true
+buffer:
+  | ‸cdef

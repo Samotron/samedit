@@ -1,0 +1,7 @@
+---
+source: crates/cockpit-terminal/tests/golden_path_detect.rs
+expression: "snapshot(\"rust-error.txt\")"
+---
+fixture: rust-error.txt
+matches:
+  - path=src/app.rs line=88 col=34 span=52..68

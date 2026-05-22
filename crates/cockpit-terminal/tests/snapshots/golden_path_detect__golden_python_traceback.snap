@@ -1,0 +1,7 @@
+---
+source: crates/cockpit-terminal/tests/golden_path_detect.rs
+expression: "snapshot(\"python-traceback.txt\")"
+---
+fixture: python-traceback.txt
+matches:
+  - path=tests/test_api.py line=- col=- span=43..60

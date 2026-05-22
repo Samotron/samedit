@@ -1,0 +1,13 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"open_line_below\", &chars(\"o\"))"
+---
+case: open_line_below
+start_mode: Normal
+steps:
+  - key: Char('o')
+    actions:
+      - MoveLineEnd
+      - InsertChar('\n')
+      - EnterMode(Insert)
+final_mode: Insert

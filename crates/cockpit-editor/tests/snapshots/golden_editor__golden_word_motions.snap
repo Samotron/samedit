@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"word_motions\", \"alpha beta gamma delta\", &chars(\"wwe\"))"
+---
+case:   word_motions
+start:  "alpha beta gamma delta"
+keys:   w w e
+mode:   Normal
+cursor: 0:15
+dirty:  false
+buffer:
+  | alpha beta gamm‸a delta

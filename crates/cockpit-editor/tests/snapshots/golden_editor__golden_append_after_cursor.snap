@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"append_after_cursor\", \"ab\", &keys)"
+---
+case:   append_after_cursor
+start:  "ab"
+keys:   a X <Esc>
+mode:   Normal
+cursor: 0:2
+dirty:  true
+buffer:
+  | aX‸b

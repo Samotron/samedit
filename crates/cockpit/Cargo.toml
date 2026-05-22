@@ -1,0 +1,24 @@
+[package]
+name = "cockpit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A fast, native, multi-platform coding cockpit."
+
+[dependencies]
+cockpit-project.workspace = true
+cockpit-testkit.workspace = true
+cockpit-commands.workspace = true
+cockpit-config.workspace = true
+cockpit-editor.workspace = true
+cockpit-render.workspace = true
+cockpit-terminal.workspace = true
+cockpit-ui.workspace = true
+anyhow = "1.0.102"
+clap = { version = "4.5.50", features = ["derive"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

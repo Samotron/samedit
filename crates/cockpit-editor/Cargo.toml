@@ -1,0 +1,14 @@
+[package]
+name = "cockpit-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rope buffer, cursor, undo, and Vim state machine for Coding Cockpit."
+
+[dependencies]
+ropey = "1.6.1"
+
+[dev-dependencies]
+insta = "1.43.2"
+proptest = "1.11.0"

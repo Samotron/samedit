@@ -1,0 +1,10 @@
+---
+source: crates/cockpit-ui/tests/golden_palette.rs
+expression: "snapshot(\"mst\")"
+---
+query: "mst"
+matches: 4
+  - [200] Mise: Show Tools (mise.show_tools)
+  - [100] Mise: Run Task (mise.run_task)
+  - [100] Mise: Install Tools (mise.install_tools)
+  - [ 97] Terminal: Restart Zellij (terminal.restart_zellij)

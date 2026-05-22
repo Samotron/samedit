@@ -1,0 +1,17 @@
+[package]
+name = "cockpit-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless view-model tree, layout, and panes for Coding Cockpit."
+
+[dependencies]
+cockpit-commands.workspace = true
+cockpit-config.workspace = true
+cockpit-project.workspace = true
+nucleo-matcher = "0.3.1"
+
+[dev-dependencies]
+cockpit-testkit.workspace = true
+insta = "1.43.2"

@@ -1,0 +1,11 @@
+running 11 tests
+test path_detect::tests::detects_path_line ... ok
+test path_detect::tests::detects_path_only ... FAILED
+
+failures:
+
+---- path_detect::tests::detects_path_only stdout ----
+thread 'path_detect::tests::detects_path_only' panicked at crates/cockpit-terminal/src/path_detect.rs:142:9:
+assertion `left == right` failed
+
+test result: FAILED. 10 passed; 1 failed; 0 ignored

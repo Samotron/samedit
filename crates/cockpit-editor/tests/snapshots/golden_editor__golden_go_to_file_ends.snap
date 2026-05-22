@@ -1,0 +1,14 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"go_to_file_ends\", \"top\\nmiddle\\nbottom\", &chars(\"Ggg\"))"
+---
+case:   go_to_file_ends
+start:  "top\nmiddle\nbottom"
+keys:   G g g
+mode:   Normal
+cursor: 0:0
+dirty:  false
+buffer:
+  | ‸top
+  | middle
+  | bottom

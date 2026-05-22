@@ -1,0 +1,17 @@
+---
+source: crates/cockpit-project/tests/golden_project.rs
+expression: render_detection(&detection)
+---
+display_name: mise-basic
+detected:     true
+strongest:    Some(Mise)
+signals:      [Mise]
+mise.detected: true
+mise.config:   Some("mise.toml")
+mise.tools:
+  rust = 1.95.0
+mise.tasks:
+  lint | desc=Some("Run clippy") | run=Some("cargo clippy --workspace --all-targets -- -D warnings")
+  test | desc=Some("Run tests") | run=Some("cargo test --workspace")
+mise.env:
+mise.metadata: Some(CockpitMetadata { name: Some("Mise Basic"), default_task: Some("test"), terminal_workspace: Some("zellij"), zellij_layout: Some(".config/zellij/dev.kdl") })

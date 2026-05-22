@@ -1,0 +1,11 @@
+error[E0382]: borrow of moved value: `config`
+  --> src/app.rs:88:34
+   |
+84 |     let config = load_config();
+   |         ------ move occurs because `config` has type `Config`
+87 |     start(config);
+   |           ------ value moved here
+88 |     println!("environment: {}", config.app_env);
+   |                                  ^^^^^^ value borrowed here after move
+
+For more information about this error, try `rustc --explain E0382`.

@@ -1,0 +1,14 @@
+---
+source: crates/cockpit-project/tests/golden_project.rs
+expression: render_detection(&detection)
+---
+display_name: rust-basic
+detected:     true
+strongest:    Some(Rust)
+signals:      [Rust]
+mise.detected: false
+mise.config:   None
+mise.tools:
+mise.tasks:
+mise.env:
+mise.metadata: None

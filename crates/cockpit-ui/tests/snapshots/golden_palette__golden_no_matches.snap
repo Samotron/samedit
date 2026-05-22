@@ -1,0 +1,6 @@
+---
+source: crates/cockpit-ui/tests/golden_palette.rs
+expression: "snapshot(\"xyzzy\")"
+---
+query: "xyzzy"
+matches: 0
