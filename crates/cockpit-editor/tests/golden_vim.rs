@@ -91,3 +91,44 @@ fn golden_undo_redo_delete_paste() {
     ];
     insta::assert_snapshot!(snapshot("undo_redo_delete_paste", &keys));
 }
+
+#[test]
+fn golden_count_motion() {
+    insta::assert_snapshot!(snapshot("count_motion", &chars("3w")));
+}
+
+#[test]
+fn golden_count_jump() {
+    insta::assert_snapshot!(snapshot("count_jump", &chars("12G")));
+}
+
+#[test]
+fn golden_operator_motion() {
+    insta::assert_snapshot!(snapshot("operator_motion", &chars("d2w")));
+}
+
+#[test]
+fn golden_change_word() {
+    insta::assert_snapshot!(snapshot("change_word", &chars("cw")));
+}
+
+#[test]
+fn golden_visual_delete() {
+    insta::assert_snapshot!(snapshot("visual_delete", &chars("vlld")));
+}
+
+#[test]
+fn golden_visual_line_yank() {
+    insta::assert_snapshot!(snapshot("visual_line_yank", &chars("Vjy")));
+}
+
+#[test]
+fn golden_replace_char() {
+    insta::assert_snapshot!(snapshot("replace_char", &chars("rx")));
+}
+
+#[test]
+fn golden_replace_mode() {
+    let keys = vec![Key::Char('R'), Key::Char('a'), Key::Char('b'), Key::Escape];
+    insta::assert_snapshot!(snapshot("replace_mode", &keys));
+}

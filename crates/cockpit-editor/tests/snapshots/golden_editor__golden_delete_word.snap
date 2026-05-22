@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"delete_word\", \"alpha beta gamma\", &chars(\"dw\"))"
+---
+case:   delete_word
+start:  "alpha beta gamma"
+keys:   d w
+mode:   Normal
+cursor: 0:0
+dirty:  true
+buffer:
+  | ‸beta gamma

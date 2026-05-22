@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"change_word\", \"alpha beta\", &keys)"
+---
+case:   change_word
+start:  "alpha beta"
+keys:   c w A L P H A <Esc>
+mode:   Normal
+cursor: 0:5
+dirty:  true
+buffer:
+  | ALPHA‸beta

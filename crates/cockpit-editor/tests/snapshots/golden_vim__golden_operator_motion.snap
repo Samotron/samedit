@@ -1,0 +1,16 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"operator_motion\", &chars(\"d2w\"))"
+---
+case: operator_motion
+start_mode: Normal
+steps:
+  - key: Char('d')
+    actions: []
+  - key: Char('2')
+    actions: []
+  - key: Char('w')
+    actions:
+      - Operate { operator: Delete, motion: WordForward }
+      - Operate { operator: Delete, motion: WordForward }
+final_mode: Normal

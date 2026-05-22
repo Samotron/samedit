@@ -1,0 +1,15 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"count_jump\", &chars(\"12G\"))"
+---
+case: count_jump
+start_mode: Normal
+steps:
+  - key: Char('1')
+    actions: []
+  - key: Char('2')
+    actions: []
+  - key: Char('G')
+    actions:
+      - Move(ToLine(11))
+final_mode: Normal

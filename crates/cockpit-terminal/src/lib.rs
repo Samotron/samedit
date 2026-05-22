@@ -3,9 +3,10 @@
 //! Houses the PTY wrapper (`portable-pty`), the terminal engine (`termwiz`),
 //! the Zellij launcher, the editor↔terminal bridge, and path detection.
 //!
-//! [`path_detect`] is the first piece implemented (v0.1 milestone M1.7); the
-//! rest follows in M1.11 / M1.12.
+//! [`path_detect`] recognises file references in output (M1.7) and [`bridge`]
+//! scans the parsed grid for them so the UI can jump to a file (M2.6).
 
+pub mod bridge;
 pub mod engine;
 pub mod io_thread;
 pub mod live;

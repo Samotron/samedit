@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"replace_mode\", \"abcdef\", &keys)"
+---
+case:   replace_mode
+start:  "abcdef"
+keys:   R X Y <Esc>
+mode:   Normal
+cursor: 0:2
+dirty:  true
+buffer:
+  | XY‸cdef

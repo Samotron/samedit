@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"visual_line_delete\", \"one\\ntwo\\nthree\", &chars(\"Vjd\"))"
+---
+case:   visual_line_delete
+start:  "one\ntwo\nthree"
+keys:   V j d
+mode:   Normal
+cursor: 0:0
+dirty:  true
+buffer:
+  | ‸three

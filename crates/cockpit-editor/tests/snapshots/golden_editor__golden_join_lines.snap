@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"join_lines\", \"hello\\n  world\", &[Key::Char('J')])"
+---
+case:   join_lines
+start:  "hello\n  world"
+keys:   J
+mode:   Normal
+cursor: 0:5
+dirty:  true
+buffer:
+  | hello‸ world

@@ -10,7 +10,7 @@ steps:
       - DeleteChar
   - key: Char('p')
     actions:
-      - PasteAfter
+      - Paste(After)
   - key: Char('u')
     actions:
       - Undo

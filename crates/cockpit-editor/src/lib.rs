@@ -9,6 +9,7 @@
 pub mod buffer;
 pub mod cursor;
 pub mod editor;
+pub mod highlight;
 pub mod search;
 pub mod undo;
 pub mod vim;
@@ -16,4 +17,5 @@ pub mod vim;
 pub use buffer::Buffer;
 pub use cursor::Cursor;
 pub use editor::{Editor, EditorSignal};
+pub use highlight::{HighlightKind, HighlightSpan, Language};
 pub use undo::History;

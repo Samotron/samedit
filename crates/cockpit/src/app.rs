@@ -12,13 +12,15 @@ use std::path::PathBuf;
 use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::GlobalKeys;
 use cockpit_editor::vim::{Key as VimKey, Mode};
-use cockpit_editor::{Editor, EditorSignal};
+use cockpit_editor::{Editor, EditorSignal, HighlightKind, HighlightSpan, Language};
 use cockpit_project::{
     FileNodeKind, FileTree, ProjectCache, ProjectDetection, project_cache_path, walk_project_files,
 };
 use cockpit_render::theme::Color;
 use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
+use cockpit_terminal::bridge::detect_paths_in_grid;
 use cockpit_terminal::live::{LiveTerminal, WakeFn};
+use cockpit_terminal::path_detect::detect_paths;
 use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
 use cockpit_terminal::zellij::{LaunchPlan, PathBinaryLookup, ShellProfile, plan_launch};
@@ -42,6 +44,8 @@ const CHAR_W_RATIO: f32 = 0.6;
 const APP_QUIT: &str = "app.quit";
 /// Command id for "pick and run a mise task".
 const MISE_RUN_TASK: &str = "mise.run_task";
+/// Command id for "open a file path from the terminal output".
+const TERMINAL_OPEN_PATH: &str = "terminal.open_path";
 
 /// What activating a palette entry does — the palette is reused as both the
 /// command palette and the mise-task picker.
@@ -51,6 +55,8 @@ enum PaletteMode {
     Commands,
     /// Entries are mise task names sent to the terminal.
     MiseTasks,
+    /// Entries are `path:line:col` references opened in the editor.
+    TerminalPaths,
 }
 
 /// The document open in the editor pane: an [`Editor`] plus its file path.
@@ -210,6 +216,7 @@ impl AppModel {
             command_ids::COMMAND_PALETTE => self.open_palette(),
             command_ids::FUZZY_OPEN => self.open_finder(),
             MISE_RUN_TASK => self.open_mise_tasks(),
+            TERMINAL_OPEN_PATH => self.open_terminal_paths(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -260,6 +267,69 @@ impl AppModel {
         }
     }
 
+    /// Scan the terminal's visible output for file references (spec §17). With
+    /// a single match jump straight to it; with several, offer a picker.
+    fn open_terminal_paths(&mut self) {
+        let Some(terminal) = self.terminal.as_ref() else {
+            self.status = "No terminal — start one to navigate its output.".to_string();
+            return;
+        };
+        let grid = terminal.snapshot().grid;
+        let mut references: Vec<String> = Vec::new();
+        for path_match in detect_paths_in_grid(&grid) {
+            let reference = path_match.reference();
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        if references.is_empty() {
+            self.status = "No file paths in the terminal output.".to_string();
+        } else if references.len() == 1 {
+            let reference = references.into_iter().next().unwrap_or_default();
+            self.open_path_reference(&reference);
+        } else {
+            let entries = references
+                .iter()
+                .map(|reference| PaletteEntry::new(reference.as_str(), reference.clone()))
+                .collect();
+            self.palette_mode = PaletteMode::TerminalPaths;
+            self.palette = Some(Palette::new(entries));
+            self.status = "Open path — type to filter, Enter to jump, Esc to close.".to_string();
+        }
+    }
+
+    /// Resolve a `path[:line[:col]]` reference against the project root and
+    /// open it in the editor at that location.
+    fn open_path_reference(&mut self, reference: &str) {
+        let Some(path_match) = detect_paths(reference).into_iter().next() else {
+            self.status = format!("Not a file reference: {reference}");
+            return;
+        };
+        let path = self.detection.root_path.join(&path_match.path);
+        if !path.is_file() {
+            self.status = format!("File not found: {}", path_match.path);
+            return;
+        }
+        self.open_document_at(path, path_match.line, path_match.column);
+    }
+
+    /// Open `path`, then place the cursor at a 1-based `line`/`column` when the
+    /// reference carried one.
+    fn open_document_at(&mut self, path: PathBuf, line: Option<u32>, column: Option<u32>) {
+        self.open_document(path);
+        let Some(line) = line else {
+            return;
+        };
+        let Some(doc) = self.document.as_mut() else {
+            return;
+        };
+        let line0 = line.saturating_sub(1) as usize;
+        let col0 = column.unwrap_or(1).saturating_sub(1) as usize;
+        doc.editor.goto(line0, col0);
+        let name = doc.name.clone();
+        self.status = format!("Opened {name} at {}:{}", line0 + 1, col0 + 1);
+    }
+
     /// Drive the modal command palette from one key chord.
     fn handle_palette_key(&mut self, chord: &KeyChord) {
         if self.palette.is_none() {
@@ -277,6 +347,7 @@ impl AppModel {
             match (selected, mode) {
                 (Some(id), PaletteMode::Commands) => self.run_command(id.as_str()),
                 (Some(id), PaletteMode::MiseTasks) => self.run_mise_task(id.as_str()),
+                (Some(id), PaletteMode::TerminalPaths) => self.open_path_reference(id.as_str()),
                 (None, _) => self.status = "Nothing selected.".to_string(),
             }
             return;
@@ -477,11 +548,9 @@ impl AppModel {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 self.status = format!("Opened {name}");
-                self.document = Some(OpenDocument {
-                    editor: Editor::new(&content),
-                    path,
-                    name,
-                });
+                let mut editor = Editor::new(&content);
+                editor.set_language(Language::from_path(&path));
+                self.document = Some(OpenDocument { editor, path, name });
                 self.layout.focus(PaneId::Editor);
             }
             Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
@@ -663,6 +732,37 @@ impl AppModel {
         let top = content.y + PAD * 0.5;
         let char_w = FONT * CHAR_W_RATIO;
 
+        if let Some((sel_start, sel_end)) = editor.selection() {
+            for row in 0..visible {
+                let line_index = first + row;
+                let Some(line) = lines.get(line_index) else {
+                    break;
+                };
+                let line_start = buffer.line_to_byte(line_index);
+                let line_end = line_start + line.len();
+                if sel_end <= line_start || sel_start > line_end {
+                    continue;
+                }
+                let from = sel_start.saturating_sub(line_start).min(line.len());
+                let to = (sel_end - line_start).min(line.len());
+                let start_col = line[..from].chars().count();
+                let end_col = line[..to].chars().count();
+                // A linewise selection running past this line still shows a sliver.
+                let extends_past = sel_end > line_end;
+                let cols = (end_col - start_col).max(usize::from(extends_past));
+                if cols == 0 {
+                    continue;
+                }
+                canvas.rect(
+                    content.x + GUTTER_W + start_col as f32 * char_w,
+                    top + row as f32 * ROW_H,
+                    cols as f32 * char_w,
+                    ROW_H,
+                    self.theme.selection,
+                );
+            }
+        }
+
         for row in 0..visible {
             let line_index = first + row;
             let Some(line) = lines.get(line_index) else {
@@ -676,15 +776,14 @@ impl AppModel {
                 self.theme.muted_text,
                 FONT,
             );
-            if !line.is_empty() {
-                canvas.text(
-                    content.x + GUTTER_W,
-                    line_y,
-                    (*line).to_string(),
-                    self.theme.text,
-                    FONT,
-                );
-            }
+            self.paint_code_line(
+                canvas,
+                content.x + GUTTER_W,
+                line_y,
+                line,
+                buffer.line_to_byte(line_index),
+                editor.highlights(),
+            );
         }
 
         if cursor_line >= first && cursor_line < first + visible {
@@ -720,6 +819,71 @@ impl AppModel {
         self.paint_mode_line(canvas, content, editor, cursor_line, cursor_col);
     }
 
+    /// Draw one buffer line, splitting it into themed runs per highlight span.
+    /// `line_start` is the line's byte offset in the full buffer.
+    fn paint_code_line(
+        &self,
+        canvas: &mut Canvas<'_>,
+        base_x: f32,
+        y: f32,
+        line: &str,
+        line_start: usize,
+        highlights: &[HighlightSpan],
+    ) {
+        let char_w = FONT * CHAR_W_RATIO;
+        let mut byte = 0usize;
+        let mut col = 0usize;
+        while byte < line.len() {
+            let abs = line_start + byte;
+            let (seg_end, color) = match highlights
+                .iter()
+                .find(|span| span.range.start <= abs && abs < span.range.end)
+            {
+                Some(span) => (
+                    (span.range.end - line_start).min(line.len()),
+                    self.syntax_color(span.kind),
+                ),
+                None => {
+                    // Run plain text up to wherever the next highlight begins.
+                    let next = highlights
+                        .iter()
+                        .map(|span| span.range.start)
+                        .filter(|&start| start > abs)
+                        .min()
+                        .map(|start| (start - line_start).min(line.len()))
+                        .unwrap_or(line.len());
+                    (next, self.theme.text)
+                }
+            };
+            let segment = &line[byte..seg_end];
+            canvas.text(
+                base_x + col as f32 * char_w,
+                y,
+                segment.to_string(),
+                color,
+                FONT,
+            );
+            col += segment.chars().count();
+            byte = seg_end;
+        }
+    }
+
+    fn syntax_color(&self, kind: HighlightKind) -> Color {
+        let syntax = &self.theme.syntax;
+        match kind {
+            HighlightKind::Keyword => syntax.keyword,
+            HighlightKind::Function => syntax.function,
+            HighlightKind::Type => syntax.type_name,
+            HighlightKind::String => syntax.string,
+            HighlightKind::Comment => syntax.comment,
+            HighlightKind::Constant => syntax.constant,
+            HighlightKind::Variable => syntax.variable,
+            HighlightKind::Operator => syntax.operator,
+            HighlightKind::Attribute => syntax.attribute,
+            HighlightKind::Punctuation => syntax.punctuation,
+        }
+    }
+
     fn paint_mode_line(
         &self,
         canvas: &mut Canvas<'_>,
@@ -734,6 +898,9 @@ impl AppModel {
         let mode = match editor.mode() {
             Mode::Normal => "NORMAL".to_string(),
             Mode::Insert => "INSERT".to_string(),
+            Mode::Visual => "VISUAL".to_string(),
+            Mode::VisualLine => "VISUAL LINE".to_string(),
+            Mode::Replace => "REPLACE".to_string(),
             Mode::Command => format!("COMMAND  :{}", editor.vim().command_line()),
             Mode::Search => format!("SEARCH  /{}", editor.vim().search_query()),
         };
@@ -1064,6 +1231,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(command_ids::TOGGLE_FILES, "View: Toggle Files Pane"),
         PaletteEntry::new(command_ids::TOGGLE_TERMINAL, "View: Toggle Terminal Pane"),
         PaletteEntry::new(MISE_RUN_TASK, "Mise: Run Task"),
+        PaletteEntry::new(TERMINAL_OPEN_PATH, "Terminal: Open Path"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -1279,6 +1447,53 @@ mod tests {
             };
             model.dispatch(chord);
         }
+    }
+
+    /// A model over the `rust-basic` fixture, which has `src/main.rs`.
+    fn rust_model() -> AppModel {
+        let path = fixture_path("rust-basic");
+        let detection = detect_project(&path).expect("detect rust-basic fixture");
+        let tree = FileTree::load(&path).expect("load rust-basic fixture");
+        AppModel::new(detection, tree).expect("build model")
+    }
+
+    #[test]
+    fn open_path_reference_jumps_to_a_file_at_line_and_column() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs:2:5");
+
+        let doc = model.document.as_ref().expect("document opened");
+        assert_eq!(doc.name, "main.rs");
+        assert_eq!(
+            doc.editor.cursor().line_col(doc.editor.buffer()),
+            (1, 4),
+            "cursor lands at the 1-based line:col, converted to 0-based"
+        );
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+    }
+
+    #[test]
+    fn open_path_reference_reports_a_missing_file() {
+        let mut model = rust_model();
+        model.open_path_reference("src/nope.rs:1");
+        assert!(model.document.is_none());
+        assert!(
+            model.status.contains("not found"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn open_terminal_paths_without_a_terminal_reports_it() {
+        let mut model = rust_model();
+        model.open_terminal_paths();
+        assert!(model.document.is_none());
+        assert!(
+            model.status.contains("No terminal"),
+            "status: {}",
+            model.status
+        );
     }
 
     #[test]

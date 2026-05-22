@@ -7,35 +7,35 @@ start_mode: Normal
 steps:
   - key: Char('h')
     actions:
-      - MoveLeft
+      - Move(Left)
   - key: Char('j')
     actions:
-      - MoveLine(Down)
+      - Move(Line(Down))
   - key: Char('k')
     actions:
-      - MoveLine(Up)
+      - Move(Line(Up))
   - key: Char('l')
     actions:
-      - MoveRight
+      - Move(Right)
   - key: Char('w')
     actions:
-      - MoveWordForward
+      - Move(WordForward)
   - key: Char('b')
     actions:
-      - MoveWordBackward
+      - Move(WordBackward)
   - key: Char('e')
     actions:
-      - MoveWordEnd
+      - Move(WordEnd)
   - key: Char('0')
     actions:
-      - MoveLineStart
+      - Move(LineStart)
   - key: Char('^')
     actions:
-      - MoveFirstNonWhitespace
+      - Move(FirstNonWhitespace)
   - key: Char('$')
     actions:
-      - MoveLineEnd
+      - Move(LineEnd)
   - key: Char('G')
     actions:
-      - MoveFileEnd
+      - Move(FileEnd)
 final_mode: Normal

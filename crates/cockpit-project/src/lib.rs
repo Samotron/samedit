@@ -304,6 +304,70 @@ fn project_cache_key(root_path: &Path) -> String {
         .collect()
 }
 
+/// Most-recent projects kept in the launcher registry.
+pub const MAX_RECENT_PROJECTS: usize = 20;
+
+/// One project remembered by the launcher — just enough cached metadata to
+/// render the launcher list without re-detecting each project (spec §7, §24).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentProject {
+    pub root_path: PathBuf,
+    pub display_name: String,
+}
+
+/// The launcher's recent-projects registry — a single global cache file so
+/// startup stays instant (spec §24 "Project launcher: instant from cache").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecentProjects {
+    /// Projects most-recently-opened first.
+    pub projects: Vec<RecentProject>,
+}
+
+impl RecentProjects {
+    /// Load the registry, returning an empty one if the file does not exist.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectError> {
+        match fs::read_to_string(path) {
+            Ok(input) => toml::from_str(&input).map_err(ProjectError::Parse),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(ProjectError::Read(err)),
+        }
+    }
+
+    /// Store the registry, creating parent directories as needed.
+    pub fn store(&self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(ProjectError::Write)?;
+        }
+        let output = toml::to_string_pretty(self).map_err(ProjectError::Serialize)?;
+        fs::write(path, output).map_err(ProjectError::Write)
+    }
+
+    /// Record a project as just-opened: move it to the front (deduplicating by
+    /// path), and cap the list at [`MAX_RECENT_PROJECTS`].
+    pub fn record(&mut self, root_path: impl Into<PathBuf>, display_name: impl Into<String>) {
+        let root_path = root_path.into();
+        self.projects
+            .retain(|project| project.root_path != root_path);
+        self.projects.insert(
+            0,
+            RecentProject {
+                root_path,
+                display_name: display_name.into(),
+            },
+        );
+        self.projects.truncate(MAX_RECENT_PROJECTS);
+    }
+}
+
+/// Resolve the path of the global recent-projects registry file.
+pub fn recent_projects_path() -> Result<PathBuf, ProjectError> {
+    let dirs = ProjectDirs::from("dev", "CodingCockpit", "cockpit")
+        .ok_or(ProjectError::NoCacheDirectory)?;
+    Ok(dirs.cache_dir().join("recent-projects.toml"))
+}
+
 /// Default file browser ignores from the Rust implementation plan.
 pub const DEFAULT_IGNORES: &[&str] = &[
     ".git",
@@ -794,6 +858,57 @@ zellij_layout = ".config/zellij/dev.kdl"
     fn cache_path_uses_stable_project_key() {
         let path = project_cache_path("/tmp/My Project").unwrap();
         assert!(path.ends_with("projects/_tmp_my_project/state.toml"));
+    }
+
+    #[test]
+    fn recent_projects_record_moves_to_front_and_dedups() {
+        let mut recents = RecentProjects::default();
+        recents.record("/code/alpha", "alpha");
+        recents.record("/code/bravo", "bravo");
+        recents.record("/code/alpha", "alpha");
+
+        let names: Vec<&str> = recents
+            .projects
+            .iter()
+            .map(|project| project.display_name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn recent_projects_record_caps_the_list() {
+        let mut recents = RecentProjects::default();
+        for i in 0..MAX_RECENT_PROJECTS + 5 {
+            recents.record(format!("/code/p{i}"), format!("p{i}"));
+        }
+        assert_eq!(recents.projects.len(), MAX_RECENT_PROJECTS);
+        // The most recently recorded project is at the front.
+        assert_eq!(
+            recents.projects[0].display_name,
+            format!("p{}", MAX_RECENT_PROJECTS + 4)
+        );
+    }
+
+    #[test]
+    fn recent_projects_round_trip() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("recent-projects.toml");
+        let mut recents = RecentProjects::default();
+        recents.record("/code/alpha", "alpha");
+        recents.record("/code/bravo", "bravo");
+
+        recents.store(&path).unwrap();
+        assert_eq!(RecentProjects::load(&path).unwrap(), recents);
+    }
+
+    #[test]
+    fn recent_projects_load_missing_file_is_empty() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("missing.toml");
+        assert_eq!(
+            RecentProjects::load(&path).unwrap(),
+            RecentProjects::default()
+        );
     }
 
     #[test]

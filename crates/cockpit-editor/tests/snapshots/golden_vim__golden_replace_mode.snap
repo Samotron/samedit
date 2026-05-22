@@ -1,0 +1,20 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"replace_mode\", &keys)"
+---
+case: replace_mode
+start_mode: Normal
+steps:
+  - key: Char('R')
+    actions:
+      - EnterMode(Replace)
+  - key: Char('a')
+    actions:
+      - ReplaceChar('a')
+  - key: Char('b')
+    actions:
+      - ReplaceChar('b')
+  - key: Escape
+    actions:
+      - EnterMode(Normal)
+final_mode: Normal

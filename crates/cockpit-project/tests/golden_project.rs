@@ -68,7 +68,14 @@ fn golden_detect_mise_basic() {
 
 #[test]
 fn golden_detect_file_tree_git_project() {
-    let detection = detect_project(fixture_path("file-tree")).expect("detect file-tree");
+    // A `.git` directory cannot be committed inside a fixture — Git refuses to
+    // track nested `.git` entries — so build the Git-marked project on disk.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let root = tempdir.path().join("file-tree");
+    std::fs::create_dir(&root).expect("create project dir");
+    std::fs::create_dir(root.join(".git")).expect("create .git dir");
+
+    let detection = detect_project(&root).expect("detect file-tree");
     insta::assert_snapshot!(render_detection(&detection));
 }
 

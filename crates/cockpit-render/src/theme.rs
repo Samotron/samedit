@@ -26,6 +26,38 @@ impl Color {
     }
 }
 
+/// Syntax-highlighting colours, one per token category.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyntaxTheme {
+    pub keyword: Color,
+    pub function: Color,
+    pub type_name: Color,
+    pub string: Color,
+    pub comment: Color,
+    pub constant: Color,
+    pub variable: Color,
+    pub operator: Color,
+    pub attribute: Color,
+    pub punctuation: Color,
+}
+
+impl Default for SyntaxTheme {
+    fn default() -> Self {
+        Self {
+            keyword: Color::rgb(0.780, 0.470, 0.870),
+            function: Color::rgb(0.400, 0.680, 0.950),
+            type_name: Color::rgb(0.900, 0.800, 0.450),
+            string: Color::rgb(0.550, 0.780, 0.500),
+            comment: Color::rgb(0.450, 0.500, 0.560),
+            constant: Color::rgb(0.900, 0.620, 0.400),
+            variable: Color::rgb(0.820, 0.860, 0.920),
+            operator: Color::rgb(0.700, 0.780, 0.850),
+            attribute: Color::rgb(0.450, 0.780, 0.720),
+            punctuation: Color::rgb(0.620, 0.670, 0.740),
+        }
+    }
+}
+
 /// Default renderer theme.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
@@ -37,6 +69,7 @@ pub struct Theme {
     pub accent: Color,
     pub selection: Color,
     pub cursor: Color,
+    pub syntax: SyntaxTheme,
 }
 
 impl Default for Theme {
@@ -50,6 +83,7 @@ impl Default for Theme {
             accent: Color::rgb(0.270, 0.520, 0.900),
             selection: Color::rgba(0.270, 0.520, 0.900, 0.35),
             cursor: Color::rgb(0.960, 0.960, 0.900),
+            syntax: SyntaxTheme::default(),
         }
     }
 }
@@ -64,6 +98,25 @@ mod tests {
         assert_eq!(theme.background.a, 1.0);
         assert_eq!(theme.text.a, 1.0);
         assert!(theme.selection.a < 1.0);
+    }
+
+    #[test]
+    fn default_syntax_colors_are_opaque() {
+        let syntax = SyntaxTheme::default();
+        for color in [
+            syntax.keyword,
+            syntax.function,
+            syntax.type_name,
+            syntax.string,
+            syntax.comment,
+            syntax.constant,
+            syntax.variable,
+            syntax.operator,
+            syntax.attribute,
+            syntax.punctuation,
+        ] {
+            assert_eq!(color.a, 1.0);
+        }
     }
 
     #[test]

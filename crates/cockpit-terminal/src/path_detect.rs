@@ -25,6 +25,23 @@ pub struct PathMatch {
     pub span: Range<usize>,
 }
 
+impl PathMatch {
+    /// The canonical `path[:line[:col]]` text for this reference. Feeding it
+    /// back through [`detect_paths`] recovers the same path, line, and column.
+    pub fn reference(&self) -> String {
+        let mut text = self.path.clone();
+        if let Some(line) = self.line {
+            text.push(':');
+            text.push_str(&line.to_string());
+            if let Some(column) = self.column {
+                text.push(':');
+                text.push_str(&column.to_string());
+            }
+        }
+        text
+    }
+}
+
 /// Characters that terminate a path token.
 fn is_delimiter(c: char) -> bool {
     c.is_whitespace()
@@ -202,5 +219,13 @@ mod tests {
     #[test]
     fn handles_empty_input() {
         assert!(detect_paths("").is_empty());
+    }
+
+    #[test]
+    fn reference_round_trips_through_detection() {
+        for text in ["src/main.rs", "src/main.rs:42", "src/main.rs:42:13"] {
+            let m = &detect_paths(text)[0];
+            assert_eq!(m.reference(), text);
+        }
     }
 }
