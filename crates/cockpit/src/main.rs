@@ -12,7 +12,9 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use cockpit_project::{FileTree, ProjectDetection, detect_project};
+use cockpit_project::{
+    FileTree, ProjectDetection, RecentProjects, detect_project, recent_projects_path,
+};
 use cockpit_testkit::{BUILTIN_FIXTURES, fixture_path};
 
 use crate::app::{AppModel, AppShell};
@@ -64,10 +66,44 @@ fn run(cli: Cli) -> Result<()> {
             "cockpit {} — coding cockpit shell.",
             env!("CARGO_PKG_VERSION")
         );
+        print_recent_projects();
         println!("Pass --fixture <name> or --project <path> to open a project.");
         println!("Add --print for a headless project-detection dump.");
         println!("Bundled fixtures: {}", BUILTIN_FIXTURES.join(", "));
         Ok(())
+    }
+}
+
+/// List the launcher's cached recent projects. Loaded from one small cache
+/// file, so this stays instant no matter how many projects exist (spec §24).
+fn print_recent_projects() {
+    let recents = recent_projects_path()
+        .ok()
+        .and_then(|path| RecentProjects::load(path).ok())
+        .unwrap_or_default();
+    if recents.projects.is_empty() {
+        return;
+    }
+    println!("Recent projects:");
+    for project in &recents.projects {
+        println!(
+            "  - {}  ({})",
+            project.display_name,
+            project.root_path.display()
+        );
+    }
+}
+
+/// Add a project to the launcher's recent-projects registry. Best-effort: a
+/// cache failure must never stop the project from opening.
+fn record_recent_project(detection: &ProjectDetection) {
+    let Ok(path) = recent_projects_path() else {
+        return;
+    };
+    let mut recents = RecentProjects::load(&path).unwrap_or_default();
+    recents.record(&detection.root_path, &detection.display_name);
+    if let Err(err) = recents.store(&path) {
+        tracing::warn!(error = %err, "failed to store recent projects");
     }
 }
 
@@ -91,6 +127,8 @@ fn run_project(path: &std::path::Path, print: bool) -> Result<()> {
         print_detection(&detection);
         return Ok(());
     }
+
+    record_recent_project(&detection);
 
     let tree =
         FileTree::load(path).with_context(|| format!("load file tree at `{}`", path.display()))?;
