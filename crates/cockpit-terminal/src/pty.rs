@@ -199,5 +199,6 @@ mod integration_tests {
 
         session.resize(PtyDimensions::new(30, 100)).unwrap();
         session.terminate().unwrap();
+        session.wait().unwrap();
     }
 }
