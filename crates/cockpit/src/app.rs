@@ -18,7 +18,9 @@ use cockpit_project::{
 };
 use cockpit_render::theme::Color;
 use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
+use cockpit_terminal::bridge::detect_paths_in_grid;
 use cockpit_terminal::live::{LiveTerminal, WakeFn};
+use cockpit_terminal::path_detect::detect_paths;
 use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
 use cockpit_terminal::zellij::{LaunchPlan, PathBinaryLookup, ShellProfile, plan_launch};
@@ -42,6 +44,8 @@ const CHAR_W_RATIO: f32 = 0.6;
 const APP_QUIT: &str = "app.quit";
 /// Command id for "pick and run a mise task".
 const MISE_RUN_TASK: &str = "mise.run_task";
+/// Command id for "open a file path from the terminal output".
+const TERMINAL_OPEN_PATH: &str = "terminal.open_path";
 
 /// What activating a palette entry does — the palette is reused as both the
 /// command palette and the mise-task picker.
@@ -51,6 +55,8 @@ enum PaletteMode {
     Commands,
     /// Entries are mise task names sent to the terminal.
     MiseTasks,
+    /// Entries are `path:line:col` references opened in the editor.
+    TerminalPaths,
 }
 
 /// The document open in the editor pane: an [`Editor`] plus its file path.
@@ -210,6 +216,7 @@ impl AppModel {
             command_ids::COMMAND_PALETTE => self.open_palette(),
             command_ids::FUZZY_OPEN => self.open_finder(),
             MISE_RUN_TASK => self.open_mise_tasks(),
+            TERMINAL_OPEN_PATH => self.open_terminal_paths(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -260,6 +267,69 @@ impl AppModel {
         }
     }
 
+    /// Scan the terminal's visible output for file references (spec §17). With
+    /// a single match jump straight to it; with several, offer a picker.
+    fn open_terminal_paths(&mut self) {
+        let Some(terminal) = self.terminal.as_ref() else {
+            self.status = "No terminal — start one to navigate its output.".to_string();
+            return;
+        };
+        let grid = terminal.snapshot().grid;
+        let mut references: Vec<String> = Vec::new();
+        for path_match in detect_paths_in_grid(&grid) {
+            let reference = path_match.reference();
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        if references.is_empty() {
+            self.status = "No file paths in the terminal output.".to_string();
+        } else if references.len() == 1 {
+            let reference = references.into_iter().next().unwrap_or_default();
+            self.open_path_reference(&reference);
+        } else {
+            let entries = references
+                .iter()
+                .map(|reference| PaletteEntry::new(reference.as_str(), reference.clone()))
+                .collect();
+            self.palette_mode = PaletteMode::TerminalPaths;
+            self.palette = Some(Palette::new(entries));
+            self.status = "Open path — type to filter, Enter to jump, Esc to close.".to_string();
+        }
+    }
+
+    /// Resolve a `path[:line[:col]]` reference against the project root and
+    /// open it in the editor at that location.
+    fn open_path_reference(&mut self, reference: &str) {
+        let Some(path_match) = detect_paths(reference).into_iter().next() else {
+            self.status = format!("Not a file reference: {reference}");
+            return;
+        };
+        let path = self.detection.root_path.join(&path_match.path);
+        if !path.is_file() {
+            self.status = format!("File not found: {}", path_match.path);
+            return;
+        }
+        self.open_document_at(path, path_match.line, path_match.column);
+    }
+
+    /// Open `path`, then place the cursor at a 1-based `line`/`column` when the
+    /// reference carried one.
+    fn open_document_at(&mut self, path: PathBuf, line: Option<u32>, column: Option<u32>) {
+        self.open_document(path);
+        let Some(line) = line else {
+            return;
+        };
+        let Some(doc) = self.document.as_mut() else {
+            return;
+        };
+        let line0 = line.saturating_sub(1) as usize;
+        let col0 = column.unwrap_or(1).saturating_sub(1) as usize;
+        doc.editor.goto(line0, col0);
+        let name = doc.name.clone();
+        self.status = format!("Opened {name} at {}:{}", line0 + 1, col0 + 1);
+    }
+
     /// Drive the modal command palette from one key chord.
     fn handle_palette_key(&mut self, chord: &KeyChord) {
         if self.palette.is_none() {
@@ -277,6 +347,7 @@ impl AppModel {
             match (selected, mode) {
                 (Some(id), PaletteMode::Commands) => self.run_command(id.as_str()),
                 (Some(id), PaletteMode::MiseTasks) => self.run_mise_task(id.as_str()),
+                (Some(id), PaletteMode::TerminalPaths) => self.open_path_reference(id.as_str()),
                 (None, _) => self.status = "Nothing selected.".to_string(),
             }
             return;
@@ -1160,6 +1231,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(command_ids::TOGGLE_FILES, "View: Toggle Files Pane"),
         PaletteEntry::new(command_ids::TOGGLE_TERMINAL, "View: Toggle Terminal Pane"),
         PaletteEntry::new(MISE_RUN_TASK, "Mise: Run Task"),
+        PaletteEntry::new(TERMINAL_OPEN_PATH, "Terminal: Open Path"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -1375,6 +1447,53 @@ mod tests {
             };
             model.dispatch(chord);
         }
+    }
+
+    /// A model over the `rust-basic` fixture, which has `src/main.rs`.
+    fn rust_model() -> AppModel {
+        let path = fixture_path("rust-basic");
+        let detection = detect_project(&path).expect("detect rust-basic fixture");
+        let tree = FileTree::load(&path).expect("load rust-basic fixture");
+        AppModel::new(detection, tree).expect("build model")
+    }
+
+    #[test]
+    fn open_path_reference_jumps_to_a_file_at_line_and_column() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs:2:5");
+
+        let doc = model.document.as_ref().expect("document opened");
+        assert_eq!(doc.name, "main.rs");
+        assert_eq!(
+            doc.editor.cursor().line_col(doc.editor.buffer()),
+            (1, 4),
+            "cursor lands at the 1-based line:col, converted to 0-based"
+        );
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+    }
+
+    #[test]
+    fn open_path_reference_reports_a_missing_file() {
+        let mut model = rust_model();
+        model.open_path_reference("src/nope.rs:1");
+        assert!(model.document.is_none());
+        assert!(
+            model.status.contains("not found"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn open_terminal_paths_without_a_terminal_reports_it() {
+        let mut model = rust_model();
+        model.open_terminal_paths();
+        assert!(model.document.is_none());
+        assert!(
+            model.status.contains("No terminal"),
+            "status: {}",
+            model.status
+        );
     }
 
     #[test]

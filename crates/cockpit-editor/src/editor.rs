@@ -90,6 +90,13 @@ impl Editor {
         &self.highlights
     }
 
+    /// Move the cursor to a 0-based `line` and `column`, clamped to the buffer.
+    /// Used by the terminal→editor bridge to jump to a `path:line:col`.
+    pub fn goto(&mut self, line: usize, column: usize) {
+        let byte = self.buffer.line_col_to_byte(line, column);
+        self.cursor.set_byte(&self.buffer, byte);
+    }
+
     /// The text buffer.
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
@@ -861,6 +868,16 @@ mod tests {
         assert!(editor.is_dirty());
         editor.mark_saved();
         assert!(!editor.is_dirty());
+    }
+
+    #[test]
+    fn goto_moves_the_cursor_to_a_line_and_column() {
+        let mut editor = Editor::new("alpha\nbravo\ncharlie");
+        editor.goto(1, 3);
+        assert_eq!(editor.cursor().line_col(editor.buffer()), (1, 3));
+        // Out-of-range positions clamp into the buffer.
+        editor.goto(99, 99);
+        assert_eq!(editor.cursor().line_col(editor.buffer()).0, 2);
     }
 
     #[test]
