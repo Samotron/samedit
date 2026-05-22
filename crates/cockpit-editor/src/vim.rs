@@ -115,6 +115,7 @@ pub enum Action {
     Undo,
     Redo,
     Search(String),
+    SearchPrevious(String),
     AppCommand(AppCommand),
 }
 
@@ -138,6 +139,7 @@ pub struct Vim {
     count: usize,
     command: String,
     search: String,
+    last_search: Option<String>,
 }
 
 impl Vim {
@@ -294,6 +296,16 @@ impl Vim {
             Key::Ctrl('r') | Key::Ctrl('R') => vec![Action::Redo; n],
             Key::Char('p') => vec![Action::Paste(PasteWhere::After); n],
             Key::Char('P') => vec![Action::Paste(PasteWhere::Before); n],
+            Key::Char('n') => self
+                .last_search
+                .clone()
+                .map(|query| vec![Action::Search(query); n])
+                .unwrap_or_default(),
+            Key::Char('N') => self
+                .last_search
+                .clone()
+                .map(|query| vec![Action::SearchPrevious(query); n])
+                .unwrap_or_default(),
             Key::Char(':') => {
                 self.command.clear();
                 self.set_mode(Mode::Command)
@@ -468,6 +480,7 @@ impl Vim {
                 self.search.clear();
                 let mut actions = self.set_mode(Mode::Normal);
                 if !query.is_empty() {
+                    self.last_search = Some(query.clone());
                     actions.push(Action::Search(query));
                 }
                 actions
@@ -837,6 +850,32 @@ mod tests {
                 Action::EnterMode(Mode::Search),
                 Action::EnterMode(Mode::Normal),
                 Action::Search("need".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn search_repeat_reuses_the_last_query() {
+        let mut vim = Vim::new();
+        assert_eq!(
+            feed(
+                &mut vim,
+                [
+                    Key::Char('/'),
+                    Key::Char('f'),
+                    Key::Char('o'),
+                    Key::Char('o'),
+                    Key::Enter,
+                    Key::Char('n'),
+                    Key::Char('N'),
+                ]
+            ),
+            vec![
+                Action::EnterMode(Mode::Search),
+                Action::EnterMode(Mode::Normal),
+                Action::Search("foo".to_string()),
+                Action::Search("foo".to_string()),
+                Action::SearchPrevious("foo".to_string()),
             ]
         );
     }

@@ -416,4 +416,37 @@ mod tests {
             RoutedInput::Unhandled(chord)
         );
     }
+
+    #[cfg(feature = "ui-smoke")]
+    #[test]
+    fn ui_smoke_view_models_cover_launcher_layout_browser_and_keys() {
+        let launcher = Launcher::new(vec![RecentProject::new(
+            "file-tree",
+            cockpit_testkit::fixture_path("file-tree"),
+        )]);
+        assert_eq!(launcher.selection(), LauncherSelection::Recent(0));
+        assert!(matches!(launcher.activate(), LauncherIntent::OpenRecent(0)));
+
+        let layout = WorkspaceLayout::new().compute(1200, 800);
+        assert!(layout.files.is_some());
+        assert_eq!(layout.editor.height, 800);
+        assert!(layout.terminal.is_some());
+
+        let tree = cockpit_project::FileTree::load(cockpit_testkit::fixture_path("file-tree"))
+            .expect("load fixture tree");
+        let mut browser = FileBrowser::new(tree);
+        assert_eq!(browser.selected().unwrap().name, "src");
+        assert_eq!(browser.activate().unwrap(), FileBrowserAction::Toggled);
+        assert!(browser.rows().iter().any(|row| row.name == "lib.rs"));
+
+        let router = InputRouter::from_global_keys(&GlobalKeys::default()).unwrap();
+        assert_eq!(
+            router.route(PaneId::Editor, "Ctrl+h".parse().unwrap()),
+            RoutedInput::Command(CommandId::from(command_ids::FOCUS_FILES))
+        );
+        assert_eq!(
+            router.route(PaneId::Terminal, "x".parse().unwrap()),
+            RoutedInput::TerminalPassthrough("x".parse().unwrap())
+        );
+    }
 }

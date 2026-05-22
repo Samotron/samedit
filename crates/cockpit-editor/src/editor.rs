@@ -247,6 +247,16 @@ impl Editor {
                     self.cursor.set_byte(&self.buffer, found.start);
                 }
             }
+            Action::SearchPrevious(query) => {
+                let before_cursor = self.cursor.byte().saturating_sub(1);
+                if let Some(found) = search::find_previous(&self.buffer, &query, before_cursor)
+                    .or_else(|| {
+                        search::find_previous(&self.buffer, &query, self.buffer.len_bytes())
+                    })
+                {
+                    self.cursor.set_byte(&self.buffer, found.start);
+                }
+            }
             Action::AppCommand(command) => {
                 return Some(match command {
                     AppCommand::Save => EditorSignal::Save,

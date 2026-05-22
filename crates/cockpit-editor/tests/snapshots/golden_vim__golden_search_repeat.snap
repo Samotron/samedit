@@ -1,0 +1,27 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"search_repeat\", &keys)"
+---
+case: search_repeat
+start_mode: Normal
+steps:
+  - key: Char('/')
+    actions:
+      - EnterMode(Search)
+  - key: Char('f')
+    actions: []
+  - key: Char('o')
+    actions: []
+  - key: Char('o')
+    actions: []
+  - key: Enter
+    actions:
+      - EnterMode(Normal)
+      - Search("foo")
+  - key: Char('n')
+    actions:
+      - Search("foo")
+  - key: Char('N')
+    actions:
+      - SearchPrevious("foo")
+final_mode: Normal

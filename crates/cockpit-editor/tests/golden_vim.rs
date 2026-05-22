@@ -82,6 +82,20 @@ fn golden_search() {
 }
 
 #[test]
+fn golden_search_repeat() {
+    let keys = vec![
+        Key::Char('/'),
+        Key::Char('f'),
+        Key::Char('o'),
+        Key::Char('o'),
+        Key::Enter,
+        Key::Char('n'),
+        Key::Char('N'),
+    ];
+    insta::assert_snapshot!(snapshot("search_repeat", &keys));
+}
+
+#[test]
 fn golden_undo_redo_delete_paste() {
     let keys = vec![
         Key::Char('x'),

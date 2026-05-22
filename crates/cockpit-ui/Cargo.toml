@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Headless view-model tree, layout, and panes for Coding Cockpit."
 
+[features]
+default = []
+ui-smoke = []
+
 [dependencies]
 cockpit-commands.workspace = true
 cockpit-config.workspace = true

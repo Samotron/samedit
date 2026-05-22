@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "A fast, native, multi-platform coding cockpit."
 
+[features]
+default = []
+ui-smoke = []
+
 [dependencies]
 cockpit-project.workspace = true
 cockpit-testkit.workspace = true

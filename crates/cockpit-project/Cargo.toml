@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Project detection, mise integration, and file tree for Coding Cockpit."
 
+[features]
+default = []
+integration = []
+
 [dependencies]
 directories = "6.0.0"
 serde = { version = "1.0.228", features = ["derive"] }

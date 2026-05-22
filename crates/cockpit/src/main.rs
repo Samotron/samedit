@@ -133,6 +133,7 @@ fn run_project(path: &std::path::Path, print: bool) -> Result<()> {
     let tree =
         FileTree::load(path).with_context(|| format!("load file tree at `{}`", path.display()))?;
     let mut model = AppModel::new(detection, tree).map_err(|err| anyhow!(err))?;
+    model.refresh_git_statuses();
     model.restore_cached_state();
     let title = format!("Coding Cockpit — {}", model.project_name());
     tracing::info!(project = model.project_name(), "opening window");

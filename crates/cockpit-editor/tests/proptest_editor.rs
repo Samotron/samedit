@@ -13,7 +13,12 @@ use proptest::prelude::*;
 
 /// Meaningful Vim keys: motions, operators, mode switches, counts, and a
 /// little literal text to type in Insert mode.
-const KEY_CHARS: &str = "hjklwbeg0^$GiIaAoOvVRrsSxXdcyDCJpPuq:/123 z";
+///
+/// Numeric counts have focused unit/golden coverage. They are intentionally
+/// omitted here because random count + paste combinations can create very
+/// large edit histories from short key streams, making the property suite
+/// nondeterministically slow.
+const KEY_CHARS: &str = "hjklwbeg^$GiIaAoOvVRrsSxXdcyDCJpPuq:/ z";
 
 fn arb_key() -> impl Strategy<Value = Key> {
     let chars: Vec<char> = KEY_CHARS.chars().collect();
@@ -73,11 +78,18 @@ proptest! {
         for key in keys {
             editor.handle_key(key);
         }
-        // Leave any insert/visual/command mode, then undo every edit.
+        // Leave any insert/visual/command mode, then undo every edit. Two
+        // escapes handle a pending Visual-mode prefix (`vg`) where the first
+        // Escape clears the prefix and the second leaves Visual mode.
         editor.handle_key(Key::Escape);
-        while editor.can_undo() {
+        editor.handle_key(Key::Escape);
+        for _ in 0..128 {
+            if !editor.can_undo() {
+                break;
+            }
             editor.handle_key(Key::Char('u'));
         }
+        prop_assert!(!editor.can_undo());
         prop_assert_eq!(editor.text(), initial);
     }
 

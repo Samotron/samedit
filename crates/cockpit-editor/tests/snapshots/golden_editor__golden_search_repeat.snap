@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"search_repeat\", \"foo bar foo bar\", &keys)"
+---
+case:   search_repeat
+start:  "foo bar foo bar"
+keys:   / b a r <CR> n N
+mode:   Normal
+cursor: 0:4
+dirty:  false
+buffer:
+  | foo ‸bar foo bar

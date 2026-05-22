@@ -10,3 +10,5 @@
 *.snap.new
 
 .antigravitycli/
+
+test/

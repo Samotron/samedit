@@ -135,6 +135,15 @@ fn golden_search_jumps_to_match() {
 }
 
 #[test]
+fn golden_search_repeat() {
+    let mut keys = vec![Key::Char('/')];
+    keys.extend(chars("bar"));
+    keys.push(Key::Enter);
+    keys.extend(chars("nN"));
+    insta::assert_snapshot!(snapshot("search_repeat", "foo bar foo bar", &keys));
+}
+
+#[test]
 fn golden_go_to_file_ends() {
     insta::assert_snapshot!(snapshot(
         "go_to_file_ends",

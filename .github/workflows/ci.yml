@@ -51,9 +51,40 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  integration:
+    name: integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: PTY integration tests
+        run: cargo test -p cockpit-terminal --features integration
+
+      - name: mise integration tests
+        run: cargo test -p cockpit-project --features integration
+
+      - name: UI smoke tests
+        run: cargo test -p cockpit-ui --features ui-smoke ui_smoke && cargo test -p cockpit --features ui-smoke ui_smoke
+
   package:
     name: package (${{ matrix.os }})
-    needs: check
+    needs: [check, integration]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
     strategy:

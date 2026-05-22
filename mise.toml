@@ -31,12 +31,12 @@ description = "Run golden/snapshot tests"
 run = "cargo test --workspace -- golden"
 
 [tasks.test-integration]
-description = "Integration tests (opt-in; lands in v0.2)"
-run = "echo 'test-integration: not wired up yet — feature `integration` arrives in v0.2'"
+description = "Integration tests (opt-in; PTY backend and real mise when present)"
+run = "cargo test -p cockpit-terminal --features integration && cargo test -p cockpit-project --features integration"
 
 [tasks.test-ui-smoke]
-description = "UI smoke tests (opt-in; lands in v0.3)"
-run = "echo 'test-ui-smoke: not wired up yet — feature `ui-smoke` arrives in v0.3'"
+description = "UI smoke tests (opt-in; headless view-model flow)"
+run = "cargo test -p cockpit-ui --features ui-smoke ui_smoke && cargo test -p cockpit --features ui-smoke ui_smoke"
 
 [tasks.test-all]
 description = "Everything runnable today"

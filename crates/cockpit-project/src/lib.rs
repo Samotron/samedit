@@ -7,6 +7,7 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use directories::ProjectDirs;
@@ -161,7 +162,7 @@ fn mise_config_path(root_path: &Path) -> Option<PathBuf> {
 }
 
 fn mise_available() -> bool {
-    std::process::Command::new("mise")
+    Command::new("mise")
         .arg("--version")
         .output()
         .map(|output| output.status.success())
@@ -618,6 +619,94 @@ pub fn walk_project_files(root: impl AsRef<Path>) -> Result<Vec<PathBuf>, Projec
     Ok(files)
 }
 
+/// Git porcelain status keyed by project-relative path.
+pub type GitStatusMap = BTreeMap<PathBuf, GitFileStatus>;
+
+/// Coarse file status for file-browser badges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GitFileStatus {
+    Ignored,
+    Untracked,
+    Modified,
+    Renamed,
+    Added,
+    Deleted,
+    Conflicted,
+}
+
+/// Load `git status --porcelain` for a project root. Failure to execute `git`
+/// is reported to the caller; non-repository roots return an empty status map.
+pub fn git_status(root: impl AsRef<Path>) -> Result<GitStatusMap, ProjectError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root.as_ref())
+        .arg("status")
+        .arg("--porcelain=v1")
+        .output()
+        .map_err(ProjectError::Git)?;
+
+    if !output.status.success() {
+        return Ok(GitStatusMap::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_git_status_porcelain(&stdout))
+}
+
+/// Parse `git status --porcelain=v1` output into coarse browser badges.
+pub fn parse_git_status_porcelain(input: &str) -> GitStatusMap {
+    input
+        .lines()
+        .filter_map(parse_git_status_line)
+        .collect::<GitStatusMap>()
+}
+
+fn parse_git_status_line(line: &str) -> Option<(PathBuf, GitFileStatus)> {
+    if line.len() < 4 {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let index = bytes[0] as char;
+    let worktree = bytes[1] as char;
+    let path = line[3..].trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    let status = classify_git_status(index, worktree);
+    let path = if status == GitFileStatus::Renamed {
+        path.rsplit_once(" -> ")
+            .map_or(path, |(_, new_path)| new_path)
+    } else {
+        path
+    };
+    Some((PathBuf::from(path), status))
+}
+
+fn classify_git_status(index: char, worktree: char) -> GitFileStatus {
+    let status = [index, worktree];
+    if status.contains(&'U')
+        || matches!(
+            (index, worktree),
+            ('A', 'A') | ('D', 'D') | ('A', 'U') | ('U', 'A') | ('D', 'U') | ('U', 'D')
+        )
+    {
+        GitFileStatus::Conflicted
+    } else if index == '?' && worktree == '?' {
+        GitFileStatus::Untracked
+    } else if index == '!' && worktree == '!' {
+        GitFileStatus::Ignored
+    } else if status.contains(&'D') {
+        GitFileStatus::Deleted
+    } else if status.contains(&'A') {
+        GitFileStatus::Added
+    } else if status.iter().any(|&ch| ch == 'R' || ch == 'C') {
+        GitFileStatus::Renamed
+    } else {
+        GitFileStatus::Modified
+    }
+}
+
 fn walk_files_into(
     root: &Path,
     relative: &Path,
@@ -687,6 +776,8 @@ pub enum ProjectError {
     NotFound(PathBuf),
     #[error("project path is not a directory: {0}")]
     NotDirectory(PathBuf),
+    #[error("failed to inspect git status: {0}")]
+    Git(#[source] io::Error),
 }
 
 #[cfg(test)]
@@ -708,6 +799,48 @@ mod tests {
                 "src/nested/mod.rs",
                 "tests/basic.rs",
             ]
+        );
+    }
+
+    #[test]
+    fn parses_git_status_porcelain_into_browser_statuses() {
+        let statuses = parse_git_status_porcelain(concat!(
+            " M src/lib.rs\n",
+            "A  src/new.rs\n",
+            "R  src/old.rs -> src/renamed.rs\n",
+            " D deleted.rs\n",
+            "UU src/conflict.rs\n",
+            "?? scratch.txt\n",
+            "!! ignored.log\n",
+        ));
+
+        assert_eq!(
+            statuses.get(Path::new("src/lib.rs")),
+            Some(&GitFileStatus::Modified)
+        );
+        assert_eq!(
+            statuses.get(Path::new("src/new.rs")),
+            Some(&GitFileStatus::Added)
+        );
+        assert_eq!(
+            statuses.get(Path::new("src/renamed.rs")),
+            Some(&GitFileStatus::Renamed)
+        );
+        assert_eq!(
+            statuses.get(Path::new("deleted.rs")),
+            Some(&GitFileStatus::Deleted)
+        );
+        assert_eq!(
+            statuses.get(Path::new("src/conflict.rs")),
+            Some(&GitFileStatus::Conflicted)
+        );
+        assert_eq!(
+            statuses.get(Path::new("scratch.txt")),
+            Some(&GitFileStatus::Untracked)
+        );
+        assert_eq!(
+            statuses.get(Path::new("ignored.log")),
+            Some(&GitFileStatus::Ignored)
         );
     }
 
@@ -994,5 +1127,132 @@ zellij_layout = ".config/zellij/dev.kdl"
             .parent()
             .unwrap()
             .to_path_buf()
+    }
+}
+
+#[cfg(all(test, feature = "integration"))]
+mod integration_tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
+
+    use super::*;
+
+    fn real_mise_available() -> bool {
+        Command::new("mise")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn write_mise_fixture(root: &Path) {
+        fs::write(
+            root.join("mise.toml"),
+            r#"
+[env]
+COCKPIT_MISE_INTEGRATION = "1"
+
+[tasks.echo]
+description = "Echo from the integration fixture"
+run = "cargo --version"
+"#,
+        )
+        .unwrap();
+    }
+
+    struct MiseCliFixture {
+        project: tempfile::TempDir,
+        home: tempfile::TempDir,
+    }
+
+    impl MiseCliFixture {
+        fn new() -> Self {
+            let project = tempfile::tempdir().unwrap();
+            write_mise_fixture(project.path());
+            let home = tempfile::tempdir().unwrap();
+
+            let fixture = Self { project, home };
+            let output = fixture.run(&["trust", "mise.toml"]);
+            assert!(
+                output.status.success(),
+                "mise trust failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fixture
+        }
+
+        fn project_path(&self) -> &Path {
+            self.project.path()
+        }
+
+        fn home_path(&self) -> PathBuf {
+            self.home.path().to_path_buf()
+        }
+
+        fn run(&self, args: &[&str]) -> Output {
+            Command::new("mise")
+                .arg("-C")
+                .arg(self.project_path())
+                .args(args)
+                .env("HOME", self.home_path())
+                .env("USERPROFILE", self.home_path())
+                .env("XDG_CONFIG_HOME", self.home_path().join(".config"))
+                .env("XDG_DATA_HOME", self.home_path().join(".local/share"))
+                .env("XDG_CACHE_HOME", self.home_path().join(".cache"))
+                .env("MISE_LOCKED", "1")
+                .output()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn real_mise_lists_tasks_without_installing_tools() {
+        if !real_mise_available() {
+            return;
+        }
+
+        let fixture = MiseCliFixture::new();
+
+        let project = detect_mise_project(fixture.project_path()).unwrap();
+        assert!(project.detected);
+        assert!(project.available);
+        assert_eq!(
+            project
+                .tasks
+                .iter()
+                .map(|task| task.name.as_str())
+                .collect::<Vec<_>>(),
+            ["echo"]
+        );
+        assert!(project.tools.is_empty());
+
+        let output = fixture.run(&["tasks", "--name-only", "--local"]);
+        assert!(
+            output.status.success(),
+            "mise tasks failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.lines().any(|line| line == "echo"));
+    }
+
+    #[test]
+    fn real_mise_exec_runs_a_command_without_dependency_preparation() {
+        if !real_mise_available() {
+            return;
+        }
+
+        let fixture = MiseCliFixture::new();
+
+        let output = fixture.run(&["exec", "--locked", "--no-deps", "--", "cargo", "--version"]);
+        assert!(
+            output.status.success(),
+            "mise exec failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("cargo"));
     }
 }

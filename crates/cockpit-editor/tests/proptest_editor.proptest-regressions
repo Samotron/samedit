@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc c49a5b66c7f0b523e728ca3ab154ba905467bfe1dad5c6dbb030304c43070c97 # shrinks to initial = "λ", keys = [Char('/'), Char('h'), Enter]
 cc ad191ee5d9208629ebeff01a85c360b90127bee56ca07116ab844ada6652a660 # shrinks to initial = "\n\néé", keys = [Char('G'), Char('X'), Char('x'), Char('/'), Char('h'), Enter]
+cc b9a68cc60e82d816aa158429bb62ce37f8f935f5f4fd17f125530a27dcb06e29 # shrinks to initial = "", keys = [Char('i'), Char('h'), Char('h'), Escape, Char('v'), Char('g')]
