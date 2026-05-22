@@ -127,9 +127,10 @@ mise run run           # cargo run -p cockpit
 mise run run-fixture -- mise-basic
 ```
 
-`test-integration` and `test-ui-smoke` are placeholders today; they land in
-v0.2 and v0.3 behind the `integration` and `ui-smoke` Cargo features
-respectively.
+`test-integration` runs the opt-in, `integration`-gated tests: the real-PTY
+terminal tests and the `mise` CLI tests (which skip cleanly when `mise` is not
+installed). `test-ui-smoke` is still a placeholder; it lands in v0.3 behind the
+`ui-smoke` Cargo feature.
 
 ### Before you say "done"
 

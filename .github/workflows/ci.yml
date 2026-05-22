@@ -65,6 +65,12 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup show
 
+      - name: Install mise
+        if: runner.os != 'Windows'
+        run: |
+          curl https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
@@ -74,11 +80,17 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Clippy (integration feature)
+      - name: Clippy — cockpit-terminal (integration)
         run: cargo clippy -p cockpit-terminal --all-targets --features integration -- -D warnings
+
+      - name: Clippy — cockpit-project (integration)
+        run: cargo clippy -p cockpit-project --all-targets --features integration -- -D warnings
 
       - name: PTY integration tests
         run: cargo test -p cockpit-terminal --features integration
+
+      - name: mise CLI integration tests
+        run: cargo test -p cockpit-project --features integration
 
   package:
     name: package (${{ matrix.os }})

@@ -31,8 +31,8 @@ description = "Run golden/snapshot tests"
 run = "cargo test --workspace -- golden"
 
 [tasks.test-integration]
-description = "Integration tests (opt-in; real PTY + shell)"
-run = "cargo test -p cockpit-terminal --features integration"
+description = "Integration tests (opt-in; real PTY, shell, and mise)"
+run = "cargo test -p cockpit-terminal --features integration && cargo test -p cockpit-project --features integration"
 
 [tasks.test-ui-smoke]
 description = "UI smoke tests (opt-in; lands in v0.3)"
