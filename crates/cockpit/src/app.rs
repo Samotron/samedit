@@ -13,7 +13,9 @@ use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::GlobalKeys;
 use cockpit_editor::vim::{Key as VimKey, Mode};
 use cockpit_editor::{Editor, EditorSignal};
-use cockpit_project::{FileNodeKind, FileTree, ProjectDetection, walk_project_files};
+use cockpit_project::{
+    FileNodeKind, FileTree, ProjectCache, ProjectDetection, project_cache_path, walk_project_files,
+};
 use cockpit_render::theme::Color;
 use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
 use cockpit_terminal::live::{LiveTerminal, WakeFn};
@@ -73,11 +75,15 @@ pub struct AppModel {
     file_index: Option<Vec<String>>,
     terminal: Option<LiveTerminal>,
     redraw: Option<RedrawHandle>,
+    cache_path: Option<PathBuf>,
     exit: bool,
 }
 
 impl AppModel {
     /// Build the model for a detected project and its loaded file tree.
+    ///
+    /// This is pure — call [`restore_cached_state`](Self::restore_cached_state)
+    /// afterwards to load persisted per-project state from disk.
     pub fn new(detection: ProjectDetection, tree: FileTree) -> Result<Self, String> {
         let router = InputRouter::from_global_keys(&GlobalKeys::default())
             .map_err(|err| format!("input router setup failed: {err:?}"))?;
@@ -94,9 +100,63 @@ impl AppModel {
             file_index: None,
             terminal: None,
             redraw: None,
+            cache_path: None,
             exit: false,
             detection,
         })
+    }
+
+    /// Resolve this project's cache file and restore persisted state from it
+    /// (pane widths, last active file — spec §7). Touches disk; the binary
+    /// calls it once after [`new`](Self::new).
+    pub fn restore_cached_state(&mut self) {
+        let Ok(path) = project_cache_path(&self.detection.root_path) else {
+            return;
+        };
+        let cache = ProjectCache::load(&path).unwrap_or_default();
+        self.cache_path = Some(path);
+        self.apply_cache(cache);
+    }
+
+    /// Restore persisted pane widths and reopen the last active file.
+    fn apply_cache(&mut self, cache: ProjectCache) {
+        let mut prefs = self.layout.preferences().clone();
+        if let Some(width) = cache.left_width {
+            prefs.left_width = u32::from(width);
+        }
+        if let Some(width) = cache.right_width {
+            prefs.right_width = u32::from(width);
+        }
+        self.layout.set_preferences(prefs);
+
+        if let Some(active) = cache.active_file
+            && active.is_file()
+        {
+            self.open_document(active);
+        }
+    }
+
+    /// Snapshot the per-project state worth persisting across sessions.
+    fn build_cache(&self) -> ProjectCache {
+        let active_file = self.document.as_ref().map(|doc| doc.path.clone());
+        let prefs = self.layout.preferences();
+        ProjectCache {
+            open_files: active_file.clone().into_iter().collect(),
+            active_file,
+            left_width: Some(prefs.left_width as u16),
+            right_width: Some(prefs.right_width as u16),
+            ..ProjectCache::default()
+        }
+    }
+
+    /// Persist per-project state. Called by the harness as the app exits.
+    pub fn on_shutdown(&mut self) {
+        let Some(path) = self.cache_path.clone() else {
+            return;
+        };
+        if let Err(err) = self.build_cache().store(&path) {
+            tracing::warn!(error = %err, "failed to store project cache");
+        }
     }
 
     /// Project display name.
@@ -1176,6 +1236,10 @@ impl CockpitApp for AppShell {
         self.model.set_redraw_handle(handle);
     }
 
+    fn on_shutdown(&mut self) {
+        self.model.on_shutdown();
+    }
+
     fn wants_exit(&self) -> bool {
         self.model.wants_exit()
     }
@@ -1525,5 +1589,43 @@ mod tests {
         // Nothing to pick: the picker does not open.
         assert!(model.palette.is_none());
         assert!(model.status.contains("No mise tasks"));
+    }
+
+    #[test]
+    fn apply_cache_restores_pane_widths_and_the_active_file() {
+        let mut model = model();
+        let cache = ProjectCache {
+            active_file: Some(fixture_path("file-tree").join("README.md")),
+            left_width: Some(320),
+            right_width: Some(400),
+            ..ProjectCache::default()
+        };
+        model.apply_cache(cache);
+
+        assert_eq!(model.layout.preferences().left_width, 320);
+        assert_eq!(model.layout.preferences().right_width, 400);
+        assert_eq!(model.document.as_ref().unwrap().name, "README.md");
+    }
+
+    #[test]
+    fn apply_cache_ignores_a_missing_active_file() {
+        let mut model = model();
+        let cache = ProjectCache {
+            active_file: Some(fixture_path("file-tree").join("does-not-exist.rs")),
+            ..ProjectCache::default()
+        };
+        model.apply_cache(cache);
+        assert!(model.document.is_none());
+    }
+
+    #[test]
+    fn build_cache_snapshots_the_open_document_and_widths() {
+        let (model, _dir) = open_temp_doc("hello");
+        let cache = model.build_cache();
+
+        assert!(cache.active_file.is_some());
+        assert_eq!(cache.open_files.len(), 1);
+        assert_eq!(cache.left_width, Some(260));
+        assert_eq!(cache.right_width, Some(480));
     }
 }

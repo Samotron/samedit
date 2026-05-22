@@ -76,6 +76,10 @@ pub trait CockpitApp {
     /// Default: ignored.
     fn set_redraw_handle(&mut self, _handle: RedrawHandle) {}
 
+    /// Called once as the event loop exits, before [`run_app`] returns — the
+    /// place to persist state. Default: ignored.
+    fn on_shutdown(&mut self) {}
+
     /// True once the application wants the event loop to exit.
     fn wants_exit(&self) -> bool {
         false
@@ -271,6 +275,10 @@ impl<A: CockpitApp> ApplicationHandler for Harness<A> {
         if let Some(gl) = self.gl.as_ref() {
             gl.window.request_redraw();
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.app.on_shutdown();
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
