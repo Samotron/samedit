@@ -183,4 +183,12 @@ proptest! {
         let (line, col) = buffer.byte_to_line_col(byte);
         prop_assert_eq!(buffer.line_col_to_byte(line, col), byte);
     }
+
+    /// Loading text into the rope and reading it back returns it unchanged for
+    /// arbitrary UTF-8 — the pure analogue of the spec §18.4 save/load round
+    /// trip, and the only buffer property exercised on non-ASCII input.
+    #[test]
+    fn buffer_round_trips_arbitrary_text(text in "\\PC{0,80}") {
+        prop_assert_eq!(Buffer::from(text.as_str()).text(), text);
+    }
 }

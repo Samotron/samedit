@@ -122,6 +122,16 @@ impl Editor {
         self.dirty
     }
 
+    /// True when there is an edit available to undo (`u`).
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    /// True when there is an undone edit available to redo (`Ctrl+r`).
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
     /// Full buffer contents.
     pub fn text(&self) -> String {
         self.buffer.text()
@@ -230,7 +240,8 @@ impl Editor {
                 }
             }
             Action::Search(query) => {
-                if let Some(found) = search::find_next(&self.buffer, &query, self.cursor.byte() + 1)
+                let after_cursor = self.buffer.next_char_boundary(self.cursor.byte());
+                if let Some(found) = search::find_next(&self.buffer, &query, after_cursor)
                     .or_else(|| search::find_next(&self.buffer, &query, 0))
                 {
                     self.cursor.set_byte(&self.buffer, found.start);
@@ -709,10 +720,14 @@ mod tests {
     #[test]
     fn undo_and_redo_round_trip_an_edit() {
         let mut editor = Editor::new("abc");
+        assert!(!editor.can_undo());
         editor.handle_key(Key::Char('x'));
         assert_eq!(editor.text(), "bc");
+        assert!(editor.can_undo());
         editor.handle_key(Key::Char('u'));
         assert_eq!(editor.text(), "abc");
+        assert!(!editor.can_undo());
+        assert!(editor.can_redo());
         editor.handle_key(Key::Ctrl('r'));
         assert_eq!(editor.text(), "bc");
     }

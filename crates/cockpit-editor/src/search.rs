@@ -24,7 +24,12 @@ pub fn find_next(buffer: &Buffer, needle: &str, from: usize) -> Option<Range<usi
     }
 
     let haystack = buffer.text();
-    let start = from.min(haystack.len());
+    let mut start = from.min(haystack.len());
+    // `from` may land inside a multi-byte character; round up to a boundary so
+    // the slice below cannot panic. A match can only start on a boundary.
+    while start < haystack.len() && !haystack.is_char_boundary(start) {
+        start += 1;
+    }
     haystack[start..]
         .find(needle)
         .map(|relative| start + relative..start + relative + needle.len())
@@ -37,7 +42,11 @@ pub fn find_previous(buffer: &Buffer, needle: &str, from: usize) -> Option<Range
     }
 
     let haystack = buffer.text();
-    let end = from.min(haystack.len());
+    let mut end = from.min(haystack.len());
+    // Round `from` down to a character boundary so the slice cannot panic.
+    while end > 0 && !haystack.is_char_boundary(end) {
+        end -= 1;
+    }
     haystack[..end]
         .rfind(needle)
         .map(|start| start..start + needle.len())
@@ -77,5 +86,14 @@ mod tests {
     fn reports_utf8_byte_ranges() {
         let buffer = Buffer::from("aé aé");
         assert_eq!(find_all(&buffer, "é"), vec![1..3, 5..7]);
+    }
+
+    #[test]
+    fn tolerates_offsets_inside_multibyte_chars() {
+        let buffer = Buffer::from("aé bé cé");
+        // Byte 2 is inside the first 'é' (bytes 1..3): round to a boundary
+        // rather than panic when slicing the haystack.
+        assert_eq!(find_next(&buffer, "é", 2), Some(5..7));
+        let _ = find_previous(&buffer, "é", 2);
     }
 }
