@@ -7,6 +7,7 @@
 
 use crate::buffer::Buffer;
 use crate::cursor::Cursor;
+use crate::highlight::{self, HighlightSpan, Language};
 use crate::search;
 use crate::undo::History;
 use crate::vim::{Action, AppCommand, Key, LineDirection, Mode, Motion, Operator, PasteWhere, Vim};
@@ -44,6 +45,12 @@ pub struct Editor {
     register_linewise: bool,
     /// Anchor of the visual selection, set while in a Visual mode.
     selection: Option<Selection>,
+    /// Syntax-highlighting language, or `None` to disable highlighting.
+    language: Option<Language>,
+    /// Cached syntax highlights, refreshed when the buffer changes.
+    highlights: Vec<HighlightSpan>,
+    /// Buffer revision the cached `highlights` were computed at.
+    highlight_revision: u64,
     dirty: bool,
 }
 
@@ -58,8 +65,29 @@ impl Editor {
             register: String::new(),
             register_linewise: false,
             selection: None,
+            language: None,
+            highlights: Vec::new(),
+            highlight_revision: 0,
             dirty: false,
         }
+    }
+
+    /// Set the syntax-highlighting language (`None` disables it) and refresh
+    /// the cached highlights immediately.
+    pub fn set_language(&mut self, language: Option<Language>) {
+        self.language = language;
+        self.refresh_highlights();
+    }
+
+    /// The active syntax-highlighting language, if any.
+    pub fn language(&self) -> Option<Language> {
+        self.language
+    }
+
+    /// Syntax-highlight spans for the current buffer, in source order. Empty
+    /// when no language is set or the file is too large (spec §15).
+    pub fn highlights(&self) -> &[HighlightSpan] {
+        &self.highlights
     }
 
     /// The text buffer.
@@ -112,7 +140,18 @@ impl Editor {
                 signal = raised;
             }
         }
+        if self.buffer.revision() != self.highlight_revision {
+            self.refresh_highlights();
+        }
         signal
+    }
+
+    fn refresh_highlights(&mut self) {
+        self.highlights = match self.language {
+            Some(language) => highlight::compute(language, &self.buffer.text()),
+            None => Vec::new(),
+        };
+        self.highlight_revision = self.buffer.revision();
     }
 
     /// Apply one Vim action to the buffer/cursor. Returns a signal for the
@@ -822,5 +861,31 @@ mod tests {
         assert!(editor.is_dirty());
         editor.mark_saved();
         assert!(!editor.is_dirty());
+    }
+
+    #[test]
+    fn setting_a_language_enables_highlighting() {
+        let mut editor = Editor::new("fn main() {}");
+        assert!(editor.highlights().is_empty());
+        editor.set_language(Some(Language::Rust));
+        assert!(!editor.highlights().is_empty());
+    }
+
+    #[test]
+    fn highlights_refresh_after_an_edit() {
+        let mut editor = Editor::new("");
+        editor.set_language(Some(Language::Rust));
+        assert!(editor.highlights().is_empty());
+        editor.handle_key(Key::Char('i'));
+        for c in "fn f() {}".chars() {
+            editor.handle_key(Key::Char(c));
+        }
+        editor.handle_key(Key::Escape);
+        assert!(
+            editor
+                .highlights()
+                .iter()
+                .any(|span| span.kind == highlight::HighlightKind::Keyword)
+        );
     }
 }

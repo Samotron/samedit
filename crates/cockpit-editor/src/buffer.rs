@@ -12,6 +12,16 @@ use ropey::Rope;
 #[derive(Debug, Clone, Default)]
 pub struct Buffer {
     rope: Rope,
+    /// Bumped on every mutation so callers can cache derived data (e.g. syntax
+    /// highlights) and recompute only when the text actually changed.
+    revision: u64,
+}
+
+impl Buffer {
+    /// A monotonically increasing counter, incremented on every mutation.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 impl Buffer {
@@ -43,6 +53,7 @@ impl Buffer {
     /// Replace the byte `range` with `text`, returning the text that was
     /// removed. Out-of-range or inverted ranges are clamped to the buffer.
     pub fn replace(&mut self, range: Range<usize>, text: &str) -> String {
+        self.revision = self.revision.wrapping_add(1);
         let len = self.len_bytes();
         let start = range.start.min(len);
         let end = range.end.min(len).max(start);
@@ -153,6 +164,7 @@ impl From<&str> for Buffer {
     fn from(text: &str) -> Self {
         Self {
             rope: Rope::from_str(text),
+            revision: 0,
         }
     }
 }

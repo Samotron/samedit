@@ -1,0 +1,19 @@
+---
+source: crates/cockpit-editor/tests/golden_highlight.rs
+expression: "snapshot(\"struct_and_types\", \"struct Point {\\n    x: i32,\\n    y: i32,\\n}\\n\")"
+---
+case:   struct_and_types
+source: "struct Point {\n    x: i32,\n    y: i32,\n}\n"
+spans:
+  Keyword       0..6   "struct"
+  Type          7..12  "Point"
+  Punctuation  13..14  "{"
+  Variable     19..20  "x"
+  Punctuation  20..21  ":"
+  Type         22..25  "i32"
+  Punctuation  25..26  ","
+  Variable     31..32  "y"
+  Punctuation  32..33  ":"
+  Type         34..37  "i32"
+  Punctuation  37..38  ","
+  Punctuation  39..40  "}"

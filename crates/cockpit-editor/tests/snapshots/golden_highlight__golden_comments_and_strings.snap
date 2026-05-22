@@ -1,0 +1,11 @@
+---
+source: crates/cockpit-editor/tests/golden_highlight.rs
+expression: "snapshot(\"comments_and_strings\", \"// a greeting\\nlet msg = \\\"hello\\\\n\\\";\\n\")"
+---
+case:   comments_and_strings
+source: "// a greeting\nlet msg = \"hello\\n\";\n"
+spans:
+  Comment       0..13  "// a greeting"
+  Keyword      14..17  "let"
+  String       24..33  "\"hello\\n\""
+  Punctuation  33..34  ";"

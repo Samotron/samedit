@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::GlobalKeys;
 use cockpit_editor::vim::{Key as VimKey, Mode};
-use cockpit_editor::{Editor, EditorSignal};
+use cockpit_editor::{Editor, EditorSignal, HighlightKind, HighlightSpan, Language};
 use cockpit_project::{
     FileNodeKind, FileTree, ProjectCache, ProjectDetection, project_cache_path, walk_project_files,
 };
@@ -477,11 +477,9 @@ impl AppModel {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 self.status = format!("Opened {name}");
-                self.document = Some(OpenDocument {
-                    editor: Editor::new(&content),
-                    path,
-                    name,
-                });
+                let mut editor = Editor::new(&content);
+                editor.set_language(Language::from_path(&path));
+                self.document = Some(OpenDocument { editor, path, name });
                 self.layout.focus(PaneId::Editor);
             }
             Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
@@ -707,15 +705,14 @@ impl AppModel {
                 self.theme.muted_text,
                 FONT,
             );
-            if !line.is_empty() {
-                canvas.text(
-                    content.x + GUTTER_W,
-                    line_y,
-                    (*line).to_string(),
-                    self.theme.text,
-                    FONT,
-                );
-            }
+            self.paint_code_line(
+                canvas,
+                content.x + GUTTER_W,
+                line_y,
+                line,
+                buffer.line_to_byte(line_index),
+                editor.highlights(),
+            );
         }
 
         if cursor_line >= first && cursor_line < first + visible {
@@ -749,6 +746,71 @@ impl AppModel {
         }
 
         self.paint_mode_line(canvas, content, editor, cursor_line, cursor_col);
+    }
+
+    /// Draw one buffer line, splitting it into themed runs per highlight span.
+    /// `line_start` is the line's byte offset in the full buffer.
+    fn paint_code_line(
+        &self,
+        canvas: &mut Canvas<'_>,
+        base_x: f32,
+        y: f32,
+        line: &str,
+        line_start: usize,
+        highlights: &[HighlightSpan],
+    ) {
+        let char_w = FONT * CHAR_W_RATIO;
+        let mut byte = 0usize;
+        let mut col = 0usize;
+        while byte < line.len() {
+            let abs = line_start + byte;
+            let (seg_end, color) = match highlights
+                .iter()
+                .find(|span| span.range.start <= abs && abs < span.range.end)
+            {
+                Some(span) => (
+                    (span.range.end - line_start).min(line.len()),
+                    self.syntax_color(span.kind),
+                ),
+                None => {
+                    // Run plain text up to wherever the next highlight begins.
+                    let next = highlights
+                        .iter()
+                        .map(|span| span.range.start)
+                        .filter(|&start| start > abs)
+                        .min()
+                        .map(|start| (start - line_start).min(line.len()))
+                        .unwrap_or(line.len());
+                    (next, self.theme.text)
+                }
+            };
+            let segment = &line[byte..seg_end];
+            canvas.text(
+                base_x + col as f32 * char_w,
+                y,
+                segment.to_string(),
+                color,
+                FONT,
+            );
+            col += segment.chars().count();
+            byte = seg_end;
+        }
+    }
+
+    fn syntax_color(&self, kind: HighlightKind) -> Color {
+        let syntax = &self.theme.syntax;
+        match kind {
+            HighlightKind::Keyword => syntax.keyword,
+            HighlightKind::Function => syntax.function,
+            HighlightKind::Type => syntax.type_name,
+            HighlightKind::String => syntax.string,
+            HighlightKind::Comment => syntax.comment,
+            HighlightKind::Constant => syntax.constant,
+            HighlightKind::Variable => syntax.variable,
+            HighlightKind::Operator => syntax.operator,
+            HighlightKind::Attribute => syntax.attribute,
+            HighlightKind::Punctuation => syntax.punctuation,
+        }
     }
 
     fn paint_mode_line(

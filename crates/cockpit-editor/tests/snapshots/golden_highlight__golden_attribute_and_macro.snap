@@ -1,0 +1,25 @@
+---
+source: crates/cockpit-editor/tests/golden_highlight.rs
+expression: "snapshot(\"attribute_and_macro\",\n\"#[derive(Debug)]\\nstruct S;\\nfn f() { println!(\\\"hi\\\"); }\\n\")"
+---
+case:   attribute_and_macro
+source: "#[derive(Debug)]\nstruct S;\nfn f() { println!(\"hi\"); }\n"
+spans:
+  Attribute     0..1   "#"
+  Punctuation   1..2   "["
+  Attribute     2..8   "derive"
+  Punctuation   8..9   "("
+  Function      9..14  "Debug"
+  Punctuation  14..16  ")]"
+  Keyword      17..23  "struct"
+  Type         24..25  "S"
+  Punctuation  25..26  ";"
+  Keyword      27..29  "fn"
+  Function     30..31  "f"
+  Punctuation  31..33  "()"
+  Punctuation  34..35  "{"
+  Function     36..44  "println!"
+  Punctuation  44..45  "("
+  String       45..49  "\"hi\""
+  Punctuation  49..51  ");"
+  Punctuation  52..53  "}"

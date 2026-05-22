@@ -1,0 +1,14 @@
+---
+source: crates/cockpit-editor/tests/golden_highlight.rs
+expression: "snapshot(\"function\", \"fn main() {\\n    return;\\n}\\n\")"
+---
+case:   function
+source: "fn main() {\n    return;\n}\n"
+spans:
+  Keyword       0..2   "fn"
+  Function      3..7   "main"
+  Punctuation   7..9   "()"
+  Punctuation  10..11  "{"
+  Keyword      16..22  "return"
+  Punctuation  22..23  ";"
+  Punctuation  24..25  "}"
