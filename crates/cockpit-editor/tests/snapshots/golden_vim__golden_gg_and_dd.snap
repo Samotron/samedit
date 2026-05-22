@@ -9,10 +9,10 @@ steps:
     actions: []
   - key: Char('g')
     actions:
-      - MoveFileStart
+      - Move(FileStart)
   - key: Char('d')
     actions: []
   - key: Char('d')
     actions:
-      - DeleteLine
+      - DeleteLine(1)
 final_mode: Normal

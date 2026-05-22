@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"replace_char\", \"cat\", &chars(\"rb\"))"
+---
+case:   replace_char
+start:  "cat"
+keys:   r b
+mode:   Normal
+cursor: 0:0
+dirty:  true
+buffer:
+  | ‸bat

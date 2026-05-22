@@ -1,0 +1,13 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"count_delete_lines\", \"one\\ntwo\\nthree\\nfour\", &chars(\"2dd\"))"
+---
+case:   count_delete_lines
+start:  "one\ntwo\nthree\nfour"
+keys:   2 d d
+mode:   Normal
+cursor: 0:0
+dirty:  true
+buffer:
+  | ‸three
+  | four

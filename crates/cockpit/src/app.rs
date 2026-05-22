@@ -663,6 +663,37 @@ impl AppModel {
         let top = content.y + PAD * 0.5;
         let char_w = FONT * CHAR_W_RATIO;
 
+        if let Some((sel_start, sel_end)) = editor.selection() {
+            for row in 0..visible {
+                let line_index = first + row;
+                let Some(line) = lines.get(line_index) else {
+                    break;
+                };
+                let line_start = buffer.line_to_byte(line_index);
+                let line_end = line_start + line.len();
+                if sel_end <= line_start || sel_start > line_end {
+                    continue;
+                }
+                let from = sel_start.saturating_sub(line_start).min(line.len());
+                let to = (sel_end - line_start).min(line.len());
+                let start_col = line[..from].chars().count();
+                let end_col = line[..to].chars().count();
+                // A linewise selection running past this line still shows a sliver.
+                let extends_past = sel_end > line_end;
+                let cols = (end_col - start_col).max(usize::from(extends_past));
+                if cols == 0 {
+                    continue;
+                }
+                canvas.rect(
+                    content.x + GUTTER_W + start_col as f32 * char_w,
+                    top + row as f32 * ROW_H,
+                    cols as f32 * char_w,
+                    ROW_H,
+                    self.theme.selection,
+                );
+            }
+        }
+
         for row in 0..visible {
             let line_index = first + row;
             let Some(line) = lines.get(line_index) else {
@@ -734,6 +765,9 @@ impl AppModel {
         let mode = match editor.mode() {
             Mode::Normal => "NORMAL".to_string(),
             Mode::Insert => "INSERT".to_string(),
+            Mode::Visual => "VISUAL".to_string(),
+            Mode::VisualLine => "VISUAL LINE".to_string(),
+            Mode::Replace => "REPLACE".to_string(),
             Mode::Command => format!("COMMAND  :{}", editor.vim().command_line()),
             Mode::Search => format!("SEARCH  /{}", editor.vim().search_query()),
         };

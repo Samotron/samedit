@@ -1,0 +1,12 @@
+---
+source: crates/cockpit-editor/tests/golden_editor.rs
+expression: "snapshot(\"visual_delete\", \"abcdef\", &chars(\"vlld\"))"
+---
+case:   visual_delete
+start:  "abcdef"
+keys:   v l l d
+mode:   Normal
+cursor: 0:0
+dirty:  true
+buffer:
+  | ‸def

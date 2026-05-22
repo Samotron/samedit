@@ -7,7 +7,7 @@ start_mode: Normal
 steps:
   - key: Char('o')
     actions:
-      - MoveLineEnd
+      - Move(LineEnd)
       - InsertChar('\n')
       - EnterMode(Insert)
 final_mode: Insert

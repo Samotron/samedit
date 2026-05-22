@@ -1,0 +1,21 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"visual_delete\", &chars(\"vlld\"))"
+---
+case: visual_delete
+start_mode: Normal
+steps:
+  - key: Char('v')
+    actions:
+      - EnterMode(Visual)
+  - key: Char('l')
+    actions:
+      - Move(Right)
+  - key: Char('l')
+    actions:
+      - Move(Right)
+  - key: Char('d')
+    actions:
+      - DeleteSelection
+      - EnterMode(Normal)
+final_mode: Normal

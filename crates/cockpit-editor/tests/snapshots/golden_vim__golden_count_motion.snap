@@ -1,0 +1,15 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"count_motion\", &chars(\"3w\"))"
+---
+case: count_motion
+start_mode: Normal
+steps:
+  - key: Char('3')
+    actions: []
+  - key: Char('w')
+    actions:
+      - Move(WordForward)
+      - Move(WordForward)
+      - Move(WordForward)
+final_mode: Normal

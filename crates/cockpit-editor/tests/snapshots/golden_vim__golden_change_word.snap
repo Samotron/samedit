@@ -1,0 +1,14 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"change_word\", &chars(\"cw\"))"
+---
+case: change_word
+start_mode: Normal
+steps:
+  - key: Char('c')
+    actions: []
+  - key: Char('w')
+    actions:
+      - Operate { operator: Change, motion: WordForward }
+      - EnterMode(Insert)
+final_mode: Insert

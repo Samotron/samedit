@@ -1,0 +1,14 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"replace_char\", &chars(\"rx\"))"
+---
+case: replace_char
+start_mode: Normal
+steps:
+  - key: Char('r')
+    actions: []
+  - key: Char('x')
+    actions:
+      - ReplaceChar('x')
+      - Move(Left)
+final_mode: Normal

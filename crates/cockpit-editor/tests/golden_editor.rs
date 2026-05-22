@@ -142,3 +142,55 @@ fn golden_go_to_file_ends() {
         &chars("Ggg")
     ));
 }
+
+#[test]
+fn golden_delete_word() {
+    insta::assert_snapshot!(snapshot("delete_word", "alpha beta gamma", &chars("dw")));
+}
+
+#[test]
+fn golden_change_word() {
+    let mut keys = chars("cw");
+    keys.extend(chars("ALPHA"));
+    keys.push(Key::Escape);
+    insta::assert_snapshot!(snapshot("change_word", "alpha beta", &keys));
+}
+
+#[test]
+fn golden_count_delete_lines() {
+    insta::assert_snapshot!(snapshot(
+        "count_delete_lines",
+        "one\ntwo\nthree\nfour",
+        &chars("2dd")
+    ));
+}
+
+#[test]
+fn golden_replace_char() {
+    insta::assert_snapshot!(snapshot("replace_char", "cat", &chars("rb")));
+}
+
+#[test]
+fn golden_join_lines() {
+    insta::assert_snapshot!(snapshot("join_lines", "hello\n  world", &[Key::Char('J')]));
+}
+
+#[test]
+fn golden_visual_delete() {
+    insta::assert_snapshot!(snapshot("visual_delete", "abcdef", &chars("vlld")));
+}
+
+#[test]
+fn golden_visual_line_delete() {
+    insta::assert_snapshot!(snapshot(
+        "visual_line_delete",
+        "one\ntwo\nthree",
+        &chars("Vjd")
+    ));
+}
+
+#[test]
+fn golden_replace_mode() {
+    let keys = vec![Key::Char('R'), Key::Char('X'), Key::Char('Y'), Key::Escape];
+    insta::assert_snapshot!(snapshot("replace_mode", "abcdef", &keys));
+}

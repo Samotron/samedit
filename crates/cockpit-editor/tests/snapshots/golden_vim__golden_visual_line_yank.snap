@@ -1,0 +1,18 @@
+---
+source: crates/cockpit-editor/tests/golden_vim.rs
+expression: "snapshot(\"visual_line_yank\", &chars(\"Vjy\"))"
+---
+case: visual_line_yank
+start_mode: Normal
+steps:
+  - key: Char('V')
+    actions:
+      - EnterMode(VisualLine)
+  - key: Char('j')
+    actions:
+      - Move(Line(Down))
+  - key: Char('y')
+    actions:
+      - YankSelection
+      - EnterMode(Normal)
+final_mode: Normal
