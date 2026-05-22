@@ -38,6 +38,18 @@ const CHAR_W_RATIO: f32 = 0.6;
 
 /// Command id for "quit the application" — handled directly by the shell.
 const APP_QUIT: &str = "app.quit";
+/// Command id for "pick and run a mise task".
+const MISE_RUN_TASK: &str = "mise.run_task";
+
+/// What activating a palette entry does — the palette is reused as both the
+/// command palette and the mise-task picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteMode {
+    /// Entries are app commands dispatched through `run_command`.
+    Commands,
+    /// Entries are mise task names sent to the terminal.
+    MiseTasks,
+}
 
 /// The document open in the editor pane: an [`Editor`] plus its file path.
 struct OpenDocument {
@@ -56,6 +68,7 @@ pub struct AppModel {
     status: String,
     document: Option<OpenDocument>,
     palette: Option<Palette>,
+    palette_mode: PaletteMode,
     finder: Option<FuzzyFinder>,
     file_index: Option<Vec<String>>,
     terminal: Option<LiveTerminal>,
@@ -76,6 +89,7 @@ impl AppModel {
             status: "Ready — select a file and press Enter to open it.".to_string(),
             document: None,
             palette: None,
+            palette_mode: PaletteMode::Commands,
             finder: None,
             file_index: None,
             terminal: None,
@@ -135,6 +149,7 @@ impl AppModel {
             command_ids::SAVE => self.save_document(),
             command_ids::COMMAND_PALETTE => self.open_palette(),
             command_ids::FUZZY_OPEN => self.open_finder(),
+            MISE_RUN_TASK => self.open_mise_tasks(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -142,8 +157,47 @@ impl AppModel {
 
     /// Open the command palette over the workspace.
     fn open_palette(&mut self) {
+        self.palette_mode = PaletteMode::Commands;
         self.palette = Some(Palette::new(palette_entries()));
         self.status = "Command palette — type to filter, Enter to run, Esc to close.".to_string();
+    }
+
+    /// Open the mise-task picker, populated from the detected project tasks.
+    fn open_mise_tasks(&mut self) {
+        let tasks = &self.detection.mise.tasks;
+        if tasks.is_empty() {
+            self.status = "No mise tasks detected for this project.".to_string();
+            return;
+        }
+        let entries = tasks
+            .iter()
+            .map(|task| {
+                let title = match task.description.as_deref() {
+                    Some(desc) if !desc.is_empty() => format!("{}  —  {desc}", task.name),
+                    _ => task.name.clone(),
+                };
+                PaletteEntry::new(task.name.as_str(), title)
+            })
+            .collect();
+        self.palette_mode = PaletteMode::MiseTasks;
+        self.palette = Some(Palette::new(entries));
+        self.status = "Run mise task — type to filter, Enter to run, Esc to close.".to_string();
+    }
+
+    /// Send `mise run <task>` to the terminal session, starting it if needed.
+    fn run_mise_task(&mut self, task: &str) {
+        self.ensure_terminal();
+        let command = format!("mise run {task}\r");
+        match self.terminal.as_mut() {
+            Some(terminal) => match terminal.send_input(command.as_bytes()) {
+                Ok(()) => {
+                    self.layout.focus(PaneId::Terminal);
+                    self.status = format!("Running mise task `{task}`.");
+                }
+                Err(err) => self.status = format!("Could not run `{task}`: {err}"),
+            },
+            None => self.status = format!("Cannot run `{task}` — terminal unavailable."),
+        }
     }
 
     /// Drive the modal command palette from one key chord.
@@ -157,11 +211,13 @@ impl AppModel {
             return;
         }
         if is_chord(chord, "Enter") {
-            let command = self.palette.as_ref().and_then(Palette::activate);
+            let selected = self.palette.as_ref().and_then(Palette::activate);
+            let mode = self.palette_mode;
             self.palette = None;
-            match command {
-                Some(id) => self.run_command(id.as_str()),
-                None => self.status = "No command selected.".to_string(),
+            match (selected, mode) {
+                (Some(id), PaletteMode::Commands) => self.run_command(id.as_str()),
+                (Some(id), PaletteMode::MiseTasks) => self.run_mise_task(id.as_str()),
+                (None, _) => self.status = "Nothing selected.".to_string(),
             }
             return;
         }
@@ -947,6 +1003,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(command_ids::FOCUS_TERMINAL, "View: Focus Terminal"),
         PaletteEntry::new(command_ids::TOGGLE_FILES, "View: Toggle Files Pane"),
         PaletteEntry::new(command_ids::TOGGLE_TERMINAL, "View: Toggle Terminal Pane"),
+        PaletteEntry::new(MISE_RUN_TASK, "Mise: Run Task"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -1134,6 +1191,14 @@ mod tests {
         let path = fixture_path("file-tree");
         let detection = detect_project(&path).expect("detect file-tree fixture");
         let tree = FileTree::load(&path).expect("load file-tree fixture");
+        AppModel::new(detection, tree).expect("build model")
+    }
+
+    /// A model over the `mise-basic` fixture, which has `lint` and `test` tasks.
+    fn mise_model() -> AppModel {
+        let path = fixture_path("mise-basic");
+        let detection = detect_project(&path).expect("detect mise-basic fixture");
+        let tree = FileTree::load(&path).expect("load mise-basic fixture");
         AppModel::new(detection, tree).expect("build model")
     }
 
@@ -1417,5 +1482,48 @@ mod tests {
 
         assert!(model.finder.is_none());
         assert!(model.document.is_none());
+    }
+
+    #[test]
+    fn palette_mise_run_task_opens_the_task_picker() {
+        let mut model = mise_model();
+        model.dispatch(chord("Ctrl+Shift+p"));
+        type_keys(&mut model, "mise");
+        model.dispatch(chord("Enter")); // activate "Mise: Run Task"
+
+        let palette = model.palette.as_ref().expect("task picker open");
+        assert_eq!(model.palette_mode, PaletteMode::MiseTasks);
+        let ids: Vec<&str> = palette.entries().iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"lint"), "tasks: {ids:?}");
+        assert!(ids.contains(&"test"), "tasks: {ids:?}");
+    }
+
+    #[test]
+    fn running_a_mise_task_without_a_terminal_is_a_safe_no_op() {
+        let mut model = mise_model();
+        model.dispatch(chord("Ctrl+Shift+p"));
+        type_keys(&mut model, "mise");
+        model.dispatch(chord("Enter")); // open the task picker
+        model.dispatch(chord("Enter")); // run the highlighted task
+
+        assert!(model.palette.is_none());
+        // No redraw handle in tests → no terminal spawns; status reflects it.
+        assert!(
+            model.status.contains("terminal unavailable"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn mise_task_picker_is_empty_without_mise_tasks() {
+        let mut model = model(); // file-tree fixture has no mise.toml
+        model.dispatch(chord("Ctrl+Shift+p"));
+        type_keys(&mut model, "mise");
+        model.dispatch(chord("Enter"));
+
+        // Nothing to pick: the picker does not open.
+        assert!(model.palette.is_none());
+        assert!(model.status.contains("No mise tasks"));
     }
 }
