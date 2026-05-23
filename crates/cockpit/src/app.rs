@@ -24,7 +24,9 @@ use cockpit_lsp::{
     Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, Response,
     ServerConfig,
 };
-use cockpit_notebook::{CellKind, Notebook, is_notebook_source, parse_notebook, parse_quarto};
+use cockpit_notebook::{
+    CellKind, Notebook, is_notebook_source, parse_notebook, parse_quarto, quarto_render_spec,
+};
 use cockpit_project::{
     FileNodeKind, FileSystem, FileTree, FormatPlan, KnownFormatter,
     PathBinaryLookup as FormatPathLookup, ProcessRunner, ProcessSpec, ProjectCache,
@@ -118,6 +120,9 @@ const NOTEBOOK_INSERT_CELL_BELOW: &str = "notebook.insert_cell_below";
 const MODELS_BUILD_ALL: &str = "models.build_all";
 /// Command id for "show the dbt-lite DAG summary in the status line".
 const MODELS_SHOW_DAG: &str = "models.show_dag";
+/// Command id for "render the active Quarto document via `quarto
+/// render`" (v0.5 M5.Q3 wire-up).
+const QUARTO_RENDER: &str = "quarto.render";
 
 /// Name of the mise task cockpit invokes for the Test: * palette entries.
 /// Conventional default; M4 may make this configurable per project.
@@ -711,6 +716,7 @@ impl AppModel {
             NOTEBOOK_INSERT_CELL_BELOW => self.notebook_insert_cell_below(),
             MODELS_BUILD_ALL => self.run_build_all_models(),
             MODELS_SHOW_DAG => self.show_dag_summary(),
+            QUARTO_RENDER => self.render_quarto_document(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -2423,6 +2429,45 @@ impl AppModel {
         };
     }
 
+    /// Shell out to `mise exec -- quarto render <file>` for the active
+    /// Quarto document (v0.5 M5.Q3). Reports the exit status in the
+    /// status line; output paths the user can open are surfaced
+    /// through `quarto`'s own stdout.
+    fn render_quarto_document(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No document to render.".to_string();
+            return;
+        };
+        let is_qmd = doc
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("qmd"))
+            .unwrap_or(false);
+        if !is_qmd {
+            self.status = "Quarto: Render only works for .qmd files.".to_string();
+            return;
+        }
+        let spec = quarto_render_spec(&doc.path, &self.detection.root_path);
+        match self.process.run(&spec) {
+            Ok(output) if output.success => {
+                self.status = "Quarto: render complete.".to_string();
+            }
+            Ok(output) => {
+                let snippet = output
+                    .stderr_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("(no stderr)")
+                    .to_string();
+                self.status = format!("Quarto: render failed: {snippet}");
+            }
+            Err(err) => {
+                self.status = format!("Quarto: could not spawn `quarto`: {err}");
+            }
+        }
+    }
+
     /// Surface the DAG topological order + cycle info in the status line.
     fn show_dag_summary(&mut self) {
         let Some(project) = self.refresh_analytics_project() else {
@@ -3662,6 +3707,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(NOTEBOOK_INSERT_CELL_BELOW, "Notebook: Insert Cell Below"),
         PaletteEntry::new(MODELS_BUILD_ALL, "Models: Build All"),
         PaletteEntry::new(MODELS_SHOW_DAG, "Models: Show DAG"),
+        PaletteEntry::new(QUARTO_RENDER, "Quarto: Render"),
         PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
         PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
@@ -5040,6 +5086,31 @@ mod tests {
     }
 
     // ---- M4.4 — Format on save -------------------------------------------
+
+    #[test]
+    fn quarto_render_without_a_document_reports_clearly() {
+        let mut model = model();
+        model.run_command(QUARTO_RENDER);
+        assert!(
+            model.status.contains("No document"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn quarto_render_refuses_non_qmd_documents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plain.sql");
+        std::fs::write(&path, "SELECT 1;\n").expect("seed file");
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(path);
+
+        model.run_command(QUARTO_RENDER);
+        assert!(model.status.contains(".qmd"), "status: {}", model.status);
+    }
 
     #[test]
     fn opening_a_jupytext_sql_file_populates_the_notebook_view_model() {
