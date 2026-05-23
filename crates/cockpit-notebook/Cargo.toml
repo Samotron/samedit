@@ -1,0 +1,12 @@
+[package]
+name = "cockpit-notebook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Jupytext-style notebook view-model for Coding Cockpit (v0.5)."
+
+[dependencies]
+cockpit-sql.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"

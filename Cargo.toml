@@ -17,7 +17,9 @@ cockpit-editor = { path = "crates/cockpit-editor" }
 cockpit-lsp = { path = "crates/cockpit-lsp" }
 cockpit-terminal = { path = "crates/cockpit-terminal" }
 cockpit-ui = { path = "crates/cockpit-ui" }
+cockpit-notebook = { path = "crates/cockpit-notebook" }
 cockpit-render = { path = "crates/cockpit-render" }
+cockpit-sql = { path = "crates/cockpit-sql" }
 cockpit-testkit = { path = "crates/cockpit-testkit" }
 
 [profile.release]

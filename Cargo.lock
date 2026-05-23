@@ -622,6 +622,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-notebook"
+version = "0.0.1"
+dependencies = [
+ "cockpit-sql",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cockpit-project"
 version = "0.0.1"
 dependencies = [
@@ -647,6 +656,17 @@ dependencies = [
  "raw-window-handle",
  "thiserror 2.0.18",
  "winit",
+]
+
+[[package]]
+name = "cockpit-sql"
+version = "0.0.1"
+dependencies = [
+ "cockpit-project",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

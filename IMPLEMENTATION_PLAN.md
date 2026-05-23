@@ -497,40 +497,41 @@ inside all three modes — they're orthogonal layers.
 
 ### Engine integration
 
-- [ ] **M5.1 — DuckDB via shell-out + mise** — execute plain SQL cells by
-  spawning `mise exec -- duckdb`. No embedded `duckdb` crate (keeps the
-  binary small and protects the future instant-load target). If `duckdb`
-  is not in `[tools]`, surface the standard prompt: *"Add `duckdb` to
-  `mise.toml` `[tools]`? [Y/n]"* — never auto-install (AGENTS.md rule
-  #6, spec §8). Long-running session per project: spawn one `duckdb`
-  subprocess on first execution, feed statements over stdin, parse JSON
-  over stdout. Lives in a new crate **`cockpit-sql`** (headless-testable
-  — the DuckDB transport is behind a `SqlEngine` trait with a fake impl
-  in `cockpit-testkit`, mirroring the `TerminalEngine` pattern).
-- [ ] **M5.1a — ggsql via shell-out + mise** — visualisation cells go
-  through `mise exec -- ggsql exec --reader duckdb://memory --writer
-  vegalite`, returning Vega-Lite v6 JSON. ggsql is a Posit project
-  (alpha, Rust, `cargo install ggsql-cli` or via `mise use cargo:ggsql-cli`)
-  that wraps DuckDB internally and emits Vega-Lite specs. Same prompt
-  pattern as M5.1 when absent. Same `SqlEngine` trait — a second
-  `GgsqlEngine` impl, swappable in tests.
+- [x] **M5.1 — DuckDB via shell-out + mise** — new `cockpit-sql` crate
+  hosts the `SqlEngine` trait + `DuckDbEngine` impl. Every query becomes
+  one `mise exec -- duckdb -json -c <sql>` spawn through the M4.10
+  `ProcessRunner` seam, so notebook tests script every interaction with
+  the engine without a real DuckDB binary on the test machine. The
+  long-running per-project session called out in the spec is an
+  optimisation behind the same trait — landing once latency from the
+  notebook UI proves it worthwhile. Detection (`detect_duckdb`) returns
+  `InMiseTools` / `OnPath` / `Missing` so callers drive the
+  "detect, surface, prompt" flow without auto-installing.
+- [x] **M5.1a — ggsql via shell-out + mise** — `GgsqlEngine` is the
+  second `SqlEngine` impl. Spawns `mise exec -- ggsql exec --reader
+  duckdb://memory --writer vegalite -c <sql>` and surfaces the
+  Vega-Lite JSON in a single-cell `QueryResult` for the M5.5 chart
+  renderer to pick up via `GgsqlEngine::extract_vega_lite`.
+  `statement_targets_ggsql` is the routing helper the notebook
+  view-model uses to send `VISUALISE`/`VISUALIZE` cells to ggsql and
+  everything else to DuckDB.
 
 ### Notebook mode
 
-- [ ] **M5.2 — Notebook file format** — Jupytext-style: **plain `.sql` or
-  `.ggsql` files with `-- %% cell` separators**, opened in a
-  `cockpit-notebook` view-model when the marker is detected. Rationale:
-  diffs cleanly in git, opens as plain SQL/ggsql in any editor, no JSON
-  envelope. A cell is routed to ggsql if its body contains a `VISUALISE`
-  (or `VISUALIZE`) clause, otherwise to DuckDB. Per-cell metadata
-  (title, options) goes in trailing `-- %% meta: { ... }` KDL lines.
-  Cell results are *not* persisted in the file — they live in a sibling
-  `.cockpit/results/<file>.json` cache so they survive reopens without
-  polluting source.
-- [ ] **M5.3 — Notebook view-model** — new crate `cockpit-notebook`. State
-  tree: `Notebook { cells: Vec<Cell { source, kind, status, result } }`,
-  where `kind ∈ { Sql, Ggsql }`. Pure data, fully unit-testable. Vim FSM
-  works inside an active cell; global keys move between cells.
+- [x] **M5.2 — Notebook file format** — `cockpit_notebook::parse_notebook`
+  parses Jupytext-style `.sql` / `.ggsql` files with `-- %% cell`
+  separators. Files without any markers parse into a single cell, so
+  opening a plain SQL file via the notebook view-model is lossless.
+  Per-cell metadata uses `-- %% meta: { title = "..." }` trailing
+  lines; explicit `kind = sql|ggsql|markdown` annotations override the
+  file-level default. Cell results live in memory only — never written
+  back to the source file.
+- [x] **M5.3 — Notebook view-model** — `cockpit-notebook` crate ships
+  `Cell`, `CellKind`, `CellStatus`, `CellResult`, and `Notebook` as
+  pure data + view helpers (`move_up`/`down`, `insert_cell_below`,
+  `set_active_source`, `apply_result`). Editing the active cell
+  re-routes a SQL cell to ggsql the instant the body picks up a
+  `VISUALISE` clause and clears stale results so the UI never lies.
 - [ ] **M5.4 — Inline tabular result rendering** — virtualised scrollable
   grid for DuckDB results (no full-load), rendered **inline beneath the
   source cell** — no separate pane, no popout. JSON pretty for
@@ -556,14 +557,14 @@ inside all three modes — they're orthogonal layers.
 
 ### Quarto mode
 
-- [ ] **M5.Q1 — Quarto file parser** — `.qmd` parses into the same
-  `Notebook` view-model as M5.3, but with a third cell kind
-  `Markdown`. Code chunks bounded by ```` ```{sql} ```` / ```` ```{ggsql} ````
-  (plus chunk options like `#| label:`, `#| echo: false`) feed the same
-  DuckDB/ggsql execution path. Non-SQL chunk languages (e.g. `{python}`,
-  `{r}`) are parsed and shown but **not executed in v0.5** — they get a
-  "language unsupported" status banner; full multi-kernel support is a
-  v0.6+ decision.
+- [x] **M5.Q1 — Quarto file parser** — `cockpit_notebook::parse_quarto`
+  parses `.qmd` into the same `Notebook` view-model as M5.3 with a
+  third `CellKind::Markdown`. Chunks bounded by ` ```{sql} ` /
+  ` ```{ggsql} ` route through the existing engines; `#| label:`
+  options become cell titles. Non-SQL languages (`{python}`, `{r}`,
+  etc.) parse as Markdown cells annotated with the source language so
+  the UI can show a "language unsupported" banner without losing the
+  user's code. Plain ` ``` ` fences pass through as Markdown prose.
 - [ ] **M5.Q2 — Inline Markdown rendering** — render Markdown cells
   inline (between code chunks, in the same document view) via
   `pulldown-cmark` → styled text runs in `cockpit-render`. Headings,
