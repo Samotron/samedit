@@ -129,8 +129,8 @@ mise run run-fixture -- mise-basic
 
 `test-integration` runs the opt-in, `integration`-gated tests: the real-PTY
 terminal tests and the `mise` CLI tests (which skip cleanly when `mise` is not
-installed). `test-ui-smoke` is still a placeholder; it lands in v0.3 behind the
-`ui-smoke` Cargo feature.
+installed). `test-ui-smoke` runs the `ui-smoke`-gated tests in `crates/cockpit`
+that assert on the `cockpit-ui` view-model tree (spec §18.8 — no pixel checks).
 
 ### Before you say "done"
 

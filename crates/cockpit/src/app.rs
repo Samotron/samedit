@@ -2315,3 +2315,141 @@ mod tests {
         assert_eq!(cache.right_width, Some(480));
     }
 }
+
+/// UI smoke tests (spec §18.8 / M3.6).
+///
+/// Asserts on the headless `cockpit-ui` view-model tree rather than pixels —
+/// the spec is explicit that pixel-level coverage is out of scope. Gated
+/// behind the `ui-smoke` Cargo feature so they stay out of the default test
+/// run; CI has a dedicated `ui-smoke` leg that enables them.
+#[cfg(all(test, feature = "ui-smoke"))]
+mod ui_smoke {
+    use super::*;
+    use cockpit_project::{detect_project, recent_projects_path};
+    use cockpit_testkit::fixture_path;
+    use cockpit_ui::{Launcher, LauncherAction, LauncherSelection, RecentProject};
+
+    /// Build an `AppModel` over the `rust-basic` fixture — the canonical
+    /// smoke-test project (it has a Cargo.toml and `src/main.rs`).
+    fn smoke_model() -> AppModel {
+        let path = fixture_path("rust-basic");
+        let detection = detect_project(&path).expect("detect rust-basic fixture");
+        let tree = FileTree::load(&path).expect("load rust-basic fixture");
+        AppModel::new(detection, tree).expect("build AppModel")
+    }
+
+    #[test]
+    fn smoke_app_starts() {
+        let model = smoke_model();
+        assert!(!model.exit, "app must not be exiting at startup");
+        assert!(
+            !model.status.is_empty(),
+            "the app should announce itself in the status line"
+        );
+    }
+
+    #[test]
+    fn smoke_project_launcher_renders() {
+        let recents = vec![
+            RecentProject::new("alpha", "/code/alpha"),
+            RecentProject::new("bravo", "/code/bravo"),
+        ];
+        let launcher = Launcher::new(recents);
+        assert_eq!(launcher.recents().len(), 2);
+        assert_eq!(launcher.actions(), LauncherAction::ALL);
+        // With recents present, the cursor lands on the first recent project.
+        assert_eq!(launcher.selection(), LauncherSelection::Recent(0));
+
+        // The launcher must also render cleanly with no recent projects.
+        let empty = Launcher::new(Vec::new());
+        assert!(empty.recents().is_empty());
+        assert_eq!(
+            empty.selection(),
+            LauncherSelection::Action(LauncherAction::OpenFolder),
+        );
+
+        // And the recent-projects cache file path must be resolvable so the
+        // binary can persist the launcher state at all.
+        recent_projects_path().expect("recent-projects path resolves");
+    }
+
+    #[test]
+    fn smoke_project_opens() {
+        let model = smoke_model();
+        // Detection must produce a project with a usable display name and at
+        // least one signal — that is the "opened project" view-model.
+        assert!(!model.detection.display_name.is_empty());
+        assert!(
+            model.detection.detected(),
+            "rust-basic fixture should detect at least one project signal",
+        );
+        // The file-browser view-model has visible rows for the project root.
+        assert!(
+            !model.browser.rows().is_empty(),
+            "file browser should populate from the project tree",
+        );
+    }
+
+    #[test]
+    fn smoke_three_panes_render() {
+        let model = smoke_model();
+        let computed = model.layout.compute(1600, 900);
+        assert!(
+            computed.files.is_some(),
+            "files pane must render in the default layout",
+        );
+        assert!(
+            computed.editor.width > 0,
+            "editor pane must have non-zero width",
+        );
+        assert!(
+            computed.terminal.is_some(),
+            "terminal pane must render in the default layout",
+        );
+    }
+
+    #[test]
+    fn smoke_file_can_be_opened() {
+        let mut model = smoke_model();
+        assert!(model.document.is_none(), "no file is open at startup");
+        model.open_path_reference("src/main.rs");
+        let doc = model.document.as_ref().expect("file opens");
+        assert_eq!(doc.name, "main.rs");
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+    }
+
+    #[test]
+    fn smoke_terminal_pane_can_be_created() {
+        let mut model = smoke_model();
+        // Focusing the terminal pane is the user-visible action that "creates"
+        // it from the layout view-model's perspective. The actual PTY spawn is
+        // covered separately by the integration leg.
+        model.run_command(command_ids::FOCUS_TERMINAL);
+        assert_eq!(model.layout.focused(), PaneId::Terminal);
+        let computed = model.layout.compute(1600, 900);
+        assert!(computed.terminal.is_some(), "terminal pane must be visible");
+    }
+
+    #[test]
+    fn smoke_basic_keybindings_work() {
+        let mut model = smoke_model();
+        // The default global key map (cockpit-config::GlobalKeys::default())
+        // routes Ctrl+h → focus files, Ctrl+l → focus terminal, Ctrl+j → editor.
+        model.dispatch("Ctrl+h".parse().expect("valid chord"));
+        assert_eq!(model.layout.focused(), PaneId::Files);
+        model.dispatch("Ctrl+l".parse().expect("valid chord"));
+        assert_eq!(model.layout.focused(), PaneId::Terminal);
+        model.dispatch("Ctrl+j".parse().expect("valid chord"));
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+        // Every chord that traversed dispatch should have been recorded.
+        assert_eq!(model.key_log.len(), 3);
+    }
+
+    #[test]
+    fn smoke_app_exits_cleanly() {
+        let mut model = smoke_model();
+        assert!(!model.wants_exit());
+        model.run_command(APP_QUIT);
+        assert!(model.wants_exit(), "App: Quit must set the wants_exit flag",);
+    }
+}

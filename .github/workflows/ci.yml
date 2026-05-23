@@ -92,6 +92,43 @@ jobs:
       - name: mise CLI integration tests
         run: cargo test -p cockpit-project --features integration
 
+  ui-smoke:
+    name: ui-smoke (${{ matrix.os }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxkbcommon-dev libwayland-dev \
+            libxcursor-dev libxrandr-dev libxi-dev
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ui-smoke-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clippy — cockpit (ui-smoke)
+        run: cargo clippy -p cockpit --all-targets --features ui-smoke -- -D warnings
+
+      - name: UI smoke tests
+        run: cargo test -p cockpit --features ui-smoke
+
   package:
     name: package (${{ matrix.os }})
     needs: check

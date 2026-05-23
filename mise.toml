@@ -35,8 +35,8 @@ description = "Integration tests (opt-in; real PTY, shell, and mise)"
 run = "cargo test -p cockpit-terminal --features integration && cargo test -p cockpit-project --features integration"
 
 [tasks.test-ui-smoke]
-description = "UI smoke tests (opt-in; lands in v0.3)"
-run = "echo 'test-ui-smoke: not wired up yet — feature `ui-smoke` arrives in v0.3'"
+description = "UI smoke tests (opt-in; cockpit-ui view-model assertions)"
+run = "cargo test -p cockpit --features ui-smoke"
 
 [tasks.test-all]
 description = "Everything runnable today"
