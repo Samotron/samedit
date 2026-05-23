@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use cockpit_commands::{KeyChord, Modifiers};
-use cockpit_config::GlobalKeys;
+use cockpit_config::{GlobalKeys, ZellijLayout};
 use cockpit_editor::vim::{Key as VimKey, Mode};
 use cockpit_editor::{Editor, EditorSignal, HighlightKind, HighlightSpan, Language};
 use cockpit_project::{
@@ -445,6 +445,27 @@ impl AppModel {
         }
     }
 
+    /// Resolve the optional per-project Zellij layout file (spec §9 / §10 v0.3).
+    /// Returns the absolute path on a successful KDL parse; surfaces a status
+    /// warning and falls back to no-layout on read/parse errors so a broken
+    /// layout never blocks the terminal from launching.
+    fn resolve_zellij_layout(&mut self) -> Option<PathBuf> {
+        let configured = self
+            .detection
+            .mise
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.zellij_layout.as_deref())?;
+        let absolute = self.detection.root_path.join(configured);
+        match ZellijLayout::load(&absolute) {
+            Ok(layout) => Some(layout.path),
+            Err(err) => {
+                self.status = format!("Zellij layout {} ignored: {err}", configured.display(),);
+                None
+            }
+        }
+    }
+
     /// Spawn the terminal session on first use of the terminal pane.
     fn ensure_terminal(&mut self) {
         if self.terminal.is_some() {
@@ -454,13 +475,21 @@ impl AppModel {
             self.status = "Terminal unavailable — no redraw handle.".to_string();
             return;
         };
+        let layout = self.resolve_zellij_layout();
         let plan = plan_launch(
             &self.detection.display_name,
+            layout.as_deref(),
             &PathBinaryLookup,
             ShellProfile::host_default(),
         );
         let (command, label) = match plan {
-            LaunchPlan::Zellij(command) => (command, "zellij".to_string()),
+            LaunchPlan::Zellij(command) => {
+                let label = match layout.as_deref() {
+                    Some(path) => format!("zellij ({})", path.display()),
+                    None => "zellij".to_string(),
+                };
+                (command, label)
+            }
             LaunchPlan::Fallback { command, reason } => (command, format!("shell — {reason:?}")),
         };
         let wake: WakeFn = Box::new(move || redraw.request());

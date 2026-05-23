@@ -87,25 +87,27 @@ impl BinaryLookup for PathBinaryLookup {
     }
 }
 
-/// Build the v0.1 Zellij command.
-pub fn zellij_command(project_name: &str) -> CommandSpec {
-    CommandSpec::new(
-        "mise",
-        vec![
-            "exec".to_string(),
-            "--".to_string(),
-            "zellij".to_string(),
-            "attach".to_string(),
-            "--create".to_string(),
-            safe_session_name(project_name),
-        ],
-    )
+/// Build the Zellij command. When `layout` is set the command applies it to
+/// the new session via the top-level `--layout <path>` flag (spec §10 v0.3);
+/// Zellij only applies the layout the first time the session is created.
+pub fn zellij_command(project_name: &str, layout: Option<&Path>) -> CommandSpec {
+    let mut args = vec!["exec".to_string(), "--".to_string(), "zellij".to_string()];
+    if let Some(layout) = layout {
+        args.push("--layout".to_string());
+        args.push(layout.display().to_string());
+    }
+    args.push("attach".to_string());
+    args.push("--create".to_string());
+    args.push(safe_session_name(project_name));
+
+    CommandSpec::new("mise", args)
 }
 
 /// Select either the Zellij command or a plain-shell fallback based on binary
-/// availability.
+/// availability. When `layout` is set, a successful Zellij plan opens it.
 pub fn plan_launch(
     project_name: &str,
+    layout: Option<&Path>,
     lookup: &impl BinaryLookup,
     fallback: ShellProfile,
 ) -> LaunchPlan {
@@ -122,7 +124,7 @@ pub fn plan_launch(
         };
     }
 
-    LaunchPlan::Zellij(zellij_command(project_name))
+    LaunchPlan::Zellij(zellij_command(project_name, layout))
 }
 
 /// Convert an arbitrary project display name to a stable Zellij session name.
@@ -210,7 +212,7 @@ mod tests {
     #[test]
     fn builds_mise_zellij_attach_command() {
         assert_eq!(
-            zellij_command("Geotech Platform"),
+            zellij_command("Geotech Platform", None),
             CommandSpec::new(
                 "mise",
                 [
@@ -228,22 +230,65 @@ mod tests {
     }
 
     #[test]
+    fn injects_layout_flag_when_a_layout_is_provided() {
+        let layout = PathBuf::from("/projects/geotech/.config/zellij/dev.kdl");
+        assert_eq!(
+            zellij_command("Geotech Platform", Some(&layout)),
+            CommandSpec::new(
+                "mise",
+                [
+                    "exec",
+                    "--",
+                    "zellij",
+                    "--layout",
+                    "/projects/geotech/.config/zellij/dev.kdl",
+                    "attach",
+                    "--create",
+                    "geotech-platform",
+                ]
+                .map(str::to_string)
+                .to_vec()
+            )
+        );
+    }
+
+    #[test]
     fn plans_zellij_when_binaries_exist() {
         let plan = plan_launch(
             "Project",
+            None,
             &FakeLookup {
                 mise: true,
                 zellij: true,
             },
             ShellProfile::UnixShell,
         );
-        assert_eq!(plan, LaunchPlan::Zellij(zellij_command("Project")));
+        assert_eq!(plan, LaunchPlan::Zellij(zellij_command("Project", None)));
+    }
+
+    #[test]
+    fn plans_zellij_with_layout_when_one_is_given() {
+        let layout = PathBuf::from("/tmp/dev.kdl");
+        let plan = plan_launch(
+            "Project",
+            Some(&layout),
+            &FakeLookup {
+                mise: true,
+                zellij: true,
+            },
+            ShellProfile::UnixShell,
+        );
+        assert_eq!(
+            plan,
+            LaunchPlan::Zellij(zellij_command("Project", Some(&layout)))
+        );
     }
 
     #[test]
     fn falls_back_when_mise_is_missing() {
         let plan = plan_launch(
             "Project",
+            None,
             &FakeLookup {
                 mise: false,
                 zellij: true,
@@ -266,6 +311,7 @@ mod tests {
     fn falls_back_when_zellij_is_missing() {
         let plan = plan_launch(
             "Project",
+            None,
             &FakeLookup {
                 mise: true,
                 zellij: false,
