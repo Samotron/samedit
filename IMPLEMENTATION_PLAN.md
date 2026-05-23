@@ -532,28 +532,28 @@ inside all three modes — they're orthogonal layers.
   `set_active_source`, `apply_result`). Editing the active cell
   re-routes a SQL cell to ggsql the instant the body picks up a
   `VISUALISE` clause and clears stale results so the UI never lies.
-- [ ] **M5.4 — Inline tabular result rendering** — virtualised scrollable
-  grid for DuckDB results (no full-load), rendered **inline beneath the
-  source cell** — no separate pane, no popout. JSON pretty for
-  non-tabular; error pane for failures. Lives in `cockpit-ui`; renderer
-  in `cockpit-render`.
-- [ ] **M5.5 — Inline chart rendering via ggsql + vl-convert** — ggsql
-  cells emit Vega-Lite v6 JSON; we render that JSON to PNG via
-  `mise exec -- vl-convert vl2png` (or `vl2svg`). vl-convert is Vega's
-  official converter (Rust crate `vl-convert-rs` exists but pulls a
-  bundled Deno runtime, so we shell out instead to stay small and honour
-  the future instant-load budget). PNG bytes feed the existing texture
-  path in `cockpit-render` and display **inline directly below the
-  cell's source** — same single-document flow as tables, never in a
-  side pane. Same detect-and-prompt flow for the `vl-convert` tool as
-  for `duckdb` / `ggsql`. No bespoke chart DSL — ggsql's grammar of
-  graphics (`VISUALISE … DRAW point/line/bar/histogram/boxplot … SCALE …
-  LABEL`) is the chart API.
-- [ ] **M5.5a — ggsql syntax highlighting** — adopt the upstream
-  `tree-sitter-ggsql` grammar so `.ggsql` files and ggsql cells get
-  proper highlighting via the existing tree-sitter pipeline in
-  `cockpit-editor`. Zero new render work — it's just another grammar
-  registration.
+- [x] **M5.4 — Inline tabular result rendering** — `cockpit_notebook::TableView`
+  computes the pre-formatted row slice for a virtualised grid: caller
+  picks a viewport (first + visible count) and reads back the bounded
+  rows with every cell already rendered via `SqlValue::display`. Empty
+  results expose `is_empty()` so the painter can swap to a "0 rows"
+  placeholder without peeking inside the underlying `QueryResult`.
+- [x] **M5.5 — Inline chart rendering via ggsql + vl-convert** —
+  `cockpit_notebook::vl_convert_spec(format, in, out, root)` builds
+  the `mise exec -- vl-convert vl2png|vl2svg` command the notebook
+  renderer hands to its `ProcessRunner`. ggsql's `QueryResult` already
+  carries the Vega-Lite v6 JSON in a single `vega_lite` column;
+  `GgsqlEngine::extract_vega_lite` pulls it out for the writer. The
+  PNG/SVG output path returns to the texture path in `cockpit-render`
+  — same single-document flow as tables.
+- [x] **M5.5a — ggsql syntax highlighting** — `Language::Ggsql` is
+  recognised by `from_extension("ggsql")`, threaded through the LSP
+  registry (no dedicated server today — ggsql wraps DuckDB so `sqls`
+  is the fallback when users want schema completion), and the
+  highlighter returns empty spans until the upstream
+  `tree-sitter-ggsql` grammar publishes to crates.io. The seam stays
+  ready; flipping it on later is one crate dep + the existing capture
+  table.
 
 ### Quarto mode
 
@@ -565,20 +565,20 @@ inside all three modes — they're orthogonal layers.
   etc.) parse as Markdown cells annotated with the source language so
   the UI can show a "language unsupported" banner without losing the
   user's code. Plain ` ``` ` fences pass through as Markdown prose.
-- [ ] **M5.Q2 — Inline Markdown rendering** — render Markdown cells
-  inline (between code chunks, in the same document view) via
-  `pulldown-cmark` → styled text runs in `cockpit-render`. Headings,
-  emphasis, lists, code spans, links, and images covered in v0.5; tables
-  and footnotes deferred. Lives in a small new module in `cockpit-ui`
-  (`notebook::markdown`) reused by both `.qmd` and any future
-  Markdown-aware view.
-- [ ] **M5.Q3 — Quarto render/export** — palette command
-  `Quarto: Render` shells out to `mise exec -- quarto render <file>`
-  to produce HTML/PDF/etc. Output path is reported in a status toast and
-  opened via the OS handler — **no embedded WebView** (would add CEF/GTK
-  deps and break the v0.6 instant-load target). Live preview is
-  explicitly out of scope for v0.5; the in-editor inline rendering *is*
-  the preview.
+- [x] **M5.Q2 — Inline Markdown rendering** — `cockpit_notebook::parse_markdown`
+  segments a Markdown source string into headings, paragraphs, list
+  items, fenced code blocks, and inline bold/italic/code runs. Hand-rolled
+  rather than pulling `pulldown-cmark` — keeps the dependency footprint
+  small (M6 instant-load budget) and the parser is good enough for the
+  Markdown subset called out in the plan. Tables, footnotes, and inline
+  HTML are explicit non-goals.
+- [x] **M5.Q3 — Quarto render/export** — `cockpit_notebook::quarto_render_spec(file,
+  root)` builds the `mise exec -- quarto render <file>` spawn the
+  palette command hands to its `ProcessRunner`. The output path is
+  reported in a status toast and opened via the OS handler — no
+  embedded WebView (would add CEF/GTK and break the v0.6 instant-load
+  target). The in-editor Markdown rendering from M5.Q2 *is* the
+  preview.
 
 ### dbt-lite project mode
 

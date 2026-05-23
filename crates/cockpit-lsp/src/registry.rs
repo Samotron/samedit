@@ -45,6 +45,10 @@ impl ServerConfig {
                 command: "typescript-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
             }),
+            // ggsql has no dedicated language server yet (v0.5 M5.5a) —
+            // notebook cells fall back to sqls when they need schema
+            // intelligence, since ggsql wraps DuckDB anyway.
+            Language::Ggsql => None,
         }
     }
 
@@ -55,6 +59,7 @@ impl ServerConfig {
             Language::Python => "python",
             Language::Rust => "rust",
             Language::Sql => "sql",
+            Language::Ggsql => "ggsql",
             Language::TypeScript => "typescript",
         }
     }

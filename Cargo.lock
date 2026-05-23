@@ -636,6 +636,7 @@ dependencies = [
 name = "cockpit-notebook"
 version = "0.0.1"
 dependencies = [
+ "cockpit-project",
  "cockpit-sql",
  "serde",
  "thiserror 2.0.18",

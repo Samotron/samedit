@@ -22,11 +22,17 @@
 //! notebook's structure; execution happens through
 //! [`cockpit_sql::SqlEngine`] in the caller.
 
+pub mod chart;
 pub mod parse;
 pub mod quarto;
+pub mod quarto_export;
+pub mod render;
 
+pub use chart::{ChartFormat, vl_convert_spec};
 pub use parse::{NotebookParseError, parse_notebook};
 pub use quarto::parse_quarto;
+pub use quarto_export::quarto_render_spec;
+pub use render::{MarkdownBlock, MarkdownInline, TableView, parse_markdown};
 
 use cockpit_sql::{QueryError, QueryResult, statement_targets_ggsql};
 use serde::{Deserialize, Serialize};
