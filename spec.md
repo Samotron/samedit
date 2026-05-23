@@ -1,5 +1,13 @@
 # Coding Cockpit — Product Specification
 
+> **Implementation language:** Rust. Early drafts considered Zig; that
+> exploration is closed and the codebase is Rust. See [`IMPLEMENTATION_PLAN.md`]
+> for the authoritative stack and crate layout. Project-signal files like
+> `build.zig` remain in the detection list because *user projects* can still
+> be Zig — cockpit itself is not.
+>
+> [`IMPLEMENTATION_PLAN.md`]: IMPLEMENTATION_PLAN.md
+
 Testing is treated as a **core product principle**, not an afterthought, because
 this app has lots of fiddly state: editor buffers, Vim modes, PTYs, terminal
 sessions, project detection, keybindings, and cross-platform behaviour.
@@ -513,8 +521,6 @@ node_modules
 target
 dist
 build
-zig-cache
-zig-out
 .venv
 __pycache__
 ```
@@ -678,7 +684,9 @@ The project should avoid relying only on manual UI testing.
 
 ## 18.2 Rust Unit Tests
 
-Use Rust's built-in test framework heavily, with `cargo nextest` as the runner.
+Use Rust's built-in test framework heavily. The runner today is plain
+`cargo test`; switching to `cargo nextest run` for process isolation
+(especially around PTY tests) remains a future hardening option.
 
 Core modules should have colocated tests:
 
@@ -694,7 +702,7 @@ crates/cockpit-terminal/src/path_detect.rs
 Run with:
 
 ```bash
-cargo nextest run
+cargo test --workspace
 ```
 
 Example test areas:
@@ -981,7 +989,7 @@ Minimum CI jobs:
 cargo fmt --check
 cargo clippy
 cargo build
-cargo nextest run
+cargo test --workspace
 ```
 
 Additional jobs:
@@ -1064,7 +1072,7 @@ Defined in `mise.toml`, each task calls `cargo` directly:
 ```toml
 [tasks.test]
 description = "Run all normal tests"
-run = "cargo nextest run"
+run = "cargo test --workspace"
 
 [tasks.test-unit]
 run = "cargo test --workspace --lib"
@@ -1081,6 +1089,10 @@ run = "cargo fmt --all --check"
 [tasks.ci]
 depends = ["fmt-check", "lint", "build", "test"]
 ```
+
+`cargo nextest` is a candidate replacement for the default runner once the
+toolchain is wired up; switching is a future hardening pass, not a v0.1
+prerequisite.
 
 ---
 
@@ -1405,9 +1417,17 @@ Hover
 Rename symbol
 Format on save
 Completion
+Code actions / quick-fix
+SQL language server (sqls)
 Use mise env for LSP
 More editor conformance tests
+Mouse input across the cockpit
 ```
+
+> Beyond v0.4: `IMPLEMENTATION_PLAN.md` introduces **v0.5** (SQL notebooks
+> and dbt-lite analytics on DuckDB) and **v0.6** (instant-load
+> performance targets that supersede §24's `< 500 ms`). Those phases are
+> deliberately not in this spec — the plan is authoritative for them.
 
 ---
 

@@ -42,6 +42,12 @@ pub enum Language {
     Python,
     Rust,
     Sql,
+    /// ggsql — Posit's grammar-of-graphics extension to SQL (v0.5
+    /// M5.5a). Falls back to no highlight spans until the upstream
+    /// `tree-sitter-ggsql` grammar lands on crates.io; cockpit still
+    /// recognises `.ggsql` files so the notebook layer can route them
+    /// and so the LSP registry has an entry to plug into later.
+    Ggsql,
     TypeScript,
 }
 
@@ -52,6 +58,7 @@ impl Language {
             "py" => Some(Language::Python),
             "rs" => Some(Language::Rust),
             "sql" => Some(Language::Sql),
+            "ggsql" => Some(Language::Ggsql),
             "ts" | "tsx" => Some(Language::TypeScript),
             _ => None,
         }
@@ -118,7 +125,7 @@ fn with_config<R>(language: Language, f: impl FnOnce(&HighlightConfiguration) ->
             let mut slot = cell.borrow_mut();
             f(slot.get_or_insert_with(build_rust_config))
         }),
-        Language::Python | Language::Sql | Language::TypeScript => {
+        Language::Python | Language::Sql | Language::Ggsql | Language::TypeScript => {
             unreachable!("non-Rust languages return before requesting a highlight config")
         }
     }

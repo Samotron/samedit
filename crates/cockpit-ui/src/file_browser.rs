@@ -113,6 +113,14 @@ impl FileBrowser {
         }
     }
 
+    /// Set the selection to `index` if it is in range. No-op otherwise.
+    /// Used by the M4.7 click-to-select mouse path.
+    pub fn select_row(&mut self, index: usize) {
+        if index < self.rows.len() {
+            self.selected = index;
+        }
+    }
+
     /// Activate the selected row: expand/collapse a directory, or report the
     /// absolute path of a file to open.
     pub fn activate(&mut self) -> Result<FileBrowserAction, ProjectError> {

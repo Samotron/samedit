@@ -1,0 +1,18 @@
+[package]
+name = "cockpit-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQL execution backend (DuckDB shell-out) for Coding Cockpit."
+
+[features]
+default = []
+integration = []
+
+[dependencies]
+cockpit-project.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+tracing = "0.1.41"

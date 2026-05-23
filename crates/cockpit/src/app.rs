@@ -10,6 +10,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use cockpit_analytics::detect::scan_models_dir;
+use cockpit_analytics::{
+    AnalyticsProject, BuildPlan, Materialisation, build_plan, detect_analytics_project,
+};
 use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::{GlobalKeys, ZellijLayout};
 use cockpit_editor::vim::{Key as VimKey, Mode};
@@ -20,12 +24,21 @@ use cockpit_lsp::{
     Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, Response,
     ServerConfig,
 };
+use cockpit_notebook::{
+    CellKind, Notebook, is_notebook_source, parse_notebook, parse_quarto, quarto_render_spec,
+};
 use cockpit_project::{
-    FileNodeKind, FileTree, ProjectCache, ProjectDetection, mise_exec_command, project_cache_path,
-    walk_project_files,
+    FileNodeKind, FileSystem, FileTree, FormatPlan, KnownFormatter,
+    PathBinaryLookup as FormatPathLookup, ProcessRunner, ProcessSpec, ProjectCache,
+    ProjectDetection, StdFileSystem, StdProcessRunner, mise_exec_command, plan_format,
+    project_cache_path, render_format_task_snippet, walk_project_files,
 };
 use cockpit_render::theme::Color;
-use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
+use cockpit_render::{
+    CockpitApp, MouseButton, Painter, PointerPosition, Rect as RenderRect, RedrawHandle, Theme,
+    Viewport,
+};
+use cockpit_sql::{DuckDbEngine, GgsqlEngine, SqlEngine, statement_targets_ggsql};
 use cockpit_terminal::bridge::{detect_paths_in_grid, paste_to_terminal, render_document_path};
 use cockpit_terminal::live::{LiveTerminal, WakeFn};
 use cockpit_terminal::path_detect::detect_paths;
@@ -33,9 +46,9 @@ use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
 use cockpit_terminal::zellij::{LaunchPlan, PathBinaryLookup, ShellProfile, plan_launch};
 use cockpit_ui::{
-    CompletionItem, CompletionPopup, ComputedLayout, FileBrowser, FileBrowserAction, FuzzyFinder,
-    InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput, WorkspaceLayout,
-    command_ids,
+    CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, FileBrowser, FileBrowserAction,
+    FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput,
+    WorkspaceLayout, command_ids,
 };
 
 /// Logical layout metrics. The painter scales these by the display factor.
@@ -75,6 +88,9 @@ const DEBUG_SHOW_PANE_TREE: &str = "debug.show_pane_tree";
 const DEBUG_SHOW_PROJECT_STATE: &str = "debug.show_project_state";
 /// Command id for "reload the user config" (spec §18.13).
 const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
+/// Command id for "summarise the recorded startup-phase trace"
+/// (v0.6 M6.7).
+const DEBUG_SHOW_STARTUP_TRACE: &str = "debug.show_startup_trace";
 /// Command id for "go to the symbol's definition under the cursor" (M4.2).
 const LSP_GOTO_DEFINITION: &str = "lsp.goto_definition";
 /// Command id for "show hover information for the symbol under the cursor" (M4.2).
@@ -85,6 +101,28 @@ const LSP_RENAME: &str = "lsp.rename";
 const LSP_COMPLETION: &str = "lsp.completion";
 /// Command id for "apply the first quick-fix for the current diagnostic" (M4.5).
 const LSP_CODE_ACTION: &str = "lsp.code_action";
+/// Command id for "format the open document" (M4.4). The implementation
+/// chooses between a mise task, a prompt to add one, or LSP `formatting`
+/// — see [`AppModel::request_format`] for the resolution rules.
+const EDITOR_FORMAT: &str = "editor.format";
+/// Command id for "toggle the per-session format-on-save preference" (M4.4).
+const EDITOR_TOGGLE_FORMAT_ON_SAVE: &str = "editor.toggle_format_on_save";
+/// Command id for "execute the active notebook cell" (v0.5 M5.3 wire-up).
+const NOTEBOOK_RUN_ACTIVE_CELL: &str = "notebook.run_active_cell";
+/// Command id for "advance the notebook cursor to the next cell".
+const NOTEBOOK_NEXT_CELL: &str = "notebook.next_cell";
+/// Command id for "move the notebook cursor to the previous cell".
+const NOTEBOOK_PREVIOUS_CELL: &str = "notebook.previous_cell";
+/// Command id for "insert a fresh cell below the active one".
+const NOTEBOOK_INSERT_CELL_BELOW: &str = "notebook.insert_cell_below";
+/// Command id for "build every materialisation in the dbt-lite project"
+/// (v0.5 M5.8 wire-up).
+const MODELS_BUILD_ALL: &str = "models.build_all";
+/// Command id for "show the dbt-lite DAG summary in the status line".
+const MODELS_SHOW_DAG: &str = "models.show_dag";
+/// Command id for "render the active Quarto document via `quarto
+/// render`" (v0.5 M5.Q3 wire-up).
+const QUARTO_RENDER: &str = "quarto.render";
 
 /// Name of the mise task cockpit invokes for the Test: * palette entries.
 /// Conventional default; M4 may make this configurable per project.
@@ -139,6 +177,33 @@ enum LspPending {
     Rename,
     /// `textDocument/completion` — show candidates in the completion popup.
     Completion,
+    /// `textDocument/formatting` — apply the returned text edits (M4.4).
+    /// `trigger` records whether the format came from a save (in which case
+    /// the formatted buffer must be flushed back to disk on success).
+    Formatting {
+        path: PathBuf,
+        trigger: FormatTrigger,
+    },
+}
+
+/// Why a format request was issued (M4.4). Drives post-apply behaviour: a
+/// save-triggered format flushes the formatted buffer back to disk, whereas
+/// a manual `editor.format` leaves the buffer dirty so the user can review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatTrigger {
+    Manual,
+    Save,
+}
+
+/// What confirming a [`ConfirmPrompt`] should do (M4.4 — and the seam any
+/// future yes/no prompt plugs into).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptIntent {
+    /// Append `[tasks.format]` to `mise.toml`, then retry formatting.
+    AddFormatTask {
+        snippet: String,
+        retry_trigger: FormatTrigger,
+    },
 }
 
 /// The most recently received hover result (M4.2). Cleared when a new
@@ -164,6 +229,12 @@ struct RenameInput {
 /// Headless application state for the v0.1 cockpit shell.
 pub struct AppModel {
     detection: ProjectDetection,
+    /// Filesystem seam (M4.10). Production uses [`StdFileSystem`]; tests
+    /// inject a [`cockpit_project::FakeFileSystem`] via [`AppModel::with_env`].
+    fs: Box<dyn FileSystem>,
+    /// Process-spawn seam (M4.10). Production uses [`StdProcessRunner`];
+    /// tests inject a [`cockpit_project::FakeProcessRunner`].
+    process: Box<dyn ProcessRunner>,
     browser: FileBrowser,
     layout: WorkspaceLayout,
     router: InputRouter,
@@ -198,24 +269,83 @@ pub struct AppModel {
     rename_input: Option<RenameInput>,
     /// Manual LSP completion popup (M4.3b).
     completion: Option<CompletionPopup>,
+    /// Active yes/no modal prompt (M4.4). When `Some`, it captures keys
+    /// the same way the rename input does.
+    confirm: Option<ConfirmPrompt>,
+    /// What to do if the active [`confirm`](Self::confirm) prompt is accepted.
+    confirm_intent: Option<PromptIntent>,
+    /// Per-session opt-in for format-on-save (M4.4). Initialised from
+    /// `editor.format_on_save`; toggled by the palette command without
+    /// touching the config file on disk.
+    format_on_save: bool,
+    /// Optional notebook view-model for the open document (v0.5 M5.3
+    /// wire-up). Populated when [`open_document`] detects a Jupytext
+    /// `.sql` / `.ggsql` source or any `.qmd` file; `None` otherwise.
+    notebook: Option<Notebook>,
+    /// Detected analytics project (v0.5 M5.6 wire-up). Built once during
+    /// [`new`] when a `models/` directory is present and refreshed by
+    /// `Models: Build All`.
+    analytics: Option<AnalyticsProject>,
     /// Tracks a pending `g` in the editor pane so local `gd` can dispatch LSP
     /// definition while non-LSP Vim chords like `gg` still reach the Vim FSM.
     editor_pending_g: bool,
     /// Tracks `<leader>c` in the editor pane so `<leader>ca` can dispatch the
     /// quick-fix command without adding a parallel command path.
     editor_pending_leader: u8,
+    /// Most recent computed layout — populated each `paint()` so mouse hit
+    /// tests can ask which pane an event landed in (M4.7).
+    last_layout: Option<ComputedLayout>,
+    /// Logical width passed to the most recent layout compute (M4.7).
+    last_view_width: f32,
+    /// Logical height passed to the most recent layout compute (M4.7).
+    last_view_height: f32,
+    /// Active pane-border drag, if any (M4.7).
+    drag: Option<DragState>,
+    /// Scroll offset (logical rows from the top) for the editor pane (M4.7).
+    editor_scroll: f32,
     exit: bool,
+}
+
+/// One in-progress pane-border drag (M4.7). Records which side is being
+/// dragged and the cursor anchor / starting width so the layout update is
+/// a pure delta from the drag origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DragState {
+    LeftBorder { start_x: f32, start_width: u32 },
+    RightBorder { start_x: f32, start_width: u32 },
 }
 
 impl AppModel {
     /// Build the model for a detected project and its loaded file tree.
     ///
     /// This is pure — call [`restore_cached_state`](Self::restore_cached_state)
-    /// afterwards to load persisted per-project state from disk.
+    /// afterwards to load persisted per-project state from disk. The
+    /// std-backed fs and process runner are used; for hermetic tests call
+    /// [`AppModel::with_env`] to inject fakes (M4.10).
     pub fn new(detection: ProjectDetection, tree: FileTree) -> Result<Self, String> {
+        Self::with_env(
+            detection,
+            tree,
+            Box::new(StdFileSystem),
+            Box::new(StdProcessRunner),
+        )
+    }
+
+    /// Build the model with caller-supplied env seams (M4.10). Used by
+    /// hermetic tests to scrub real filesystem / subprocess access from
+    /// the model — the v0.5 SqlEngine work depends on this pattern being
+    /// in place.
+    pub fn with_env(
+        detection: ProjectDetection,
+        tree: FileTree,
+        fs: Box<dyn FileSystem>,
+        process: Box<dyn ProcessRunner>,
+    ) -> Result<Self, String> {
         let router = InputRouter::from_global_keys(&GlobalKeys::default())
             .map_err(|err| format!("input router setup failed: {err:?}"))?;
         Ok(Self {
+            fs,
+            process,
             browser: FileBrowser::new(tree),
             layout: WorkspaceLayout::new(),
             router,
@@ -238,8 +368,18 @@ impl AppModel {
             hover: None,
             rename_input: None,
             completion: None,
+            confirm: None,
+            confirm_intent: None,
+            format_on_save: false,
+            notebook: None,
+            analytics: None,
             editor_pending_g: false,
             editor_pending_leader: 0,
+            last_layout: None,
+            last_view_width: 0.0,
+            last_view_height: 0.0,
+            drag: None,
+            editor_scroll: 0.0,
             exit: false,
             detection,
         })
@@ -257,6 +397,20 @@ impl AppModel {
         self.apply_cache(cache);
     }
 
+    /// Apply a loaded user [`cockpit_config::Config`] onto the model.
+    /// Currently honours `editor.format_on_save` (M4.4) and the layout
+    /// width preferences (`ui.left_width` / `ui.right_width`). Other
+    /// fields parse but are still inert — they will land as their
+    /// owning subsystems get wired up.
+    pub fn apply_user_config(&mut self, config: &cockpit_config::Config) {
+        self.format_on_save = config.editor.format_on_save;
+
+        let mut prefs = self.layout.preferences().clone();
+        prefs.left_width = config.ui.left_width.into();
+        prefs.right_width = config.ui.right_width.into();
+        self.layout.set_preferences(prefs);
+    }
+
     /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
     /// out to `git status --porcelain`; no-ops when `git` is missing or the
     /// project is not a git working tree.
@@ -266,6 +420,10 @@ impl AppModel {
     }
 
     /// Restore persisted pane widths and reopen the last active file.
+    /// Also rehydrates the fuzzy-finder index from the cache so the
+    /// first `Ctrl+P` press is instant (M6.6); the index falls back to
+    /// a real filesystem walk if the cached snapshot turns out to be
+    /// stale.
     fn apply_cache(&mut self, cache: ProjectCache) {
         let mut prefs = self.layout.preferences().clone();
         if let Some(width) = cache.left_width {
@@ -276,6 +434,10 @@ impl AppModel {
         }
         self.layout.set_preferences(prefs);
 
+        if !cache.file_index.is_empty() {
+            self.file_index = Some(cache.file_index);
+        }
+
         if let Some(active) = cache.active_file
             && active.is_file()
         {
@@ -284,6 +446,8 @@ impl AppModel {
     }
 
     /// Snapshot the per-project state worth persisting across sessions.
+    /// Includes the fuzzy-finder index so the next launch can offer
+    /// instant Ctrl+P without re-walking the project tree (M6.6).
     fn build_cache(&self) -> ProjectCache {
         let active_file = self.document.as_ref().map(|doc| doc.path.clone());
         let prefs = self.layout.preferences();
@@ -292,6 +456,7 @@ impl AppModel {
             active_file,
             left_width: Some(prefs.left_width as u16),
             right_width: Some(prefs.right_width as u16),
+            file_index: self.file_index.clone().unwrap_or_default(),
             ..ProjectCache::default()
         }
     }
@@ -326,6 +491,10 @@ impl AppModel {
         self.record_key_event(&chord);
         // The palette and fuzzy finder are modal: while open they consume
         // every key.
+        if self.confirm.is_some() {
+            self.handle_confirm_key(&chord);
+            return;
+        }
         if self.rename_input.is_some() {
             self.handle_rename_key(&chord);
             return;
@@ -349,6 +518,159 @@ impl AppModel {
                 self.handle_local(focused, &chord)
             }
         }
+    }
+
+    // ---- M4.7 — Mouse input -----------------------------------------------
+
+    /// Route a primary-button press at logical-pixel `position`. Routes:
+    /// click in the file browser → focus + select (double-click activates),
+    /// click in the editor or terminal pane → focus that pane, click on a
+    /// pane border → start a resize drag.
+    pub fn on_pointer_down(&mut self, button: MouseButton, position: PointerPosition) {
+        if button != MouseButton::Left {
+            return;
+        }
+        let Some(layout) = self.last_layout.clone() else {
+            return;
+        };
+
+        // Pane-border resize takes priority over pane-focus hit tests.
+        if let Some(drag) = self.detect_border_drag(&layout, position) {
+            self.drag = Some(drag);
+            return;
+        }
+
+        if let Some(rect) = layout.files
+            && pane_contains(rect, position)
+        {
+            self.layout.focus(PaneId::Files);
+            self.handle_files_click(rect, position);
+            return;
+        }
+        if pane_contains(layout.editor, position) {
+            self.layout.focus(PaneId::Editor);
+            return;
+        }
+        if let Some(rect) = layout.terminal
+            && pane_contains(rect, position)
+        {
+            self.layout.focus(PaneId::Terminal);
+            self.ensure_terminal();
+        }
+    }
+
+    /// Release any in-progress drag and forget the last anchor (M4.7).
+    pub fn on_pointer_up(&mut self, button: MouseButton, _position: PointerPosition) {
+        if button == MouseButton::Left {
+            self.drag = None;
+        }
+    }
+
+    /// Continue an in-progress drag (M4.7). Mouse moves outside a drag are
+    /// ignored — cockpit has no hover state today.
+    pub fn on_pointer_move(&mut self, position: PointerPosition) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        match drag {
+            DragState::LeftBorder {
+                start_x,
+                start_width,
+            } => {
+                let delta = position.x - start_x;
+                let new_width = (start_width as f32 + delta).clamp(120.0, 800.0);
+                self.layout.set_left_width(new_width as u32);
+            }
+            DragState::RightBorder {
+                start_x,
+                start_width,
+            } => {
+                let delta = start_x - position.x;
+                let new_width = (start_width as f32 + delta).clamp(160.0, 1000.0);
+                self.layout.set_right_width(new_width as u32);
+            }
+        }
+    }
+
+    /// Scroll wheel delta (M4.7). Positive `dy` scrolls content down — the
+    /// viewport sees rows leave the top. The terminal pane forwards the
+    /// scroll to the live PTY (Zellij owns scroll-back); the editor pane
+    /// shifts its viewport offset.
+    pub fn on_scroll(&mut self, position: PointerPosition, _dx: f32, dy: f32) {
+        let Some(layout) = self.last_layout.clone() else {
+            return;
+        };
+        if pane_contains(layout.editor, position) {
+            // 1 line per 20px of wheel travel.
+            self.editor_scroll = (self.editor_scroll - dy / 20.0).max(0.0);
+            return;
+        }
+        if let Some(rect) = layout.terminal
+            && pane_contains(rect, position)
+            && let Some(terminal) = self.terminal.as_mut()
+        {
+            // Forward the wheel as a Zellij/termwiz scroll arrow sequence
+            // by emitting CSI A/B per step. termwiz interprets these as
+            // line-up/line-down inside its scroll-back.
+            let steps = (dy.abs() / 20.0).ceil() as i32;
+            let bytes: &[u8] = if dy > 0.0 { b"\x1b[A" } else { b"\x1b[B" };
+            for _ in 0..steps {
+                let _ = terminal.send_input(bytes);
+            }
+        }
+    }
+
+    /// Pane-border drag detection (M4.7). A 6-pixel hit band around each
+    /// visible side-pane border starts a [`DragState`].
+    fn detect_border_drag(
+        &self,
+        layout: &ComputedLayout,
+        position: PointerPosition,
+    ) -> Option<DragState> {
+        let band = 6.0_f32;
+        if let Some(rect) = layout.files {
+            let border_x = (rect.x + rect.width) as f32;
+            if (position.x - border_x).abs() <= band
+                && position.y >= TOP_BAR_H
+                && position.y <= TOP_BAR_H + rect.height as f32
+            {
+                return Some(DragState::LeftBorder {
+                    start_x: position.x,
+                    start_width: rect.width,
+                });
+            }
+        }
+        if let Some(rect) = layout.terminal {
+            let border_x = rect.x as f32;
+            if (position.x - border_x).abs() <= band
+                && position.y >= TOP_BAR_H
+                && position.y <= TOP_BAR_H + rect.height as f32
+            {
+                return Some(DragState::RightBorder {
+                    start_x: position.x,
+                    start_width: rect.width,
+                });
+            }
+        }
+        None
+    }
+
+    /// Translate a click in the files pane to a row index and act on it:
+    /// single click selects, double-click is the same as Enter (open file
+    /// or expand/collapse). For v0.4 cockpit treats the same click as both
+    /// — a double-click counter would land here later if needed.
+    fn handle_files_click(&mut self, rect: UiRect, position: PointerPosition) {
+        let pane_top = rect.y as f32 + TOP_BAR_H + HEADER_H + PAD * 0.5;
+        let local_y = position.y - pane_top;
+        if local_y < 0.0 {
+            return;
+        }
+        let index = (local_y / ROW_H) as usize;
+        if index >= self.browser.rows().len() {
+            return;
+        }
+        self.browser.select_row(index);
+        self.activate_selection();
     }
 
     /// Push a chord onto the recent-key ring buffer (spec §18.13).
@@ -394,11 +716,21 @@ impl AppModel {
             DEBUG_SHOW_PANE_TREE => self.debug_show_pane_tree(),
             DEBUG_SHOW_PROJECT_STATE => self.debug_show_project_state(),
             DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
+            DEBUG_SHOW_STARTUP_TRACE => self.debug_show_startup_trace(),
             LSP_GOTO_DEFINITION => self.request_goto_definition(),
             LSP_SHOW_HOVER => self.request_show_hover(),
             LSP_RENAME => self.open_rename_input(),
             LSP_COMPLETION => self.request_completion(),
             LSP_CODE_ACTION => self.request_code_action(),
+            EDITOR_FORMAT => self.request_format(FormatTrigger::Manual),
+            EDITOR_TOGGLE_FORMAT_ON_SAVE => self.toggle_format_on_save(),
+            NOTEBOOK_RUN_ACTIVE_CELL => self.run_active_notebook_cell(),
+            NOTEBOOK_NEXT_CELL => self.notebook_next_cell(),
+            NOTEBOOK_PREVIOUS_CELL => self.notebook_previous_cell(),
+            NOTEBOOK_INSERT_CELL_BELOW => self.notebook_insert_cell_below(),
+            MODELS_BUILD_ALL => self.run_build_all_models(),
+            MODELS_SHOW_DAG => self.show_dag_summary(),
+            QUARTO_RENDER => self.render_quarto_document(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -607,6 +939,14 @@ impl AppModel {
     /// Re-apply the default config to the input router. A real user-config
     /// load path lands later; for now this exercises the reload code path so
     /// keybinding changes from a future config edit can be wired through here.
+    /// Surface the recorded startup trace in the status line (v0.6 M6.7).
+    fn debug_show_startup_trace(&mut self) {
+        let snapshot = crate::startup::snapshot();
+        let text = crate::startup::format_snapshot(&snapshot);
+        tracing::info!(startup = %text, "debug: show startup trace");
+        self.status = text;
+    }
+
     fn debug_reload_config(&mut self) {
         match InputRouter::from_global_keys(&GlobalKeys::default()) {
             Ok(router) => {
@@ -1093,15 +1433,21 @@ impl AppModel {
         }
     }
 
-    /// Load a file into the editor pane.
+    /// Load a file into the editor pane. Disk read goes through
+    /// [`Self::fs`] so the path is testable with fakes (M4.10).
     fn open_document(&mut self, path: PathBuf) {
-        match std::fs::read_to_string(&path) {
+        match self.fs.read_to_string(&path) {
             Ok(content) => {
                 let name = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                self.status = format!("Opened {name}");
+                self.notebook = recognise_notebook(&path, &content);
+                let suffix = match &self.notebook {
+                    Some(nb) => format!(" — notebook ({} cells)", nb.cells.len()),
+                    None => String::new(),
+                };
+                self.status = format!("Opened {name}{suffix}");
                 let mut editor = Editor::new(&content);
                 editor.set_language(Language::from_path(&path));
                 self.document = Some(OpenDocument { editor, path, name });
@@ -1195,18 +1541,26 @@ impl AppModel {
         }
     }
 
-    /// Write the open document to its file.
+    /// Write the open document to its file. When `format_on_save` is enabled
+    /// the formatter runs immediately after the on-disk write succeeds (M4.4).
+    /// Disk write goes through [`Self::fs`] (M4.10).
     fn save_document(&mut self) {
         let Some(doc) = self.document.as_mut() else {
             self.status = "No document to save.".to_string();
             return;
         };
-        match std::fs::write(&doc.path, doc.editor.text()) {
+        match self.fs.write(&doc.path, doc.editor.text().as_bytes()) {
             Ok(()) => {
                 doc.editor.mark_saved();
                 self.status = format!("Saved {}", doc.name);
             }
-            Err(err) => self.status = format!("Save failed: {err}"),
+            Err(err) => {
+                self.status = format!("Save failed: {err}");
+                return;
+            }
+        }
+        if self.format_on_save {
+            self.request_format(FormatTrigger::Save);
         }
     }
 
@@ -1515,6 +1869,9 @@ impl AppModel {
             } => self.apply_prepare_rename_result(language, path, line, col, new_name, result),
             LspPending::Rename => self.apply_rename_result(result),
             LspPending::Completion => self.apply_completion_result(result),
+            LspPending::Formatting { path, trigger } => {
+                self.apply_formatting_result(path, trigger, result)
+            }
         }
     }
 
@@ -1659,6 +2016,580 @@ impl AppModel {
         self.status = format!("Completions: {count} candidate(s), first `{first}`.");
     }
 
+    /// Format the open document — M4.4. Mise task wins; otherwise prompt to
+    /// add one when a known formatter is detectable; otherwise fall back to
+    /// LSP `textDocument/formatting`.
+    fn request_format(&mut self, trigger: FormatTrigger) {
+        let Some((path, language)) = self.document.as_ref().map(|doc| {
+            let path = doc.path.clone();
+            let language = Language::from_path(&path);
+            (path, language)
+        }) else {
+            self.status = "No document to format.".to_string();
+            return;
+        };
+        let language_id = language.and_then(|language| {
+            ServerConfig::for_language(language).map(|config| config.language_id().to_string())
+        });
+        let plan = plan_format(
+            &self.detection.mise,
+            language_id.as_deref(),
+            &FormatPathLookup,
+        );
+        match plan {
+            FormatPlan::MiseTask { name } => self.run_format_mise_task(&path, &name, trigger),
+            FormatPlan::SuggestMiseTask {
+                formatter,
+                suggested_run,
+                from_mise_tools,
+            } => self.prompt_add_format_task(formatter, suggested_run, from_mise_tools, trigger),
+            FormatPlan::LspOnly => self.request_lsp_formatting(language, path, trigger),
+        }
+    }
+
+    /// Run an existing `format` (or `format:<lang>`) mise task against the
+    /// open document. The on-disk version is the source of truth: the buffer
+    /// is already saved by the time we get here (either via [`save_document`]
+    /// or via an explicit save flushed by the manual command), so we spawn
+    /// `mise run <task> -- <path>` through [`Self::process`], wait for it,
+    /// and reload the buffer through [`Self::fs`] (M4.10).
+    fn run_format_mise_task(&mut self, path: &Path, task: &str, trigger: FormatTrigger) {
+        // Manual triggers also need the on-disk file to match the buffer
+        // before we hand it to the formatter — flush first.
+        if trigger == FormatTrigger::Manual
+            && let Some(doc) = self.document.as_ref()
+            && doc.editor.is_dirty()
+            && let Err(err) = self.fs.write(&doc.path, doc.editor.text().as_bytes())
+        {
+            self.status = format!("Format: pre-save failed: {err}");
+            return;
+        }
+
+        let spec = ProcessSpec::new("mise")
+            .arg("run")
+            .arg(task)
+            .arg("--")
+            .arg(path.as_os_str())
+            .current_dir(&self.detection.root_path);
+        let output = match self.process.run(&spec) {
+            Ok(output) => output,
+            Err(err) => {
+                self.status = format!("Format: could not run `mise run {task}`: {err}");
+                return;
+            }
+        };
+        if !output.success {
+            let snippet = output
+                .stderr_string()
+                .lines()
+                .next()
+                .unwrap_or("(no output)")
+                .to_string();
+            self.status = format!("Format: `mise run {task}` failed: {snippet}");
+            return;
+        }
+        if let Err(err) = self.reload_buffer_from_disk(path) {
+            self.status = format!("Format: reload after `{task}` failed: {err}");
+            return;
+        }
+        self.status = match trigger {
+            FormatTrigger::Manual => format!("Formatted via `mise run {task}`."),
+            FormatTrigger::Save => format!("Saved and formatted via `mise run {task}`."),
+        };
+    }
+
+    /// Surface the M4.4 "Add `format` task to `mise.toml`?" confirmation
+    /// modal. Stores the snippet to be written on confirm and the original
+    /// trigger so the format retries after the user says yes.
+    fn prompt_add_format_task(
+        &mut self,
+        formatter: KnownFormatter,
+        suggested_run: String,
+        from_mise_tools: bool,
+        trigger: FormatTrigger,
+    ) {
+        let where_from = if from_mise_tools {
+            "mise.toml [tools]"
+        } else {
+            "$PATH"
+        };
+        let title = format!(
+            "Add `format` task to mise.toml? ({} found on {where_from})",
+            formatter.binary()
+        );
+        let body = format!(
+            "Cockpit will append:\n\n[tasks.format]\nrun = \"{}\"\n\nNothing is written until you confirm.",
+            suggested_run.replace('"', "\\\"")
+        );
+        let snippet = render_format_task_snippet(&suggested_run);
+        self.confirm = Some(ConfirmPrompt::new(title, body));
+        self.confirm_intent = Some(PromptIntent::AddFormatTask {
+            snippet,
+            retry_trigger: trigger,
+        });
+        self.status =
+            "Add format task? y/Enter to confirm, n/Escape to cancel, Tab to toggle.".to_string();
+    }
+
+    /// Issue a `textDocument/formatting` request against the open document's
+    /// language server. The response is applied in [`apply_formatting_result`].
+    fn request_lsp_formatting(
+        &mut self,
+        language: Option<Language>,
+        path: PathBuf,
+        trigger: FormatTrigger,
+    ) {
+        let Some(language) = language else {
+            self.status = "No formatter and unsupported language for LSP fallback.".to_string();
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&language) else {
+            self.status =
+                "No formatter detected and the language server is not running.".to_string();
+            return;
+        };
+        let tab_size = 4_u64;
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "options": {
+                "tabSize": tab_size,
+                "insertSpaces": true,
+                "trimTrailingWhitespace": true,
+                "insertFinalNewline": true,
+            }
+        });
+        match client.request("textDocument/formatting", params) {
+            Ok(id) => {
+                self.lsp_pending
+                    .insert(id, LspPending::Formatting { path, trigger });
+                self.status = "Requested formatting from language server...".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "LSP formatting request failed to queue");
+                self.status = format!("LSP request failed: {err}");
+            }
+        }
+    }
+
+    /// Apply edits returned by `textDocument/formatting`. When the trigger
+    /// was a save, the buffer is also flushed back to disk so the on-disk
+    /// file ends up formatted (the buffer-only edit would otherwise stay
+    /// out of sync with disk until the next save).
+    fn apply_formatting_result(
+        &mut self,
+        path: PathBuf,
+        trigger: FormatTrigger,
+        result: serde_json::Value,
+    ) {
+        let Some(items) = result.as_array() else {
+            if result.is_null() {
+                self.status = "Formatter returned no edits.".to_string();
+            } else {
+                self.status = "Formatter result was not an edit array.".to_string();
+            }
+            return;
+        };
+        let mut by_path: HashMap<PathBuf, Vec<LspTextEdit>> = HashMap::new();
+        if let Err(err) = collect_lsp_text_edits(
+            &serde_json::Value::Array(items.clone()),
+            &mut by_path,
+            path.clone(),
+        ) {
+            self.status = format!("Formatter edits malformed: {err}");
+            return;
+        }
+        let Some(edits) = by_path.remove(&path) else {
+            self.status = "Formatter returned no edits.".to_string();
+            return;
+        };
+        let mut sorted = edits;
+        sorted.sort_by(|a, b| {
+            b.start_line
+                .cmp(&a.start_line)
+                .then_with(|| b.start_character.cmp(&a.start_character))
+        });
+        let Some(doc) = self.document.as_mut() else {
+            self.status = "Format: no document open.".to_string();
+            return;
+        };
+        if doc.path != path {
+            self.status = "Format: result is for a closed file.".to_string();
+            return;
+        }
+        let result = apply_lsp_text_edits_to_editor(&mut doc.editor, &sorted);
+        let (text_to_persist, count) = match result {
+            Ok(count) => (doc.editor.text(), count),
+            Err(err) => {
+                self.status = format!("Format: apply failed: {err}");
+                return;
+            }
+        };
+        if trigger == FormatTrigger::Save {
+            // Re-flush the now-formatted buffer through the env seam (M4.10).
+            match self.fs.write(&path, text_to_persist.as_bytes()) {
+                Ok(()) => {
+                    if let Some(doc) = self.document.as_mut() {
+                        doc.editor.mark_saved();
+                    }
+                    self.status = format!("Saved and formatted via LSP ({count} edit(s)).");
+                }
+                Err(err) => {
+                    self.status = format!("Format applied but re-save failed: {err}");
+                }
+            }
+        } else {
+            self.status = format!("Formatted via LSP ({count} edit(s)).");
+        }
+    }
+
+    /// Replace the open document's buffer with the on-disk contents of
+    /// `path`. Used after an out-of-process formatter rewrites the file.
+    /// Disk read goes through [`Self::fs`] (M4.10).
+    fn reload_buffer_from_disk(&mut self, path: &Path) -> Result<(), String> {
+        let text = self
+            .fs
+            .read_to_string(path)
+            .map_err(|err| format!("read {}: {err}", path.display()))?;
+        let Some(doc) = self.document.as_mut() else {
+            return Err("no document open".to_string());
+        };
+        if doc.path != path {
+            return Err("open document changed during format".to_string());
+        }
+        doc.editor.replace_all(&text);
+        doc.editor.mark_saved();
+        Ok(())
+    }
+
+    /// Apply the pending [`PromptIntent`] when the user accepts the modal.
+    fn accept_confirm(&mut self) {
+        let Some(intent) = self.confirm_intent.take() else {
+            self.confirm = None;
+            return;
+        };
+        self.confirm = None;
+        match intent {
+            PromptIntent::AddFormatTask {
+                snippet,
+                retry_trigger,
+            } => self.add_format_task_and_retry(&snippet, retry_trigger),
+        }
+    }
+
+    /// Append the `[tasks.format]` snippet to `mise.toml`, refresh the
+    /// detected project, and retry the original format request so the user
+    /// sees the formatter run immediately after confirming. All disk I/O
+    /// goes through [`Self::fs`] (M4.10).
+    fn add_format_task_and_retry(&mut self, snippet: &str, trigger: FormatTrigger) {
+        let mise_path = self.detection.root_path.join("mise.toml");
+        let updated = match self.fs.read_to_string(&mise_path) {
+            Ok(existing) => {
+                let mut updated = existing;
+                if !updated.ends_with('\n') {
+                    updated.push('\n');
+                }
+                updated.push_str(snippet);
+                updated
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => snippet.to_string(),
+            Err(err) => {
+                self.status = format!("Could not read mise.toml: {err}");
+                return;
+            }
+        };
+        if let Err(err) = self.fs.write(&mise_path, updated.as_bytes()) {
+            self.status = format!("Could not write mise.toml: {err}");
+            return;
+        }
+        match cockpit_project::detect_mise_project_with(
+            &self.detection.root_path,
+            self.fs.as_ref(),
+            self.process.as_ref(),
+        ) {
+            Ok(mise) => {
+                self.detection.mise = mise;
+                self.status = "Added [tasks.format] to mise.toml.".to_string();
+            }
+            Err(err) => {
+                self.status = format!("mise.toml updated but reparse failed: {err}");
+                return;
+            }
+        }
+        self.request_format(trigger);
+    }
+
+    /// Flip the per-session format-on-save preference (M4.4).
+    fn toggle_format_on_save(&mut self) {
+        self.format_on_save = !self.format_on_save;
+        self.status = if self.format_on_save {
+            "Format on save: ON.".to_string()
+        } else {
+            "Format on save: OFF.".to_string()
+        };
+    }
+
+    // ---- v0.5 notebook + analytics wire-up ------------------------------
+
+    /// Execute the active notebook cell through DuckDB or ggsql, route
+    /// the result back into [`Cell::apply_result`] (M5.3 wire-up).
+    fn run_active_notebook_cell(&mut self) {
+        let root = self.detection.root_path.clone();
+        let Some(notebook) = self.notebook.as_mut() else {
+            self.status = "No notebook open.".to_string();
+            return;
+        };
+        let Some(cell) = notebook.active_cell_mut() else {
+            self.status = "No active cell.".to_string();
+            return;
+        };
+        if !cell.kind.executable() {
+            self.status = format!("Cell {} is not executable.", notebook.active);
+            return;
+        }
+        let source = cell.source.clone();
+        let kind = cell.kind;
+        cell.mark_running();
+        let active = notebook.active;
+        let result = run_cell_against_engines(&root, kind, &source);
+        let Some(cell) = notebook.active_cell_mut() else {
+            return;
+        };
+        cell.apply_result(result);
+        let summary = match &cell.result {
+            Some(cockpit_notebook::CellResult::Ok(query)) => {
+                format!("Cell {active} ran: {} row(s).", query.rows.len())
+            }
+            Some(cockpit_notebook::CellResult::Err { message }) => {
+                format!("Cell {active} failed: {message}")
+            }
+            None => format!("Cell {active}: no result."),
+        };
+        self.status = summary;
+    }
+
+    fn notebook_next_cell(&mut self) {
+        let Some(notebook) = self.notebook.as_mut() else {
+            self.status = "No notebook open.".to_string();
+            return;
+        };
+        notebook.move_down();
+        self.status = format!(
+            "Notebook cell {} of {}.",
+            notebook.active + 1,
+            notebook.cells.len()
+        );
+    }
+
+    fn notebook_previous_cell(&mut self) {
+        let Some(notebook) = self.notebook.as_mut() else {
+            self.status = "No notebook open.".to_string();
+            return;
+        };
+        notebook.move_up();
+        self.status = format!(
+            "Notebook cell {} of {}.",
+            notebook.active + 1,
+            notebook.cells.len()
+        );
+    }
+
+    fn notebook_insert_cell_below(&mut self) {
+        let Some(notebook) = self.notebook.as_mut() else {
+            self.status = "No notebook open.".to_string();
+            return;
+        };
+        notebook.insert_cell_below();
+        self.status = format!(
+            "Inserted cell — active {} of {}.",
+            notebook.active + 1,
+            notebook.cells.len()
+        );
+    }
+
+    /// Re-detect the analytics project (if any) and run every
+    /// non-ephemeral [`BuildStep`] through DuckDB (M5.8 wire-up).
+    fn run_build_all_models(&mut self) {
+        let root = self.detection.root_path.clone();
+        let Some(project) = self.refresh_analytics_project() else {
+            self.status =
+                "No `models/` directory — add one or a cockpit-analytics.toml.".to_string();
+            return;
+        };
+        let plan: BuildPlan = match build_plan(&project) {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.status = format!("Build plan failed: {err}");
+                return;
+            }
+        };
+        let engine = DuckDbEngine::with_runner(root, self.process_arc());
+        let mut ok = 0usize;
+        let mut failed: Option<String> = None;
+        for step in &plan.steps {
+            if step.materialisation == Materialisation::Ephemeral || step.statement.is_empty() {
+                continue;
+            }
+            match engine.execute(&step.statement) {
+                Ok(_) => ok += 1,
+                Err(err) => {
+                    failed = Some(format!("{}: {err}", step.model));
+                    break;
+                }
+            }
+        }
+        self.status = match failed {
+            Some(why) => format!("Models build failed at {why} ({ok} ok before)"),
+            None => format!("Models build ok — {ok} statement(s) executed."),
+        };
+    }
+
+    /// Shell out to `mise exec -- quarto render <file>` for the active
+    /// Quarto document (v0.5 M5.Q3). Reports the exit status in the
+    /// status line; output paths the user can open are surfaced
+    /// through `quarto`'s own stdout.
+    fn render_quarto_document(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No document to render.".to_string();
+            return;
+        };
+        let is_qmd = doc
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("qmd"))
+            .unwrap_or(false);
+        if !is_qmd {
+            self.status = "Quarto: Render only works for .qmd files.".to_string();
+            return;
+        }
+        let spec = quarto_render_spec(&doc.path, &self.detection.root_path);
+        match self.process.run(&spec) {
+            Ok(output) if output.success => {
+                self.status = "Quarto: render complete.".to_string();
+            }
+            Ok(output) => {
+                let snippet = output
+                    .stderr_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("(no stderr)")
+                    .to_string();
+                self.status = format!("Quarto: render failed: {snippet}");
+            }
+            Err(err) => {
+                self.status = format!("Quarto: could not spawn `quarto`: {err}");
+            }
+        }
+    }
+
+    /// Surface the DAG topological order + cycle info in the status line.
+    fn show_dag_summary(&mut self) {
+        let Some(project) = self.refresh_analytics_project() else {
+            self.status = "No analytics project detected.".to_string();
+            return;
+        };
+        let dag = cockpit_analytics::ModelDag::from_models(&project.models);
+        match dag.topological_order() {
+            Ok(order) => {
+                self.status = if order.is_empty() {
+                    "Analytics project: no models.".to_string()
+                } else {
+                    format!(
+                        "Models: {} → {} ({} model(s))",
+                        order.first().unwrap(),
+                        order.last().unwrap(),
+                        order.len()
+                    )
+                };
+            }
+            Err(err) => self.status = format!("Models DAG: {err}"),
+        }
+    }
+
+    /// Re-run analytics detection. Uses `cockpit_project::StdFileSystem`
+    /// plus the analytics crate's `scan_models_dir` helper to enumerate
+    /// `.sql` files (the trait FS doesn't iterate directories yet —
+    /// `read_dir` lives in the `scan_models_dir` adapter so detection
+    /// itself stays pure). Caches the result in `self.analytics`.
+    fn refresh_analytics_project(&mut self) -> Option<AnalyticsProject> {
+        let root = self.detection.root_path.clone();
+        let models_dir = root.join("models");
+        if !models_dir.is_dir() {
+            self.analytics = None;
+            return None;
+        }
+        // Seed the fake fs with the real models so the pure
+        // `detect_analytics_project` can stay path-driven.
+        let model_paths = scan_models_dir(&models_dir).unwrap_or_default();
+        let fs = cockpit_project::FakeFileSystem::new();
+        fs.insert_dir(&root);
+        fs.insert_dir(&models_dir);
+        for path in &model_paths {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                fs.insert_file(path.clone(), &text);
+            }
+        }
+        match detect_analytics_project(&root, &fs) {
+            Ok(Some(project)) => {
+                self.analytics = Some(project.clone());
+                Some(project)
+            }
+            Ok(None) => {
+                self.analytics = None;
+                None
+            }
+            Err(err) => {
+                self.status = format!("Analytics detect failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// Fresh `Arc<StdProcessRunner>` for the cockpit-sql engines. The
+    /// model's own `process: Box<dyn ProcessRunner>` is not cloneable;
+    /// the SQL engines just spawn `mise exec` so a separate
+    /// std-backed handle is fine.
+    fn process_arc(&self) -> std::sync::Arc<dyn ProcessRunner> {
+        std::sync::Arc::new(StdProcessRunner)
+    }
+
+    /// Drive the modal yes/no confirmation prompt from one key chord.
+    fn handle_confirm_key(&mut self, chord: &KeyChord) {
+        if is_chord(chord, "Escape") || is_chord(chord, "n") || is_chord(chord, "N") {
+            self.confirm = None;
+            self.confirm_intent = None;
+            self.status = "Cancelled.".to_string();
+            return;
+        }
+        if is_chord(chord, "y") || is_chord(chord, "Y") {
+            self.accept_confirm();
+            return;
+        }
+        if is_chord(chord, "Enter") {
+            // Enter accepts only when "Yes" is highlighted — defaults to No
+            // so a careless Enter is always safe (AGENTS.md rule #6).
+            if self.confirm.as_ref().is_some_and(ConfirmPrompt::selection) {
+                self.accept_confirm();
+            } else {
+                self.confirm = None;
+                self.confirm_intent = None;
+                self.status = "Cancelled.".to_string();
+            }
+            return;
+        }
+        let Some(prompt) = self.confirm.as_mut() else {
+            return;
+        };
+        if is_chord(chord, "Tab")
+            || is_chord(chord, "ArrowLeft")
+            || is_chord(chord, "ArrowRight")
+            || is_chord(chord, "h")
+            || is_chord(chord, "l")
+        {
+            prompt.toggle();
+        }
+    }
+
     /// Insert the highlighted completion text at the current cursor.
     fn accept_completion(&mut self) {
         let Some(item) = self
@@ -1727,11 +2658,15 @@ impl AppModel {
                 applied += apply_lsp_text_edits_to_editor(&mut doc.editor, &edits)?;
                 continue;
             }
-            let text = std::fs::read_to_string(&path)
+            // Off-buffer edits go through the env seam (M4.10).
+            let text = self
+                .fs
+                .read_to_string(&path)
                 .map_err(|err| format!("read {}: {err}", path.display()))?;
             let mut editor = Editor::new(&text);
             applied += apply_lsp_text_edits_to_editor(&mut editor, &edits)?;
-            std::fs::write(&path, editor.text())
+            self.fs
+                .write(&path, editor.text().as_bytes())
                 .map_err(|err| format!("write {}: {err}", path.display()))?;
         }
         Ok(applied)
@@ -1746,6 +2681,11 @@ impl AppModel {
 
         let body_height = (height - TOP_BAR_H).max(0.0);
         let computed: ComputedLayout = self.layout.compute(width as u32, body_height as u32);
+        // Remember the latest layout + viewport so mouse hit tests can route
+        // events to the right pane (M4.7).
+        self.last_layout = Some(computed.clone());
+        self.last_view_width = width;
+        self.last_view_height = height;
 
         // Keep the PTY grid matched to the terminal pane before drawing it.
         if let Some(rect) = computed.terminal {
@@ -1775,6 +2715,9 @@ impl AppModel {
         }
         if let Some(completion) = &self.completion {
             paint_completion(&mut canvas, &self.theme, completion, width, height);
+        }
+        if let Some(prompt) = &self.confirm {
+            paint_confirm(&mut canvas, &self.theme, prompt, width, height);
         }
     }
 
@@ -1889,7 +2832,21 @@ impl AppModel {
         let visible = ((text_height - PAD) / ROW_H).max(1.0) as usize;
 
         let (cursor_line, cursor_col) = editor.cursor().line_col(buffer);
-        let first = cursor_line.saturating_sub(visible.saturating_sub(1));
+        // The first visible line is whichever brings the cursor into view —
+        // typed cursor moves still auto-scroll. The mouse wheel can push the
+        // viewport above that line (M4.7); the user-driven offset wins as
+        // long as the cursor is still inside the visible range.
+        let cursor_anchor = cursor_line.saturating_sub(visible.saturating_sub(1));
+        let scroll_anchor = self.editor_scroll.round() as usize;
+        let max_first = buffer.len_lines().saturating_sub(1);
+        let first = if scroll_anchor <= cursor_line
+            && cursor_line < scroll_anchor + visible
+            && scroll_anchor <= max_first
+        {
+            scroll_anchor
+        } else {
+            cursor_anchor
+        };
 
         let text = buffer.text();
         let lines: Vec<&str> = text.split('\n').collect();
@@ -2322,6 +3279,17 @@ impl Canvas<'_> {
     }
 }
 
+/// True when `position` falls inside `rect`. Pane rectangles use logical
+/// pixels in body coordinates (i.e. the top bar is at `y < TOP_BAR_H` and
+/// not part of any pane); callers compensate before calling.
+fn pane_contains(rect: UiRect, position: PointerPosition) -> bool {
+    let x0 = rect.x as f32;
+    let y0 = rect.y as f32 + TOP_BAR_H;
+    let x1 = x0 + rect.width as f32;
+    let y1 = y0 + rect.height as f32;
+    position.x >= x0 && position.x < x1 && position.y >= y0 && position.y < y1
+}
+
 /// True when `chord` is a single unmodified press of `key`.
 fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
@@ -2435,6 +3403,54 @@ fn chord_to_terminal_bytes(chord: &KeyChord) -> Option<Vec<u8>> {
 /// Build the spawn argv for `config`'s language server, wrapping it in
 /// `mise exec --` so every server inherits the project's mise environment
 /// (spec §19 / M4.5). Result: `["mise", "exec", "--", <command>, <args>...]`.
+/// Pick a notebook view-model when `path`'s contents look like a
+/// Jupytext or Quarto source. The two file-level cues are:
+///
+/// * `.qmd` extension → Quarto, parsed with [`parse_quarto`].
+/// * `.sql` / `.ggsql` extension with at least one `-- %% cell` marker
+///   → Jupytext, parsed with [`parse_notebook`].
+///
+/// Returns `None` for plain text files so opening a regular `.sql`
+/// file without markers keeps the normal editor experience.
+fn recognise_notebook(path: &Path, content: &str) -> Option<Notebook> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("qmd") => parse_quarto(content).ok(),
+        Some("sql") | Some("ggsql") if is_notebook_source(content) => {
+            let default_kind = if ext.as_deref() == Some("ggsql") {
+                CellKind::Ggsql
+            } else {
+                CellKind::Sql
+            };
+            parse_notebook(content, default_kind).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Route one cell's source through the right SQL engine based on its
+/// [`CellKind`]. Both engines share the M5.1 `SqlEngine` trait;
+/// production callers always spawn through `StdProcessRunner` because
+/// these are external `mise exec` invocations.
+fn run_cell_against_engines(
+    root: &Path,
+    kind: CellKind,
+    source: &str,
+) -> Result<cockpit_sql::QueryResult, cockpit_sql::QueryError> {
+    let process = std::sync::Arc::new(StdProcessRunner) as std::sync::Arc<dyn ProcessRunner>;
+    match kind {
+        CellKind::Ggsql => GgsqlEngine::with_runner(root.to_path_buf(), process).execute(source),
+        CellKind::Sql if statement_targets_ggsql(source) => {
+            GgsqlEngine::with_runner(root.to_path_buf(), process).execute(source)
+        }
+        CellKind::Sql => DuckDbEngine::with_runner(root.to_path_buf(), process).execute(source),
+        CellKind::Markdown => Ok(cockpit_sql::QueryResult::empty()),
+    }
+}
+
 fn lsp_launch_argv(config: &ServerConfig) -> Vec<String> {
     let inner: Vec<&str> = std::iter::once(config.command.as_str())
         .chain(config.args.iter().map(String::as_str))
@@ -2694,11 +3710,24 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(LSP_RENAME, "LSP: Rename Symbol"),
         PaletteEntry::new(LSP_COMPLETION, "LSP: Complete"),
         PaletteEntry::new(LSP_CODE_ACTION, "LSP: Code Action"),
+        PaletteEntry::new(EDITOR_FORMAT, "Editor: Format Document"),
+        PaletteEntry::new(
+            EDITOR_TOGGLE_FORMAT_ON_SAVE,
+            "Editor: Toggle Format on Save",
+        ),
+        PaletteEntry::new(NOTEBOOK_RUN_ACTIVE_CELL, "Notebook: Run Active Cell"),
+        PaletteEntry::new(NOTEBOOK_NEXT_CELL, "Notebook: Next Cell"),
+        PaletteEntry::new(NOTEBOOK_PREVIOUS_CELL, "Notebook: Previous Cell"),
+        PaletteEntry::new(NOTEBOOK_INSERT_CELL_BELOW, "Notebook: Insert Cell Below"),
+        PaletteEntry::new(MODELS_BUILD_ALL, "Models: Build All"),
+        PaletteEntry::new(MODELS_SHOW_DAG, "Models: Show DAG"),
+        PaletteEntry::new(QUARTO_RENDER, "Quarto: Render"),
         PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
         PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
         PaletteEntry::new(DEBUG_SHOW_PROJECT_STATE, "Debug: Show Project State"),
         PaletteEntry::new(DEBUG_RELOAD_CONFIG, "Debug: Reload Config"),
+        PaletteEntry::new(DEBUG_SHOW_STARTUP_TRACE, "Debug: Show Startup Trace"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -2891,6 +3920,72 @@ fn paint_completion(
     }
 }
 
+/// Paint the modal yes/no confirmation prompt (M4.4).
+fn paint_confirm(
+    canvas: &mut Canvas<'_>,
+    theme: &Theme,
+    prompt: &ConfirmPrompt,
+    view_width: f32,
+    view_height: f32,
+) {
+    canvas.rect(
+        0.0,
+        0.0,
+        view_width,
+        view_height,
+        Color::rgba(0.0, 0.0, 0.0, 0.5),
+    );
+    let panel_w = 520.0_f32.min(view_width - 2.0 * PAD);
+    let panel_x = ((view_width - panel_w) / 2.0).max(PAD);
+    let body_lines: Vec<&str> = prompt.body().lines().collect();
+    let panel_h = HEADER_H + ROW_H * (body_lines.len() as f32 + 2.0) + PAD * 2.0;
+    let panel_y = ((view_height - panel_h) / 2.0).max(TOP_BAR_H + PAD);
+
+    canvas.rect(panel_x, panel_y, panel_w, panel_h, theme.pane_background);
+    canvas.rect(panel_x, panel_y, panel_w, 2.0, theme.accent);
+    canvas.text(
+        panel_x + PAD,
+        panel_y + 6.0,
+        prompt.title().to_string(),
+        theme.text,
+        FONT,
+    );
+    for (idx, line) in body_lines.iter().enumerate() {
+        canvas.text(
+            panel_x + PAD,
+            panel_y + HEADER_H + idx as f32 * ROW_H,
+            (*line).to_string(),
+            theme.muted_text,
+            FONT,
+        );
+    }
+    let buttons_y = panel_y + HEADER_H + body_lines.len() as f32 * ROW_H + PAD;
+    let button_w = 80.0;
+    let yes_x = panel_x + panel_w - 2.0 * button_w - 2.0 * PAD;
+    let no_x = panel_x + panel_w - button_w - PAD;
+    let (yes_color, no_color) = if prompt.selection() {
+        (theme.accent, theme.pane_border)
+    } else {
+        (theme.pane_border, theme.accent)
+    };
+    canvas.rect(yes_x, buttons_y, button_w, ROW_H, yes_color);
+    canvas.rect(no_x, buttons_y, button_w, ROW_H, no_color);
+    canvas.text(
+        yes_x + PAD,
+        buttons_y + 3.0,
+        "[y] Yes".to_string(),
+        theme.text,
+        FONT,
+    );
+    canvas.text(
+        no_x + PAD,
+        buttons_y + 3.0,
+        "[n] No".to_string(),
+        theme.text,
+        FONT,
+    );
+}
+
 /// [`CockpitApp`] adapter: forwards harness callbacks to the [`AppModel`].
 pub struct AppShell {
     model: AppModel,
@@ -2914,6 +4009,22 @@ impl CockpitApp for AppShell {
 
     fn on_key(&mut self, chord: KeyChord) {
         self.model.dispatch(chord);
+    }
+
+    fn on_mouse_down(&mut self, button: MouseButton, position: PointerPosition) {
+        self.model.on_pointer_down(button, position);
+    }
+
+    fn on_mouse_up(&mut self, button: MouseButton, position: PointerPosition) {
+        self.model.on_pointer_up(button, position);
+    }
+
+    fn on_mouse_move(&mut self, position: PointerPosition) {
+        self.model.on_pointer_move(position);
+    }
+
+    fn on_scroll(&mut self, position: PointerPosition, dx: f32, dy: f32) {
+        self.model.on_scroll(position, dx, dy);
     }
 
     fn set_redraw_handle(&mut self, handle: RedrawHandle) {
@@ -3986,6 +5097,589 @@ mod tests {
         assert_eq!(cache.open_files.len(), 1);
         assert_eq!(cache.left_width, Some(260));
         assert_eq!(cache.right_width, Some(480));
+    }
+
+    // ---- M4.4 — Format on save -------------------------------------------
+
+    #[test]
+    fn apply_user_config_honours_format_on_save_and_layout_widths() {
+        let mut model = model();
+        assert!(!model.format_on_save);
+        let toml = r#"
+[ui]
+left_width = 300
+right_width = 360
+
+[editor]
+format_on_save = true
+"#;
+        let config = cockpit_config::Config::from_toml(toml).expect("config parses");
+        model.apply_user_config(&config);
+
+        assert!(model.format_on_save);
+        assert_eq!(model.layout.preferences().left_width, 300);
+        assert_eq!(model.layout.preferences().right_width, 360);
+    }
+
+    #[test]
+    fn quarto_render_without_a_document_reports_clearly() {
+        let mut model = model();
+        model.run_command(QUARTO_RENDER);
+        assert!(
+            model.status.contains("No document"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn quarto_render_refuses_non_qmd_documents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plain.sql");
+        std::fs::write(&path, "SELECT 1;\n").expect("seed file");
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(path);
+
+        model.run_command(QUARTO_RENDER);
+        assert!(model.status.contains(".qmd"), "status: {}", model.status);
+    }
+
+    #[test]
+    fn opening_a_jupytext_sql_file_populates_the_notebook_view_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("queries.sql");
+        std::fs::write(&path, "-- %% cell\nSELECT 1;\n-- %% cell\nSELECT 2;\n").expect("seed file");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(path.clone());
+
+        let notebook = model.notebook.as_ref().expect("notebook populated");
+        assert_eq!(notebook.cells.len(), 2);
+        assert_eq!(notebook.cells[0].source, "SELECT 1;");
+        assert_eq!(notebook.cells[1].source, "SELECT 2;");
+        assert!(model.status.contains("notebook"));
+    }
+
+    #[test]
+    fn opening_a_plain_sql_file_leaves_notebook_view_model_unset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plain.sql");
+        std::fs::write(&path, "SELECT 1;\n").expect("seed file");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(path);
+
+        assert!(model.notebook.is_none(), "no notebook for plain SQL");
+    }
+
+    #[test]
+    fn notebook_navigation_commands_walk_the_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("queries.sql");
+        std::fs::write(&path, "-- %% cell\nSELECT 1;\n-- %% cell\nSELECT 2;\n").expect("seed file");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(path);
+
+        assert_eq!(model.notebook.as_ref().unwrap().active, 0);
+        model.run_command(NOTEBOOK_NEXT_CELL);
+        assert_eq!(model.notebook.as_ref().unwrap().active, 1);
+        model.run_command(NOTEBOOK_PREVIOUS_CELL);
+        assert_eq!(model.notebook.as_ref().unwrap().active, 0);
+        model.run_command(NOTEBOOK_INSERT_CELL_BELOW);
+        assert_eq!(model.notebook.as_ref().unwrap().cells.len(), 3);
+    }
+
+    #[test]
+    fn show_dag_with_no_models_directory_reports_no_project() {
+        let mut model = model();
+        // The `file-tree` fixture has no `models/` dir.
+        model.run_command(MODELS_SHOW_DAG);
+        assert!(
+            model.status.contains("No analytics project"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn show_dag_with_a_models_dir_reports_a_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("models")).expect("mkdir models");
+        std::fs::write(
+            dir.path().join("models").join("stg_orders.sql"),
+            "SELECT 1 AS id",
+        )
+        .expect("seed model");
+        std::fs::write(
+            dir.path().join("models").join("fct_orders.sql"),
+            "SELECT * FROM {{ ref('stg_orders') }}",
+        )
+        .expect("seed model");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+
+        model.run_command(MODELS_SHOW_DAG);
+        // Summary mentions both models in topological order.
+        assert!(
+            model.status.contains("stg_orders"),
+            "status: {}",
+            model.status
+        );
+        assert!(
+            model.status.contains("fct_orders"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn editor_toggle_format_on_save_flips_the_session_preference() {
+        let mut model = model();
+        assert!(!model.format_on_save);
+
+        model.run_command(EDITOR_TOGGLE_FORMAT_ON_SAVE);
+        assert!(model.format_on_save);
+        assert!(model.status.contains("ON"));
+
+        model.run_command(EDITOR_TOGGLE_FORMAT_ON_SAVE);
+        assert!(!model.format_on_save);
+        assert!(model.status.contains("OFF"));
+    }
+
+    #[test]
+    fn format_without_a_document_surfaces_a_clear_status() {
+        let mut model = model();
+        assert!(model.document.is_none());
+
+        model.run_command(EDITOR_FORMAT);
+        assert!(model.confirm.is_none());
+        assert!(
+            model.status.contains("No document to format"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn format_with_no_detectable_tool_falls_back_to_lsp_only_status() {
+        // mise-basic has neither a `format` task nor a rustfmt entry; the
+        // fixture has no .rs files so language detection drops out and the
+        // request never reaches the LSP request path.
+        let mut model = mise_model();
+        let path = fixture_path("mise-basic").join("README.md");
+        std::fs::write(&path, "# hello\n").expect("seed file");
+        model.open_document(path.clone());
+        assert!(model.document.is_some());
+
+        model.run_command(EDITOR_FORMAT);
+        // No formatter & no LSP server running for markdown → user-visible
+        // explanation, not a panic.
+        assert!(
+            !model.status.is_empty(),
+            "format should always set a status line"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn detected_formatter_in_tools_opens_the_add_format_task_prompt() {
+        // Seed a tempdir with a `mise.toml` listing rustfmt as a tool so the
+        // planner picks the "suggest mise task" branch deterministically.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[tools]\nrustfmt = \"latest\"\n",
+        )
+        .expect("seed mise.toml");
+        std::fs::write(dir.path().join("main.rs"), "fn main(){}\n").expect("seed source");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(dir.path().join("main.rs"));
+        assert!(model.document.is_some());
+
+        model.run_command(EDITOR_FORMAT);
+        let prompt = model.confirm.as_ref().expect("confirm prompt is open");
+        assert!(
+            prompt.title().contains("rustfmt"),
+            "title: {}",
+            prompt.title()
+        );
+        assert!(prompt.body().contains("[tasks.format]"));
+        assert!(!prompt.selection(), "default selection must be safe (No)");
+
+        // Cancelling via `n` clears the prompt without touching mise.toml.
+        model.dispatch(chord("n"));
+        assert!(model.confirm.is_none());
+        let mise_toml = std::fs::read_to_string(dir.path().join("mise.toml")).expect("read back");
+        assert!(
+            !mise_toml.contains("[tasks.format]"),
+            "no task should be written on cancel — got:\n{mise_toml}"
+        );
+    }
+
+    #[test]
+    fn confirming_the_prompt_appends_format_task_to_mise_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[tools]\nrustfmt = \"latest\"\n",
+        )
+        .expect("seed mise.toml");
+        std::fs::write(dir.path().join("main.rs"), "fn main(){}\n").expect("seed source");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(dir.path().join("main.rs"));
+
+        model.run_command(EDITOR_FORMAT);
+        assert!(model.confirm.is_some());
+
+        // Highlight Yes (Tab) then confirm with Enter — exercises the modal
+        // contract that Enter is a no-op until the user opts into Yes.
+        model.dispatch(chord("Tab"));
+        assert!(model.confirm.as_ref().unwrap().selection());
+        model.dispatch(chord("Enter"));
+
+        // After accepting the prompt, the file has the snippet appended …
+        let mise_toml = std::fs::read_to_string(dir.path().join("mise.toml")).expect("read back");
+        assert!(
+            mise_toml.contains("[tasks.format]"),
+            "expected [tasks.format] in:\n{mise_toml}"
+        );
+        assert!(
+            mise_toml.contains("rustfmt"),
+            "expected suggested run line in:\n{mise_toml}"
+        );
+        // … and the live MiseProject is reparsed so a follow-up format would
+        // pick the new task without restarting cockpit.
+        assert!(
+            model
+                .detection
+                .mise
+                .tasks
+                .iter()
+                .any(|task| task.name == "format"),
+            "detection should be refreshed after write"
+        );
+    }
+
+    #[test]
+    fn confirm_prompt_default_enter_cancels_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[tools]\nrustfmt = \"latest\"\n",
+        )
+        .expect("seed mise.toml");
+        std::fs::write(dir.path().join("main.rs"), "fn x(){}\n").expect("seed source");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(dir.path().join("main.rs"));
+
+        model.run_command(EDITOR_FORMAT);
+        assert!(model.confirm.is_some());
+
+        // Plain Enter with No still highlighted (default) must NOT write —
+        // AGENTS.md rule #6.
+        model.dispatch(chord("Enter"));
+        assert!(model.confirm.is_none());
+        let mise_toml = std::fs::read_to_string(dir.path().join("mise.toml")).expect("read back");
+        assert!(
+            !mise_toml.contains("[tasks.format]"),
+            "Enter on No must cancel — got:\n{mise_toml}"
+        );
+    }
+
+    // ---- M4.10 — Hermetic format flow over the injected env seam ---------
+
+    /// `Arc`-shared `FileSystem` so the test and the [`AppModel`] both
+    /// observe the same in-memory state.
+    #[derive(Clone)]
+    struct SharedFs(std::sync::Arc<cockpit_project::FakeFileSystem>);
+
+    impl FileSystem for SharedFs {
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            self.0.read_to_string(path)
+        }
+        fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            self.0.write(path, contents)
+        }
+        fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.0.create_dir_all(path)
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            self.0.is_file(path)
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            self.0.is_dir(path)
+        }
+    }
+
+    /// `Arc`-shared `ProcessRunner` so the test can script responses and
+    /// inspect the spawn log after the model has run.
+    #[derive(Clone)]
+    struct SharedProcess(std::sync::Arc<cockpit_project::FakeProcessRunner>);
+
+    impl ProcessRunner for SharedProcess {
+        fn run(&self, spec: &ProcessSpec) -> std::io::Result<cockpit_project::ProcessOutput> {
+            self.0.run(spec)
+        }
+    }
+
+    #[test]
+    fn format_via_mise_task_runs_through_the_injected_process_runner() {
+        use cockpit_project::ProcessOutput;
+
+        let root = PathBuf::from("/proj");
+        let main_rs = root.join("main.rs");
+
+        // Seed an in-memory project: a mise.toml with a `format` task, and
+        // the open document the formatter should rewrite. No real I/O.
+        let fs = SharedFs(std::sync::Arc::new(cockpit_project::FakeFileSystem::new()));
+        fs.0.insert_dir(&root);
+        fs.0.insert_file(
+            root.join("mise.toml"),
+            "[tasks.format]\nrun = \"rustfmt $1\"\n",
+        );
+        fs.0.insert_file(&main_rs, "fn  main(){}\n");
+
+        let process = SharedProcess(std::sync::Arc::new(
+            cockpit_project::FakeProcessRunner::new(),
+        ));
+        // mise --version probe runs whenever we ask for project detection;
+        // the format spawn arrives once the model dispatches `editor.format`.
+        process.0.expect(
+            "mise",
+            ["--version"],
+            ProcessOutput {
+                success: true,
+                stdout: b"mise 2026.0.0\n".to_vec(),
+                stderr: Vec::new(),
+            },
+        );
+        process.0.expect::<&str, _, std::ffi::OsString>(
+            "mise",
+            [
+                std::ffi::OsString::from("run"),
+                std::ffi::OsString::from("format"),
+                std::ffi::OsString::from("--"),
+                main_rs.clone().into_os_string(),
+            ],
+            ProcessOutput {
+                success: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+
+        // Detection is a pure function over the seeded fake project.
+        let mise = cockpit_project::detect_mise_project_with(
+            &root,
+            &fs as &dyn FileSystem,
+            &process as &dyn ProcessRunner,
+        )
+        .expect("hermetic mise detection");
+        assert!(mise.tasks.iter().any(|t| t.name == "format"));
+
+        let detection = ProjectDetection {
+            root_path: root.clone(),
+            display_name: "proj".to_string(),
+            signals: Vec::new(),
+            strongest_signal: None,
+            mise,
+        };
+        // The file tree itself is not under test here; load it from a
+        // bundled fixture so the model has something to populate the
+        // browser pane with. The browser is irrelevant to the format flow.
+        let tree =
+            FileTree::load(fixture_path("file-tree")).expect("load file-tree fixture for shell");
+        let mut model = AppModel::with_env(
+            detection,
+            tree,
+            Box::new(fs.clone()),
+            Box::new(process.clone()),
+        )
+        .expect("hermetic model");
+
+        // Open the in-memory file through the model's own document path.
+        model.open_document(main_rs.clone());
+        assert!(model.document.is_some(), "document should open via fake fs");
+
+        // Simulate the formatter rewriting the file on disk so the reload
+        // observes a change.
+        fs.0.insert_file(&main_rs, "fn main() {}\n");
+
+        model.run_command(EDITOR_FORMAT);
+        assert!(
+            model.status.contains("Formatted via"),
+            "status: {}",
+            model.status
+        );
+        // The injected process runner saw both scripted spawns:
+        // `mise --version` during detection above, then `mise run format`
+        // — proving the model never touches `std::process::Command` and
+        // every spawn is observable from the test (M4.10 payoff).
+        let log = process.0.spawns();
+        assert_eq!(log.len(), 2, "spawn count, log: {log:?}");
+        assert_eq!(log[0].args, vec!["--version"]);
+        assert_eq!(log[1].args[0], "run");
+        assert_eq!(log[1].args[1], "format");
+        // And the buffer reloaded from the fake fs, not from real disk.
+        assert_eq!(
+            model.document.as_ref().unwrap().editor.text(),
+            "fn main() {}\n"
+        );
+    }
+
+    // ---- M4.7 — Mouse input ----------------------------------------------
+
+    /// Compute a layout for the model so the mouse handlers have a real
+    /// rectangle tree to hit-test against. Returns the model + the layout
+    /// for assertions.
+    fn primed_model() -> AppModel {
+        let mut model = model();
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+        model
+    }
+
+    #[test]
+    fn clicking_inside_the_files_pane_focuses_files() {
+        let mut model = primed_model();
+        // Start with the editor focused so the click is observable.
+        model.layout.focus(PaneId::Editor);
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+
+        // The files pane is the leftmost — a click at (10, 200) is safely inside.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(10.0, 200.0));
+        assert_eq!(model.layout.focused(), PaneId::Files);
+    }
+
+    #[test]
+    fn clicking_inside_the_editor_pane_focuses_editor() {
+        let mut model = primed_model();
+        model.layout.focus(PaneId::Files);
+        // Default layout: files=260, editor=460, terminal=480 over 1280px.
+        // Editor center is around x=490.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(490.0, 300.0));
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+    }
+
+    #[test]
+    fn clicking_inside_the_terminal_pane_focuses_terminal() {
+        let mut model = primed_model();
+        // Terminal sits at x >= 800 in the default 1280-wide layout.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(1000.0, 300.0));
+        assert_eq!(model.layout.focused(), PaneId::Terminal);
+    }
+
+    #[test]
+    fn right_click_does_not_change_focus() {
+        let mut model = primed_model();
+        model.layout.focus(PaneId::Editor);
+        // Right-click inside the files pane must NOT steal focus —
+        // right-button is reserved for future context menus.
+        model.on_pointer_down(MouseButton::Right, PointerPosition::new(10.0, 200.0));
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+    }
+
+    #[test]
+    fn dragging_the_left_pane_border_resizes_the_files_pane() {
+        let mut model = primed_model();
+        let initial = model.layout.preferences().left_width;
+        // Press on the left border (default files width = 260) then drag right.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(260.0, 200.0));
+        model.on_pointer_move(PointerPosition::new(320.0, 200.0));
+        model.on_pointer_up(MouseButton::Left, PointerPosition::new(320.0, 200.0));
+        assert!(
+            model.layout.preferences().left_width > initial,
+            "left width {} should exceed initial {initial}",
+            model.layout.preferences().left_width
+        );
+    }
+
+    #[test]
+    fn dragging_the_right_pane_border_resizes_the_terminal_pane() {
+        let mut model = primed_model();
+        let initial = model.layout.preferences().right_width;
+        // Right border lives at x = 800 in the default layout.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(800.0, 200.0));
+        model.on_pointer_move(PointerPosition::new(700.0, 200.0));
+        model.on_pointer_up(MouseButton::Left, PointerPosition::new(700.0, 200.0));
+        assert!(
+            model.layout.preferences().right_width > initial,
+            "right width {} should exceed initial {initial}",
+            model.layout.preferences().right_width
+        );
+    }
+
+    #[test]
+    fn scroll_in_the_editor_pane_updates_the_scroll_offset() {
+        let mut model = primed_model();
+        assert_eq!(model.editor_scroll, 0.0);
+        // Scroll up — content scrolls up so editor_scroll grows.
+        model.on_scroll(PointerPosition::new(490.0, 300.0), 0.0, -40.0);
+        assert!(model.editor_scroll > 0.0, "scroll: {}", model.editor_scroll);
+        // Scrolling back down clamps at zero, not negative.
+        model.on_scroll(PointerPosition::new(490.0, 300.0), 0.0, 200.0);
+        assert_eq!(model.editor_scroll, 0.0);
+    }
+
+    #[test]
+    fn clicking_a_file_row_selects_and_opens_it() {
+        let mut model = primed_model();
+        assert!(model.document.is_none(), "no document open at start");
+
+        // Row 2 in the file-tree fixture is README.md (rows: src, tests,
+        // README.md). Click lands at pane_top + ROW_H * 2 + a few pixels.
+        let row_y = TOP_BAR_H + HEADER_H + PAD * 0.5 + ROW_H * 2.0 + 4.0;
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(10.0, row_y));
+
+        // Opening a file leaves focus on the editor (open_document's contract).
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+        let doc = model.document.as_ref().expect("a file should be open");
+        assert_eq!(doc.name, "README.md");
+    }
+
+    #[test]
+    fn clicking_a_directory_row_expands_it_and_keeps_files_focused() {
+        let mut model = primed_model();
+
+        // Row 0 is `src` — a directory in the file-tree fixture.
+        let row_y = TOP_BAR_H + HEADER_H + PAD * 0.5 + 4.0;
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(10.0, row_y));
+        // Directory toggles don't open a document and don't move focus
+        // away from the files pane.
+        assert!(model.document.is_none());
+        assert_eq!(model.layout.focused(), PaneId::Files);
+        assert!(
+            model.browser.rows().iter().any(|row| row.name == "lib.rs"),
+            "src should be expanded after the click"
+        );
     }
 }
 

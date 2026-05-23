@@ -35,9 +35,18 @@ revert, not a review comment.
    filesystem (use `cockpit-testkit` fakes), no network.
 
 3. **All non-determinism is injected via traits.** Filesystem, process
-   spawning, and clock are dependencies, not globals. If you reach for
-   `std::fs`, `std::process::Command`, or `Instant::now()` inside core code,
-   you are probably adding an untestable path — add a trait or use the testkit.
+   spawning, and clock are dependencies, not globals. The traits live in
+   `cockpit-project::env` — `FileSystem`, `ProcessRunner`, `Clock` — with
+   `Std*` production impls and `Fake*` in-memory impls in the same module.
+   If you reach for `std::fs`, `std::process::Command`, or `Instant::now()`
+   inside core code, you are probably adding an untestable path — take the
+   trait object instead and pair the call site with `_with` variants where
+   the existing helpers expose them.
+
+   Adding a new SQL backend? Same pattern: extend the `SqlEngine` trait in
+   `cockpit-sql`, ship a real impl plus a `FakeSqlEngine` so the notebook
+   view-model (`cockpit-notebook`) and dbt-lite project layer
+   (`cockpit-analytics`) can keep running hermetic tests.
 
 4. **No global async runtime.** PTY and child-process I/O run on dedicated OS
    threads with channels. Do not add `tokio` to a core crate.
@@ -57,6 +66,12 @@ revert, not a review comment.
    the plan is wrong, update it; if the spec is wrong, annotate or update it.
    Never silently change behaviour described in either without updating both.
 
+9. **Mouse goes through `cockpit-render`'s headless callbacks.** Winit
+   mouse events translate into `MouseButton` + `PointerPosition` callbacks
+   on the `CockpitApp` trait (M4.7). `cockpit-render` is the only crate
+   that names a `winit` mouse type; the rest of the codebase hit-tests
+   the latest `ComputedLayout` rectangle.
+
 ---
 
 ## 3. Repository layout
@@ -67,20 +82,25 @@ samedit/                            # Cargo workspace root
 │   ├── cockpit/                    # binary: app shell, event loop, wiring
 │   ├── cockpit-editor/             # ropey buffer, cursor, undo, vim FSM, search
 │   ├── cockpit-project/            # detection, mise, project cache, file tree
+│   │                               #  + env::{FileSystem,ProcessRunner,Clock}
+│   │                               #    seams (M4.10)
 │   ├── cockpit-terminal/           # pty, termwiz engine, zellij, path detect
 │   ├── cockpit-lsp/                # LSP transport — codec, JSON-RPC, client
 │   ├── cockpit-commands/           # command registry + keybinding resolution
 │   ├── cockpit-config/             # serde config types, TOML/KDL loading
 │   ├── cockpit-ui/                 # view-model tree, layout, panes, palette
 │   ├── cockpit-render/             # winit + glow — ONLY GPU/window crate
-│   └── cockpit-testkit/  (dev)     # shared fixtures, fakes, golden helpers
+│   ├── cockpit-sql/                # DuckDB / ggsql shell-out engines (v0.5)
+│   ├── cockpit-notebook/           # Jupytext + Quarto notebook view-model (v0.5)
+│   ├── cockpit-analytics/          # dbt-lite project mode (v0.5)
+│   └── cockpit-testkit/  (dev)     # shared fixtures, bench helpers
 ├── tests/
 │   └── fixtures/                   # rust-basic, mise-basic, file-tree, …
 ├── .github/workflows/              # Win/macOS/Linux CI matrix
 ├── Cargo.toml                      # workspace manifest
 ├── rust-toolchain.toml             # pinned stable Rust
 ├── mise.toml                       # canonical task runner (all dev workflows)
-├── spec.md                         # product spec (Zig refs are stale)
+├── spec.md                         # product spec (Rust-aligned as of M4.9)
 └── IMPLEMENTATION_PLAN.md          # authoritative stack + plan
 ```
 
@@ -95,14 +115,18 @@ should never gain a window/GPU dependency.
 |------------------------------------------|--------------------------|
 | Buffer / cursor / undo / Vim mode logic  | `cockpit-editor`         |
 | Project detection, mise parsing, tasks   | `cockpit-project`        |
+| Filesystem / process / clock seams       | `cockpit-project::env`   |
 | PTY, terminal engine, Zellij, path parse | `cockpit-terminal`       |
 | LSP codec / JSON-RPC / client transport  | `cockpit-lsp`            |
 | A new command ID or keybinding           | `cockpit-commands`       |
 | Config schema, TOML/KDL parsing          | `cockpit-config`         |
 | View-model state (panes, palette, tree)  | `cockpit-ui`             |
 | Anything calling `winit` or `glow`       | `cockpit-render`         |
+| DuckDB / ggsql / new SQL backend         | `cockpit-sql`            |
+| Notebook cell parser / view-model        | `cockpit-notebook`       |
+| dbt-lite analytics (detect / DAG / build)| `cockpit-analytics`      |
 | Wiring crates together, CLI flags        | `cockpit` (binary)       |
-| Fixtures, fakes, golden helpers          | `cockpit-testkit`        |
+| Fixtures, fakes, bench helpers           | `cockpit-testkit`        |
 
 When in doubt, prefer adding to the *most headless* crate that can express the
 behaviour. UI is thin; cores are fat.

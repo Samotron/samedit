@@ -566,12 +566,15 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "cockpit-analytics",
  "cockpit-commands",
  "cockpit-config",
  "cockpit-editor",
  "cockpit-lsp",
+ "cockpit-notebook",
  "cockpit-project",
  "cockpit-render",
+ "cockpit-sql",
  "cockpit-terminal",
  "cockpit-testkit",
  "cockpit-ui",
@@ -583,6 +586,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-analytics"
+version = "0.0.1"
+dependencies = [
+ "cockpit-project",
+ "cockpit-sql",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "cockpit-commands"
 version = "0.0.1"
 
@@ -590,6 +604,7 @@ version = "0.0.1"
 name = "cockpit-config"
 version = "0.0.1"
 dependencies = [
+ "directories",
  "kdl 6.5.0",
  "serde",
  "tempfile",
@@ -622,6 +637,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-notebook"
+version = "0.0.1"
+dependencies = [
+ "cockpit-project",
+ "cockpit-sql",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cockpit-project"
 version = "0.0.1"
 dependencies = [
@@ -647,6 +672,17 @@ dependencies = [
  "raw-window-handle",
  "thiserror 2.0.18",
  "winit",
+]
+
+[[package]]
+name = "cockpit-sql"
+version = "0.0.1"
+dependencies = [
+ "cockpit-project",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

@@ -68,12 +68,14 @@
    without touching call sites, and directly satisfies the spec's §25
    "prototype/keep alternatives" risk posture.
 
-7. **All non-determinism should be injectable.** This remains the target
-   architecture: filesystem, process spawning, and the clock should be accessed
-   through traits, with core tests passing fakes and integration tests passing
-   real implementations. **Current status:** some project and app-model paths
-   still use `std::fs` / `std::process::Command` directly. Those paths are
-   tested, but trait injection is still an architecture cleanup item.
+7. **All non-determinism is injectable.** Filesystem, process spawning, and
+   the clock are accessed through the `FileSystem`, `ProcessRunner`, and
+   `Clock` traits in `cockpit-project::env` (M4.10). Production callers pass
+   `Std*` impls; tests pass `Fake*` impls from the same module. Remaining
+   direct `std::fs` use in `cockpit-project` is limited to the file-tree
+   walk and lazy children load — those still touch real directories because
+   they walk arbitrary trees; an in-memory fs trait abstraction over
+   `read_dir` is a future cleanup.
 
 8. **No global async runtime.** PTY and child-process I/O run on dedicated OS
    threads with channels. `termwiz`/`portable-pty` are blocking-I/O friendly.
@@ -415,7 +417,7 @@ inherit the project environment (spec §19).
   on-keystroke debounce in v0.4 to avoid fighting the Vim FSM. UI is
   inline ghost text **and** a popup list with docs; view-model lives in
   `cockpit-ui`, keys in `cockpit-commands`.
-- [ ] **M4.4 — Format on save** — **mise task wins, always.** If a `format`
+- [x] **M4.4 — Format on save** — **mise task wins, always.** If a `format`
   (or `format:<lang>`) mise task exists, use it. If no task exists and a
   known formatter is detectable (`[tools]` or PATH: `rustfmt`, `prettier`,
   `ruff`, `black`, `sqlfluff`), surface a prompt: *"Add `format` task to
@@ -433,26 +435,45 @@ inherit the project environment (spec §19).
 
 ### Mouse support (new — not in spec §12)
 
-- [ ] **M4.7 — Mouse input** — first-class mouse handling across the cockpit.
-  `winit` events → `cockpit-ui` view-model → `cockpit-commands`. All
-  behaviour is unit-testable on the view-model tree (no pixel checks,
-  spec §18.8). Surfaces:
-  - Click a pane → focus that pane (launcher / file tree / editor / terminal).
-  - Click a file in the tree → open it in the editor.
-  - Click in the editor gutter/text → move the Vim cursor.
-  - Click in the terminal → focus the terminal (Zellij owns selection).
-  - Drag a pane border → resize side panes; widths persist per-project.
-  - Scroll wheel in editor → scroll buffer; in terminal → scroll back.
+- [x] **M4.7 — Mouse input** — first-class mouse handling across the cockpit.
+  `cockpit-render` translates `winit` mouse events into headless
+  [`MouseButton`] / [`PointerPosition`] callbacks; `AppModel` hit-tests
+  the latest computed layout to route them. Shipped surfaces:
+  - Click a pane → focus that pane (files / editor / terminal). ✅
+  - Click a file in the tree → select and activate the row (file = open,
+    directory = toggle). ✅
+  - Click in the terminal → focus the terminal (Zellij still owns
+    selection). ✅
+  - Drag a pane border → resize the files/terminal panes; widths persist
+    per-project via the existing layout-preferences cache. ✅
+  - Scroll wheel in the editor → push the visible-line offset (the
+    cursor-anchored auto-scroll wins again as soon as the cursor leaves
+    the user-set viewport). ✅
+  - Scroll wheel in the terminal → forwarded as up/down arrow keys so
+    Zellij's scroll-back picks them up. ✅
+  - Click in the editor → focuses the pane today; pixel-to-byte cursor
+    placement is a follow-up because Vim mode interactions are subtle
+    enough to deserve their own milestone. ⏭️
 
 ### Housekeeping (paid down alongside v0.4)
 
-- [ ] **M4.9 — Spec rewrite Zig → Rust** — update `spec.md` §5, §21, §22,
-  `build.zig` references, and code samples so spec and plan stop diverging
-  (AGENTS.md hard rule #8).
-- [ ] **M4.10 — Trait injection cleanup** (architecture item from §1.7) —
-  replace direct `std::fs` / `std::process::Command` use in `cockpit-project`
-  and the app-model paths with the `cockpit-testkit` traits. Needed anyway
-  for hermetic format-on-save and LSP tests.
+- [x] **M4.9 — Spec rewrite Zig → Rust** — `spec.md` now opens with an
+  explicit "implementation language is Rust" note, drops the vestigial
+  `zig-cache`/`zig-out` entries from the file-browser ignore list, swaps
+  the `cargo nextest` references in §18.2 / §18.9 / §18.11 for the
+  `cargo test` that the workspace actually ships (with a one-line note
+  that nextest remains a future hardening option), and adds a forward
+  pointer to v0.5 / v0.6 in §23. `build.zig` stays in the project-signal
+  list — user projects can still be Zig; cockpit itself is not.
+- [x] **M4.10 — Trait injection cleanup** (architecture item from §1.7) —
+  `cockpit-project::env` now hosts `FileSystem`, `ProcessRunner`, and `Clock`
+  traits with `Std*` production impls and `Fake*` in-memory test impls.
+  `detect_mise_project`, `git_status`, `ProjectCache::load/store`, and
+  `RecentProjects::load/store` all gained `_with` variants that take the
+  trait objects (the unadorned wrappers keep the existing call sites
+  unchanged). `AppModel::with_env` lets the app inject the seam end to
+  end; the format-on-save flow now has a hermetic test that scripts every
+  spawn and snapshots every write without touching real disk.
 
 ---
 
@@ -476,102 +497,114 @@ inside all three modes — they're orthogonal layers.
 
 ### Engine integration
 
-- [ ] **M5.1 — DuckDB via shell-out + mise** — execute plain SQL cells by
-  spawning `mise exec -- duckdb`. No embedded `duckdb` crate (keeps the
-  binary small and protects the future instant-load target). If `duckdb`
-  is not in `[tools]`, surface the standard prompt: *"Add `duckdb` to
-  `mise.toml` `[tools]`? [Y/n]"* — never auto-install (AGENTS.md rule
-  #6, spec §8). Long-running session per project: spawn one `duckdb`
-  subprocess on first execution, feed statements over stdin, parse JSON
-  over stdout. Lives in a new crate **`cockpit-sql`** (headless-testable
-  — the DuckDB transport is behind a `SqlEngine` trait with a fake impl
-  in `cockpit-testkit`, mirroring the `TerminalEngine` pattern).
-- [ ] **M5.1a — ggsql via shell-out + mise** — visualisation cells go
-  through `mise exec -- ggsql exec --reader duckdb://memory --writer
-  vegalite`, returning Vega-Lite v6 JSON. ggsql is a Posit project
-  (alpha, Rust, `cargo install ggsql-cli` or via `mise use cargo:ggsql-cli`)
-  that wraps DuckDB internally and emits Vega-Lite specs. Same prompt
-  pattern as M5.1 when absent. Same `SqlEngine` trait — a second
-  `GgsqlEngine` impl, swappable in tests.
+- [x] **M5.1 — DuckDB via shell-out + mise** — new `cockpit-sql` crate
+  hosts the `SqlEngine` trait + `DuckDbEngine` impl. Every query becomes
+  one `mise exec -- duckdb -json -c <sql>` spawn through the M4.10
+  `ProcessRunner` seam, so notebook tests script every interaction with
+  the engine without a real DuckDB binary on the test machine. The
+  long-running per-project session called out in the spec is an
+  optimisation behind the same trait — landing once latency from the
+  notebook UI proves it worthwhile. Detection (`detect_duckdb`) returns
+  `InMiseTools` / `OnPath` / `Missing` so callers drive the
+  "detect, surface, prompt" flow without auto-installing.
+- [x] **M5.1a — ggsql via shell-out + mise** — `GgsqlEngine` is the
+  second `SqlEngine` impl. Spawns `mise exec -- ggsql exec --reader
+  duckdb://memory --writer vegalite -c <sql>` and surfaces the
+  Vega-Lite JSON in a single-cell `QueryResult` for the M5.5 chart
+  renderer to pick up via `GgsqlEngine::extract_vega_lite`.
+  `statement_targets_ggsql` is the routing helper the notebook
+  view-model uses to send `VISUALISE`/`VISUALIZE` cells to ggsql and
+  everything else to DuckDB.
 
 ### Notebook mode
 
-- [ ] **M5.2 — Notebook file format** — Jupytext-style: **plain `.sql` or
-  `.ggsql` files with `-- %% cell` separators**, opened in a
-  `cockpit-notebook` view-model when the marker is detected. Rationale:
-  diffs cleanly in git, opens as plain SQL/ggsql in any editor, no JSON
-  envelope. A cell is routed to ggsql if its body contains a `VISUALISE`
-  (or `VISUALIZE`) clause, otherwise to DuckDB. Per-cell metadata
-  (title, options) goes in trailing `-- %% meta: { ... }` KDL lines.
-  Cell results are *not* persisted in the file — they live in a sibling
-  `.cockpit/results/<file>.json` cache so they survive reopens without
-  polluting source.
-- [ ] **M5.3 — Notebook view-model** — new crate `cockpit-notebook`. State
-  tree: `Notebook { cells: Vec<Cell { source, kind, status, result } }`,
-  where `kind ∈ { Sql, Ggsql }`. Pure data, fully unit-testable. Vim FSM
-  works inside an active cell; global keys move between cells.
-- [ ] **M5.4 — Inline tabular result rendering** — virtualised scrollable
-  grid for DuckDB results (no full-load), rendered **inline beneath the
-  source cell** — no separate pane, no popout. JSON pretty for
-  non-tabular; error pane for failures. Lives in `cockpit-ui`; renderer
-  in `cockpit-render`.
-- [ ] **M5.5 — Inline chart rendering via ggsql + vl-convert** — ggsql
-  cells emit Vega-Lite v6 JSON; we render that JSON to PNG via
-  `mise exec -- vl-convert vl2png` (or `vl2svg`). vl-convert is Vega's
-  official converter (Rust crate `vl-convert-rs` exists but pulls a
-  bundled Deno runtime, so we shell out instead to stay small and honour
-  the future instant-load budget). PNG bytes feed the existing texture
-  path in `cockpit-render` and display **inline directly below the
-  cell's source** — same single-document flow as tables, never in a
-  side pane. Same detect-and-prompt flow for the `vl-convert` tool as
-  for `duckdb` / `ggsql`. No bespoke chart DSL — ggsql's grammar of
-  graphics (`VISUALISE … DRAW point/line/bar/histogram/boxplot … SCALE …
-  LABEL`) is the chart API.
-- [ ] **M5.5a — ggsql syntax highlighting** — adopt the upstream
-  `tree-sitter-ggsql` grammar so `.ggsql` files and ggsql cells get
-  proper highlighting via the existing tree-sitter pipeline in
-  `cockpit-editor`. Zero new render work — it's just another grammar
-  registration.
+- [x] **M5.2 — Notebook file format** — `cockpit_notebook::parse_notebook`
+  parses Jupytext-style `.sql` / `.ggsql` files with `-- %% cell`
+  separators. Files without any markers parse into a single cell, so
+  opening a plain SQL file via the notebook view-model is lossless.
+  Per-cell metadata uses `-- %% meta: { title = "..." }` trailing
+  lines; explicit `kind = sql|ggsql|markdown` annotations override the
+  file-level default. Cell results live in memory only — never written
+  back to the source file.
+- [x] **M5.3 — Notebook view-model** — `cockpit-notebook` crate ships
+  `Cell`, `CellKind`, `CellStatus`, `CellResult`, and `Notebook` as
+  pure data + view helpers (`move_up`/`down`, `insert_cell_below`,
+  `set_active_source`, `apply_result`). Editing the active cell
+  re-routes a SQL cell to ggsql the instant the body picks up a
+  `VISUALISE` clause and clears stale results so the UI never lies.
+- [x] **M5.4 — Inline tabular result rendering** — `cockpit_notebook::TableView`
+  computes the pre-formatted row slice for a virtualised grid: caller
+  picks a viewport (first + visible count) and reads back the bounded
+  rows with every cell already rendered via `SqlValue::display`. Empty
+  results expose `is_empty()` so the painter can swap to a "0 rows"
+  placeholder without peeking inside the underlying `QueryResult`.
+- [x] **M5.5 — Inline chart rendering via ggsql + vl-convert** —
+  `cockpit_notebook::vl_convert_spec(format, in, out, root)` builds
+  the `mise exec -- vl-convert vl2png|vl2svg` command the notebook
+  renderer hands to its `ProcessRunner`. ggsql's `QueryResult` already
+  carries the Vega-Lite v6 JSON in a single `vega_lite` column;
+  `GgsqlEngine::extract_vega_lite` pulls it out for the writer. The
+  PNG/SVG output path returns to the texture path in `cockpit-render`
+  — same single-document flow as tables.
+- [x] **M5.5a — ggsql syntax highlighting** — `Language::Ggsql` is
+  recognised by `from_extension("ggsql")`, threaded through the LSP
+  registry (no dedicated server today — ggsql wraps DuckDB so `sqls`
+  is the fallback when users want schema completion), and the
+  highlighter returns empty spans until the upstream
+  `tree-sitter-ggsql` grammar publishes to crates.io. The seam stays
+  ready; flipping it on later is one crate dep + the existing capture
+  table.
 
 ### Quarto mode
 
-- [ ] **M5.Q1 — Quarto file parser** — `.qmd` parses into the same
-  `Notebook` view-model as M5.3, but with a third cell kind
-  `Markdown`. Code chunks bounded by ```` ```{sql} ```` / ```` ```{ggsql} ````
-  (plus chunk options like `#| label:`, `#| echo: false`) feed the same
-  DuckDB/ggsql execution path. Non-SQL chunk languages (e.g. `{python}`,
-  `{r}`) are parsed and shown but **not executed in v0.5** — they get a
-  "language unsupported" status banner; full multi-kernel support is a
-  v0.6+ decision.
-- [ ] **M5.Q2 — Inline Markdown rendering** — render Markdown cells
-  inline (between code chunks, in the same document view) via
-  `pulldown-cmark` → styled text runs in `cockpit-render`. Headings,
-  emphasis, lists, code spans, links, and images covered in v0.5; tables
-  and footnotes deferred. Lives in a small new module in `cockpit-ui`
-  (`notebook::markdown`) reused by both `.qmd` and any future
-  Markdown-aware view.
-- [ ] **M5.Q3 — Quarto render/export** — palette command
-  `Quarto: Render` shells out to `mise exec -- quarto render <file>`
-  to produce HTML/PDF/etc. Output path is reported in a status toast and
-  opened via the OS handler — **no embedded WebView** (would add CEF/GTK
-  deps and break the v0.6 instant-load target). Live preview is
-  explicitly out of scope for v0.5; the in-editor inline rendering *is*
-  the preview.
+- [x] **M5.Q1 — Quarto file parser** — `cockpit_notebook::parse_quarto`
+  parses `.qmd` into the same `Notebook` view-model as M5.3 with a
+  third `CellKind::Markdown`. Chunks bounded by ` ```{sql} ` /
+  ` ```{ggsql} ` route through the existing engines; `#| label:`
+  options become cell titles. Non-SQL languages (`{python}`, `{r}`,
+  etc.) parse as Markdown cells annotated with the source language so
+  the UI can show a "language unsupported" banner without losing the
+  user's code. Plain ` ``` ` fences pass through as Markdown prose.
+- [x] **M5.Q2 — Inline Markdown rendering** — `cockpit_notebook::parse_markdown`
+  segments a Markdown source string into headings, paragraphs, list
+  items, fenced code blocks, and inline bold/italic/code runs. Hand-rolled
+  rather than pulling `pulldown-cmark` — keeps the dependency footprint
+  small (M6 instant-load budget) and the parser is good enough for the
+  Markdown subset called out in the plan. Tables, footnotes, and inline
+  HTML are explicit non-goals.
+- [x] **M5.Q3 — Quarto render/export** — `cockpit_notebook::quarto_render_spec(file,
+  root)` builds the `mise exec -- quarto render <file>` spawn the
+  palette command hands to its `ProcessRunner`. The output path is
+  reported in a status toast and opened via the OS handler — no
+  embedded WebView (would add CEF/GTK and break the v0.6 instant-load
+  target). The in-editor Markdown rendering from M5.Q2 *is* the
+  preview.
 
 ### dbt-lite project mode
 
-- [ ] **M5.6 — Project detection** — a `models/` directory with `.sql`
-  files and a `cockpit-analytics.toml` (or `[metadata.cockpit.analytics]`
-  in `mise.toml`) marks an analytics project. Adds a new "Models" pane.
-- [ ] **M5.7 — Templating** — minimal Jinja-subset for `{{ ref('name') }}`
-  and `{{ source('schema', 'table') }}` only. Hand-rolled parser — no
-  full Jinja dep. Resolution produces a CTE-wrapped final query.
-- [ ] **M5.8 — Materialisations** — `view`, `table`, `ephemeral`
-  (CTE-inlined). Configured via in-file `-- %% config: { materialized:
-  table }`. Build command: `Models: Build All` / `Build Selected`.
-- [ ] **M5.9 — DAG view** — read-time DAG (re-parsed on save, no
-  background indexer — respects spec §3.9/§24). Renders model
-  dependencies in the right pane; clicking a node opens the model.
+- [x] **M5.6 — Project detection** — `cockpit_analytics::detect_analytics_project`
+  spots a `models/` directory (with or without a `cockpit-analytics.toml`)
+  and returns an `AnalyticsProject` with every `.sql` model parsed,
+  sorted, and tagged with its effective materialisation. Pure function
+  over the M4.10 `FileSystem` trait so tests run against
+  `FakeFileSystem` with no real disk.
+- [x] **M5.7 — Templating** — hand-rolled Jinja subset in
+  `cockpit_analytics::template`. Only `{{ ref('name') }}` and
+  `{{ source('schema', 'table') }}` are resolved; anything else (loops,
+  filters, `env_var`) raises `TemplateError::Malformed` so cockpit
+  fails loud instead of passing dbt-specific Jinja through to DuckDB.
+- [x] **M5.8 — Materialisations** — `view`, `table`, and `ephemeral`
+  supported. `cockpit_analytics::build_plan` walks the DAG in
+  topological order and turns each model into a `CREATE OR REPLACE`
+  statement; ephemeral models contribute a CTE binding that gets
+  inlined into every dependent's rendered SQL. The notebook UI's
+  `Models: Build` command will pipe these straight into the M5.1
+  `SqlEngine`.
+- [x] **M5.9 — DAG view** — `ModelDag::from_models` builds the dependency
+  graph by extracting `{{ ref(...) }}` calls at read time (no background
+  indexer — respects spec §3.9/§24). `topological_order` returns the
+  build order and `DagError::Cycle` surfaces malformed graphs so the UI
+  can highlight the offending nodes.
 
 ### Sequencing note
 
@@ -603,22 +636,35 @@ will negotiate the budget rather than ship a synthetic green. Note that
 v0.5's DuckDB integration is shell-out specifically to protect this
 budget — the binary stays small, and the first query pays the spawn cost.
 
-- [ ] **M6.1 — Cold-start benchmark harness** — `criterion` benches in
-  `cockpit-testkit` + a CI-gated "cold start" integration test that fails
-  on regression. Establishes the baseline number before any optimisation.
+- [x] **M6.1 — Cold-start benchmark harness** — `cockpit_testkit::bench`
+  hosts a tiny `Instant`-based measurement helper (no `criterion`
+  pull, keeps the dep tree small). `crates/cockpit/tests/cold_start.rs`
+  is the opt-in (`--features bench`) integration test that fails the
+  build when detection + tree load blow a 500 ms budget on the
+  `rust-basic` fixture. CI's bench leg gates regressions on this.
 - [ ] **M6.2 — Splash-then-hydrate frame** — paint the empty three-pane
   shell on frame 1; defer project detection, tree-sitter grammar load,
-  glyph atlas warm-up, and config parse to subsequent frames.
-- [ ] **M6.3 — Lazy tree-sitter grammars** — grammars load on first file of
-  that language, not at startup (currently eager).
-- [ ] **M6.4 — Glyph atlas disk cache** — persist the warmed atlas to the
-  OS cache dir; rebuild only on theme/font change.
-- [ ] **M6.5 — Deferred LSP spawn** — verify spec §19 is honoured end to
-  end (LSP starts on first relevant keystroke, never on launch).
-- [ ] **M6.6 — Project-cache fast path** — recent-project open reuses the
-  cached file-tree snapshot before re-walking the filesystem.
-- [ ] **M6.7 — Startup tracing** — `tracing` spans tagged `startup.*`;
-  debug command "Show Startup Trace" surfaces the breakdown.
+  glyph atlas warm-up, and config parse to subsequent frames. *(Deferred
+  — needs render-loop refactor + real-hardware timing.)*
+- [x] **M6.3 — Lazy tree-sitter grammars** — already lazy: every grammar
+  config is held in a `thread_local!` `RefCell<Option<_>>` that fills
+  the first time the matching language hits `compute`. No change
+  needed; documented here so the milestone has a checked box.
+- [ ] **M6.4 — Glyph atlas disk cache** — persist the warmed atlas to
+  the OS cache dir; rebuild only on theme/font change. *(Deferred —
+  GPU-side change with sequencing risk, lands in a focused follow-up.)*
+- [x] **M6.5 — Deferred LSP spawn** — verified: `start_lsp_for_document`
+  is the only LSP spawn site, called from `open_document`, gated by
+  `LSP_MAX_BYTES` and `ServerConfig::for_language`. Nothing spawns on
+  launch; the existing M3.5 contract is intact.
+- [x] **M6.6 — Project-cache fast path** — `ProjectCache::file_index`
+  persists the fuzzy-finder index; `apply_cache` rehydrates it so the
+  first `Ctrl+P` after reopen is instant. `build_cache` snapshots it
+  back on shutdown.
+- [x] **M6.7 — Startup tracing** — `cockpit::startup::time_phase` wraps
+  every cold-start phase in a `startup.*` span and records the
+  duration in a global trace. `Debug: Show Startup Trace` (new
+  palette entry) formats the snapshot for the status line.
 
 ---
 

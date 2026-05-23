@@ -4,9 +4,19 @@
 //! the per-project state cache (spec §7), the lazy file tree (spec §13), and
 //! the git status integration that drives file-browser badges (spec §23 v0.3).
 
+pub mod env;
+pub mod formatter;
 pub mod git;
 
-pub use git::{GitStatus, git_status, parse_porcelain_z};
+pub use env::{
+    Clock, FakeClock, FakeFileSystem, FakeProcessRunner, FileSystem, ProcessOutput, ProcessRunner,
+    ProcessSpec, StdClock, StdFileSystem, StdProcessRunner,
+};
+pub use formatter::{
+    BinaryLookup, FixedBinaryLookup, FormatPlan, KnownFormatter, NoBinaryLookup, PathBinaryLookup,
+    plan_format, render_format_task_snippet,
+};
+pub use git::{GitStatus, git_status, git_status_with, parse_porcelain_z};
 
 use std::{
     collections::BTreeMap,
@@ -144,33 +154,55 @@ pub struct CockpitMetadata {
 }
 
 /// Parse `mise.toml` / `.mise.toml` from a project root.
+///
+/// Production wrapper that delegates to [`detect_mise_project_with`] using
+/// the std-backed filesystem and process runner (M4.10).
 pub fn detect_mise_project(root_path: impl AsRef<Path>) -> Result<MiseProject, ProjectError> {
+    detect_mise_project_with(root_path, &env::StdFileSystem, &env::StdProcessRunner)
+}
+
+/// Trait-injected variant of [`detect_mise_project`] — same semantics,
+/// disk reads and the `mise --version` probe go through the trait objects
+/// so tests can stub them out (M4.10).
+pub fn detect_mise_project_with(
+    root_path: impl AsRef<Path>,
+    fs: &dyn env::FileSystem,
+    process: &dyn env::ProcessRunner,
+) -> Result<MiseProject, ProjectError> {
     let root_path = root_path.as_ref();
-    let Some(config_path) = mise_config_path(root_path) else {
+    let Some(config_path) = mise_config_path_with(root_path, fs) else {
         return Ok(MiseProject::default());
     };
 
-    let input = fs::read_to_string(&config_path).map_err(ProjectError::Read)?;
+    let input = fs
+        .read_to_string(&config_path)
+        .map_err(ProjectError::Read)?;
     let mut project = parse_mise_toml(&input)?;
     project.detected = true;
-    project.available = mise_available();
+    project.available = mise_available_with(process);
     project.config_path = Some(config_path);
     Ok(project)
 }
 
-fn mise_config_path(root_path: &Path) -> Option<PathBuf> {
+fn mise_config_path_with(root_path: &Path, fs: &dyn env::FileSystem) -> Option<PathBuf> {
     ["mise.toml", ".mise.toml"]
         .into_iter()
         .map(|name| root_path.join(name))
-        .find(|path| path.exists())
+        .find(|path| fs.is_file(path))
 }
 
-fn mise_available() -> bool {
-    std::process::Command::new("mise")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
+fn mise_available_with(process: &dyn env::ProcessRunner) -> bool {
+    let spec = env::ProcessSpec::new("mise").arg("--version");
+    process
+        .run(&spec)
+        .map(|output| output.success)
         .unwrap_or(false)
+}
+
+/// True when a real `mise` binary is on `$PATH`. The std-backed wrapper
+/// around [`mise_available_with`] kept for the existing integration tests.
+pub fn mise_available() -> bool {
+    mise_available_with(&env::StdProcessRunner)
 }
 
 /// Parse a mise TOML document.
@@ -261,12 +293,27 @@ pub struct ProjectCache {
     pub last_selected_mise_task: Option<String>,
     pub terminal_profile: Option<String>,
     pub workspace_layout: Option<String>,
+    /// Cached fuzzy-finder index — sorted, slash-normalised relative
+    /// paths captured the last time the user opened the finder
+    /// (v0.6 M6.6). Empty when the index has never been built or the
+    /// project tree has changed since the last save; the next finder
+    /// open re-walks the filesystem and refreshes this.
+    pub file_index: Vec<String>,
 }
 
 impl ProjectCache {
     /// Load a cache file, returning an empty cache if it does not exist.
+    /// Std-backed wrapper around [`ProjectCache::load_with`] (M4.10).
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectError> {
-        match fs::read_to_string(path) {
+        Self::load_with(path, &env::StdFileSystem)
+    }
+
+    /// Trait-injected load — same semantics, disk reads go through `fs`.
+    pub fn load_with(
+        path: impl AsRef<Path>,
+        fs: &dyn env::FileSystem,
+    ) -> Result<Self, ProjectError> {
+        match fs.read_to_string(path.as_ref()) {
             Ok(input) => toml::from_str(&input).map_err(ProjectError::Parse),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(ProjectError::Read(err)),
@@ -274,13 +321,24 @@ impl ProjectCache {
     }
 
     /// Store a cache file, creating parent directories as needed.
+    /// Std-backed wrapper around [`ProjectCache::store_with`] (M4.10).
     pub fn store(&self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
+        self.store_with(path, &env::StdFileSystem)
+    }
+
+    /// Trait-injected store — same semantics, disk writes go through `fs`.
+    pub fn store_with(
+        &self,
+        path: impl AsRef<Path>,
+        fs: &dyn env::FileSystem,
+    ) -> Result<(), ProjectError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(ProjectError::Write)?;
+            fs.create_dir_all(parent).map_err(ProjectError::Write)?;
         }
         let output = toml::to_string_pretty(self).map_err(ProjectError::Serialize)?;
-        fs::write(path, output).map_err(ProjectError::Write)
+        fs.write(path, output.as_bytes())
+            .map_err(ProjectError::Write)
     }
 }
 
@@ -331,8 +389,17 @@ pub struct RecentProjects {
 
 impl RecentProjects {
     /// Load the registry, returning an empty one if the file does not exist.
+    /// Std-backed wrapper around [`RecentProjects::load_with`] (M4.10).
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectError> {
-        match fs::read_to_string(path) {
+        Self::load_with(path, &env::StdFileSystem)
+    }
+
+    /// Trait-injected load — disk reads go through `fs`.
+    pub fn load_with(
+        path: impl AsRef<Path>,
+        fs: &dyn env::FileSystem,
+    ) -> Result<Self, ProjectError> {
+        match fs.read_to_string(path.as_ref()) {
             Ok(input) => toml::from_str(&input).map_err(ProjectError::Parse),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(ProjectError::Read(err)),
@@ -340,13 +407,24 @@ impl RecentProjects {
     }
 
     /// Store the registry, creating parent directories as needed.
+    /// Std-backed wrapper around [`RecentProjects::store_with`] (M4.10).
     pub fn store(&self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
+        self.store_with(path, &env::StdFileSystem)
+    }
+
+    /// Trait-injected store — disk writes go through `fs`.
+    pub fn store_with(
+        &self,
+        path: impl AsRef<Path>,
+        fs: &dyn env::FileSystem,
+    ) -> Result<(), ProjectError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(ProjectError::Write)?;
+            fs.create_dir_all(parent).map_err(ProjectError::Write)?;
         }
         let output = toml::to_string_pretty(self).map_err(ProjectError::Serialize)?;
-        fs::write(path, output).map_err(ProjectError::Write)
+        fs.write(path, output.as_bytes())
+            .map_err(ProjectError::Write)
     }
 
     /// Record a project as just-opened: move it to the front (deduplicating by
