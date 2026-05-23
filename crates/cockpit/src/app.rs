@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::{GlobalKeys, ZellijLayout};
 use cockpit_editor::vim::{Key as VimKey, Mode};
-use cockpit_editor::{Editor, EditorSignal, HighlightKind, HighlightSpan, Language};
+use cockpit_editor::{
+    Editor, EditorSignal, HighlightKind, HighlightSpan, Language, nearest_test_name,
+};
 use cockpit_project::{
     FileNodeKind, FileTree, ProjectCache, ProjectDetection, project_cache_path, walk_project_files,
 };
@@ -50,6 +52,18 @@ const TERMINAL_OPEN_PATH: &str = "terminal.open_path";
 const TERMINAL_SEND_FILE_PATH: &str = "terminal.send_file_path";
 /// Command id for "send the editor's visual selection to the terminal" (spec §17).
 const TERMINAL_SEND_SELECTION: &str = "terminal.send_selection";
+/// Command id for "run the project's mise `test` task" (spec §16).
+const TEST_RUN_ALL: &str = "test.run_all";
+/// Command id for "run the `test` task targeting the current file" (spec §16).
+const TEST_RUN_CURRENT_FILE: &str = "test.run_current_file";
+/// Command id for "run the `test` task targeting the nearest test" (spec §16).
+const TEST_RUN_NEAREST: &str = "test.run_nearest";
+
+/// Name of the mise task cockpit invokes for the Test: * palette entries.
+/// Conventional default; M4 may make this configurable per project.
+const TEST_TASK: &str = "test";
+/// Status surfaced when the project has no `test` mise task wired up.
+const TEST_TASK_MISSING: &str = "No `test` mise task — add one to your mise.toml.";
 
 /// What activating a palette entry does — the palette is reused as both the
 /// command palette and the mise-task picker.
@@ -223,6 +237,9 @@ impl AppModel {
             TERMINAL_OPEN_PATH => self.open_terminal_paths(),
             TERMINAL_SEND_FILE_PATH => self.send_file_path_to_terminal(),
             TERMINAL_SEND_SELECTION => self.send_selection_to_terminal(),
+            TEST_RUN_ALL => self.run_test_all(),
+            TEST_RUN_CURRENT_FILE => self.run_test_current_file(),
+            TEST_RUN_NEAREST => self.run_test_nearest(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -310,6 +327,86 @@ impl AppModel {
         self.ensure_terminal();
         match self.terminal.as_mut() {
             Some(terminal) => match terminal.send_input(bytes) {
+                Ok(()) => {
+                    self.layout.focus(PaneId::Terminal);
+                    self.status = success;
+                }
+                Err(err) => self.status = format!("Terminal write failed: {err}"),
+            },
+            None => self.status = "Terminal unavailable.".to_string(),
+        }
+    }
+
+    /// Run `mise run test` for the whole project (spec §16 Test: Run All).
+    fn run_test_all(&mut self) {
+        if !self.has_test_task() {
+            self.status = TEST_TASK_MISSING.to_string();
+            return;
+        }
+        self.send_command_to_terminal(
+            &format!("mise run {TEST_TASK}"),
+            "Running `mise run test`.".to_string(),
+        );
+    }
+
+    /// Run `mise run test -- <file>` targeting the current document (spec §16
+    /// Test: Run Current File). Whether the file path is honoured depends on
+    /// the user's `test` task forwarding extra args (e.g. via `$@`).
+    fn run_test_current_file(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No file open to test.".to_string();
+            return;
+        };
+        if !self.has_test_task() {
+            self.status = TEST_TASK_MISSING.to_string();
+            return;
+        }
+        let path = render_document_path(&doc.path, &self.detection.root_path);
+        self.send_command_to_terminal(
+            &format!("mise run {TEST_TASK} -- {path}"),
+            format!("Running tests for `{path}`."),
+        );
+    }
+
+    /// Run `mise run test -- <name>` targeting the function declaration nearest
+    /// to the cursor (spec §16 Test: Run Nearest).
+    fn run_test_nearest(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No file open to test.".to_string();
+            return;
+        };
+        if !self.has_test_task() {
+            self.status = TEST_TASK_MISSING.to_string();
+            return;
+        }
+        let language = Language::from_path(&doc.path);
+        let cursor_byte = doc.editor.cursor().byte();
+        let Some(name) = nearest_test_name(doc.editor.buffer(), cursor_byte, language) else {
+            self.status = "No nearby test function found.".to_string();
+            return;
+        };
+        self.send_command_to_terminal(
+            &format!("mise run {TEST_TASK} -- {name}"),
+            format!("Running test `{name}`."),
+        );
+    }
+
+    /// True when the detected project defines a [`TEST_TASK`] mise task.
+    fn has_test_task(&self) -> bool {
+        self.detection
+            .mise
+            .tasks
+            .iter()
+            .any(|task| task.name == TEST_TASK)
+    }
+
+    /// Type `command\r` into the terminal — start one on demand, focus it on
+    /// success, and report status either way. Used by the Test: * commands.
+    fn send_command_to_terminal(&mut self, command: &str, success: String) {
+        self.ensure_terminal();
+        let line = format!("{command}\r");
+        match self.terminal.as_mut() {
+            Some(terminal) => match terminal.send_input(line.as_bytes()) {
                 Ok(()) => {
                     self.layout.focus(PaneId::Terminal);
                     self.status = success;
@@ -1316,6 +1413,9 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(TERMINAL_OPEN_PATH, "Terminal: Open Path"),
         PaletteEntry::new(TERMINAL_SEND_FILE_PATH, "Terminal: Send Current File Path"),
         PaletteEntry::new(TERMINAL_SEND_SELECTION, "Terminal: Send Selection"),
+        PaletteEntry::new(TEST_RUN_ALL, "Test: Run All"),
+        PaletteEntry::new(TEST_RUN_CURRENT_FILE, "Test: Run Current File"),
+        PaletteEntry::new(TEST_RUN_NEAREST, "Test: Run Nearest"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -1611,6 +1711,39 @@ mod tests {
         model.send_selection_to_terminal();
         assert!(
             model.status.contains("No selection"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn run_test_all_requires_a_test_mise_task() {
+        let mut model = rust_model();
+        model.run_test_all();
+        assert!(
+            model.status.contains("No `test` mise task"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn run_test_current_file_requires_a_document() {
+        let mut model = mise_model();
+        model.run_test_current_file();
+        assert!(
+            model.status.contains("No file open"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn run_test_nearest_requires_a_document() {
+        let mut model = mise_model();
+        model.run_test_nearest();
+        assert!(
+            model.status.contains("No file open"),
             "status: {}",
             model.status
         );
