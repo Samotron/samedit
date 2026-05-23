@@ -1,7 +1,12 @@
 //! `cockpit-project` — projects, `mise` integration, and the file tree.
 //!
 //! Project detection (spec §6), the `mise` environment provider (spec §8),
-//! the per-project state cache (spec §7), and the lazy file tree (spec §13).
+//! the per-project state cache (spec §7), the lazy file tree (spec §13), and
+//! the git status integration that drives file-browser badges (spec §23 v0.3).
+
+pub mod git;
+
+pub use git::{GitStatus, git_status, parse_porcelain_z};
 
 use std::{
     collections::BTreeMap,

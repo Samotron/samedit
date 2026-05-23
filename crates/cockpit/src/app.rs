@@ -142,6 +142,14 @@ impl AppModel {
         self.apply_cache(cache);
     }
 
+    /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
+    /// out to `git status --porcelain`; no-ops when `git` is missing or the
+    /// project is not a git working tree.
+    pub fn refresh_git_status(&mut self) {
+        let statuses = cockpit_project::git_status(&self.detection.root_path);
+        self.browser.set_git_statuses(statuses);
+    }
+
     /// Restore persisted pane widths and reopen the last active file.
     fn apply_cache(&mut self, cache: ProjectCache) {
         let mut prefs = self.layout.preferences().clone();
@@ -867,6 +875,7 @@ impl AppModel {
                 (FileNodeKind::Directory, false) => "> ",
                 (FileNodeKind::File, _) => "  ",
             };
+            let badge = row.git_status.map(|status| status.badge()).unwrap_or(' ');
             let text_x = content.x + PAD + row.depth as f32 * INDENT_W;
             let color = if row.is_dir() {
                 self.theme.text
@@ -876,7 +885,7 @@ impl AppModel {
             canvas.text(
                 text_x,
                 row_y + 3.0,
-                format!("{marker}{}", row.name),
+                format!("{badge} {marker}{}", row.name),
                 color,
                 FONT,
             );
