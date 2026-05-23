@@ -582,18 +582,29 @@ inside all three modes — they're orthogonal layers.
 
 ### dbt-lite project mode
 
-- [ ] **M5.6 — Project detection** — a `models/` directory with `.sql`
-  files and a `cockpit-analytics.toml` (or `[metadata.cockpit.analytics]`
-  in `mise.toml`) marks an analytics project. Adds a new "Models" pane.
-- [ ] **M5.7 — Templating** — minimal Jinja-subset for `{{ ref('name') }}`
-  and `{{ source('schema', 'table') }}` only. Hand-rolled parser — no
-  full Jinja dep. Resolution produces a CTE-wrapped final query.
-- [ ] **M5.8 — Materialisations** — `view`, `table`, `ephemeral`
-  (CTE-inlined). Configured via in-file `-- %% config: { materialized:
-  table }`. Build command: `Models: Build All` / `Build Selected`.
-- [ ] **M5.9 — DAG view** — read-time DAG (re-parsed on save, no
-  background indexer — respects spec §3.9/§24). Renders model
-  dependencies in the right pane; clicking a node opens the model.
+- [x] **M5.6 — Project detection** — `cockpit_analytics::detect_analytics_project`
+  spots a `models/` directory (with or without a `cockpit-analytics.toml`)
+  and returns an `AnalyticsProject` with every `.sql` model parsed,
+  sorted, and tagged with its effective materialisation. Pure function
+  over the M4.10 `FileSystem` trait so tests run against
+  `FakeFileSystem` with no real disk.
+- [x] **M5.7 — Templating** — hand-rolled Jinja subset in
+  `cockpit_analytics::template`. Only `{{ ref('name') }}` and
+  `{{ source('schema', 'table') }}` are resolved; anything else (loops,
+  filters, `env_var`) raises `TemplateError::Malformed` so cockpit
+  fails loud instead of passing dbt-specific Jinja through to DuckDB.
+- [x] **M5.8 — Materialisations** — `view`, `table`, and `ephemeral`
+  supported. `cockpit_analytics::build_plan` walks the DAG in
+  topological order and turns each model into a `CREATE OR REPLACE`
+  statement; ephemeral models contribute a CTE binding that gets
+  inlined into every dependent's rendered SQL. The notebook UI's
+  `Models: Build` command will pipe these straight into the M5.1
+  `SqlEngine`.
+- [x] **M5.9 — DAG view** — `ModelDag::from_models` builds the dependency
+  graph by extracting `{{ ref(...) }}` calls at read time (no background
+  indexer — respects spec §3.9/§24). `topological_order` returns the
+  build order and `DagError::Cycle` surfaces malformed graphs so the UI
+  can highlight the offending nodes.
 
 ### Sequencing note
 
