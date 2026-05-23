@@ -20,7 +20,8 @@ use cockpit_lsp::{
     Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, ServerConfig,
 };
 use cockpit_project::{
-    FileNodeKind, FileTree, ProjectCache, ProjectDetection, project_cache_path, walk_project_files,
+    FileNodeKind, FileTree, ProjectCache, ProjectDetection, mise_exec_command, project_cache_path,
+    walk_project_files,
 };
 use cockpit_render::theme::Color;
 use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
@@ -939,9 +940,11 @@ impl AppModel {
         };
 
         if !self.lsp_clients.contains_key(&language) {
-            let mut argv = vec!["exec".to_string(), "--".to_string(), config.command.clone()];
-            argv.extend(config.args.iter().cloned());
-            match LspClient::spawn("mise", &argv, Some(&self.detection.root_path)) {
+            let argv = lsp_launch_argv(&config);
+            let (program, args) = argv
+                .split_first()
+                .expect("lsp_launch_argv always returns a non-empty argv");
+            match LspClient::spawn(program, args, Some(&self.detection.root_path)) {
                 Ok(client) => {
                     tracing::info!(?language, command = %config.command, "LSP client spawned");
                     self.lsp_clients.insert(language, client);
@@ -1770,6 +1773,16 @@ fn chord_to_terminal_bytes(chord: &KeyChord) -> Option<Vec<u8>> {
     }
 }
 
+/// Build the spawn argv for `config`'s language server, wrapping it in
+/// `mise exec --` so every server inherits the project's mise environment
+/// (spec §19 / M4.5). Result: `["mise", "exec", "--", <command>, <args>...]`.
+fn lsp_launch_argv(config: &ServerConfig) -> Vec<String> {
+    let inner: Vec<&str> = std::iter::once(config.command.as_str())
+        .chain(config.args.iter().map(String::as_str))
+        .collect();
+    mise_exec_command(&inner)
+}
+
 /// Format `path` as an LSP `file://` URI. The path is treated as absolute;
 /// callers above resolve project-relative paths against the project root.
 fn file_uri(path: &Path) -> String {
@@ -2283,6 +2296,15 @@ mod tests {
         .unwrap();
         model.apply_publish_diagnostics(cleared);
         assert!(model.diagnostics_for(&expected).is_empty());
+    }
+
+    #[test]
+    fn lsp_servers_launch_via_mise_exec() {
+        let config = ServerConfig::for_language(Language::Rust).expect("rust-analyzer config");
+        let argv = lsp_launch_argv(&config);
+        assert_eq!(&argv[..3], &["mise", "exec", "--"]);
+        assert_eq!(argv[3], "rust-analyzer");
+        assert_eq!(argv.len(), 4, "no extra args today: argv was {argv:?}",);
     }
 
     #[test]
