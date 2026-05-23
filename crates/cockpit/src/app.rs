@@ -397,6 +397,20 @@ impl AppModel {
         self.apply_cache(cache);
     }
 
+    /// Apply a loaded user [`cockpit_config::Config`] onto the model.
+    /// Currently honours `editor.format_on_save` (M4.4) and the layout
+    /// width preferences (`ui.left_width` / `ui.right_width`). Other
+    /// fields parse but are still inert — they will land as their
+    /// owning subsystems get wired up.
+    pub fn apply_user_config(&mut self, config: &cockpit_config::Config) {
+        self.format_on_save = config.editor.format_on_save;
+
+        let mut prefs = self.layout.preferences().clone();
+        prefs.left_width = config.ui.left_width.into();
+        prefs.right_width = config.ui.right_width.into();
+        self.layout.set_preferences(prefs);
+    }
+
     /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
     /// out to `git status --porcelain`; no-ops when `git` is missing or the
     /// project is not a git working tree.
@@ -5086,6 +5100,26 @@ mod tests {
     }
 
     // ---- M4.4 — Format on save -------------------------------------------
+
+    #[test]
+    fn apply_user_config_honours_format_on_save_and_layout_widths() {
+        let mut model = model();
+        assert!(!model.format_on_save);
+        let toml = r#"
+[ui]
+left_width = 300
+right_width = 360
+
+[editor]
+format_on_save = true
+"#;
+        let config = cockpit_config::Config::from_toml(toml).expect("config parses");
+        model.apply_user_config(&config);
+
+        assert!(model.format_on_save);
+        assert_eq!(model.layout.preferences().left_width, 300);
+        assert_eq!(model.layout.preferences().right_width, 360);
+    }
 
     #[test]
     fn quarto_render_without_a_document_reports_clearly() {

@@ -7,6 +7,7 @@ license.workspace = true
 description = "Typed user and project configuration for Coding Cockpit."
 
 [dependencies]
+directories = "6.0.0"
 kdl = { version = "6.5", features = ["v1-fallback"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"

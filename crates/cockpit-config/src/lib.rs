@@ -47,6 +47,17 @@ impl Config {
     }
 }
 
+/// Resolve the default location of the user config file on this OS —
+/// `$XDG_CONFIG_HOME/cockpit/config.toml` on Linux,
+/// `~/Library/Application Support/dev.CodingCockpit.cockpit/config.toml`
+/// on macOS, `%APPDATA%\CodingCockpit\cockpit\config\config.toml` on
+/// Windows. Returns `None` when the OS does not surface a config dir
+/// (rare — typically headless CI).
+pub fn user_config_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "CodingCockpit", "cockpit")
+        .map(|dirs| dirs.config_dir().join("config.toml"))
+}
+
 /// UI settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

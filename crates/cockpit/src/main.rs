@@ -100,6 +100,16 @@ fn run_project_or_launcher(path: Option<PathBuf>, print: bool) -> Result<()> {
     let mut model = startup::time_phase("startup.model", || {
         AppModel::new(detection, tree).map_err(|err| anyhow!(err))
     })?;
+    startup::time_phase("startup.config", || {
+        if let Some(path) = cockpit_config::user_config_path() {
+            match cockpit_config::Config::load_optional(&path) {
+                Ok(config) => model.apply_user_config(&config),
+                Err(err) => {
+                    tracing::warn!(error = %err, "user config load failed");
+                }
+            }
+        }
+    });
     startup::time_phase("startup.git", || model.refresh_git_status());
     startup::time_phase("startup.cache", || model.restore_cached_state());
     let title = format!("Coding Cockpit — {}", model.project_name());
