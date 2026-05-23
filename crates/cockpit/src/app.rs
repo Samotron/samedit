@@ -10,6 +10,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use cockpit_analytics::detect::scan_models_dir;
+use cockpit_analytics::{
+    AnalyticsProject, BuildPlan, Materialisation, build_plan, detect_analytics_project,
+};
 use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::{GlobalKeys, ZellijLayout};
 use cockpit_editor::vim::{Key as VimKey, Mode};
@@ -20,6 +24,7 @@ use cockpit_lsp::{
     Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, Response,
     ServerConfig,
 };
+use cockpit_notebook::{CellKind, Notebook, is_notebook_source, parse_notebook, parse_quarto};
 use cockpit_project::{
     FileNodeKind, FileSystem, FileTree, FormatPlan, KnownFormatter,
     PathBinaryLookup as FormatPathLookup, ProcessRunner, ProcessSpec, ProjectCache,
@@ -31,6 +36,7 @@ use cockpit_render::{
     CockpitApp, MouseButton, Painter, PointerPosition, Rect as RenderRect, RedrawHandle, Theme,
     Viewport,
 };
+use cockpit_sql::{DuckDbEngine, GgsqlEngine, SqlEngine, statement_targets_ggsql};
 use cockpit_terminal::bridge::{detect_paths_in_grid, paste_to_terminal, render_document_path};
 use cockpit_terminal::live::{LiveTerminal, WakeFn};
 use cockpit_terminal::path_detect::detect_paths;
@@ -99,6 +105,19 @@ const LSP_CODE_ACTION: &str = "lsp.code_action";
 const EDITOR_FORMAT: &str = "editor.format";
 /// Command id for "toggle the per-session format-on-save preference" (M4.4).
 const EDITOR_TOGGLE_FORMAT_ON_SAVE: &str = "editor.toggle_format_on_save";
+/// Command id for "execute the active notebook cell" (v0.5 M5.3 wire-up).
+const NOTEBOOK_RUN_ACTIVE_CELL: &str = "notebook.run_active_cell";
+/// Command id for "advance the notebook cursor to the next cell".
+const NOTEBOOK_NEXT_CELL: &str = "notebook.next_cell";
+/// Command id for "move the notebook cursor to the previous cell".
+const NOTEBOOK_PREVIOUS_CELL: &str = "notebook.previous_cell";
+/// Command id for "insert a fresh cell below the active one".
+const NOTEBOOK_INSERT_CELL_BELOW: &str = "notebook.insert_cell_below";
+/// Command id for "build every materialisation in the dbt-lite project"
+/// (v0.5 M5.8 wire-up).
+const MODELS_BUILD_ALL: &str = "models.build_all";
+/// Command id for "show the dbt-lite DAG summary in the status line".
+const MODELS_SHOW_DAG: &str = "models.show_dag";
 
 /// Name of the mise task cockpit invokes for the Test: * palette entries.
 /// Conventional default; M4 may make this configurable per project.
@@ -254,6 +273,14 @@ pub struct AppModel {
     /// `editor.format_on_save`; toggled by the palette command without
     /// touching the config file on disk.
     format_on_save: bool,
+    /// Optional notebook view-model for the open document (v0.5 M5.3
+    /// wire-up). Populated when [`open_document`] detects a Jupytext
+    /// `.sql` / `.ggsql` source or any `.qmd` file; `None` otherwise.
+    notebook: Option<Notebook>,
+    /// Detected analytics project (v0.5 M5.6 wire-up). Built once during
+    /// [`new`] when a `models/` directory is present and refreshed by
+    /// `Models: Build All`.
+    analytics: Option<AnalyticsProject>,
     /// Tracks a pending `g` in the editor pane so local `gd` can dispatch LSP
     /// definition while non-LSP Vim chords like `gg` still reach the Vim FSM.
     editor_pending_g: bool,
@@ -339,6 +366,8 @@ impl AppModel {
             confirm: None,
             confirm_intent: None,
             format_on_save: false,
+            notebook: None,
+            analytics: None,
             editor_pending_g: false,
             editor_pending_leader: 0,
             last_layout: None,
@@ -676,6 +705,12 @@ impl AppModel {
             LSP_CODE_ACTION => self.request_code_action(),
             EDITOR_FORMAT => self.request_format(FormatTrigger::Manual),
             EDITOR_TOGGLE_FORMAT_ON_SAVE => self.toggle_format_on_save(),
+            NOTEBOOK_RUN_ACTIVE_CELL => self.run_active_notebook_cell(),
+            NOTEBOOK_NEXT_CELL => self.notebook_next_cell(),
+            NOTEBOOK_PREVIOUS_CELL => self.notebook_previous_cell(),
+            NOTEBOOK_INSERT_CELL_BELOW => self.notebook_insert_cell_below(),
+            MODELS_BUILD_ALL => self.run_build_all_models(),
+            MODELS_SHOW_DAG => self.show_dag_summary(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -1387,7 +1422,12 @@ impl AppModel {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                self.status = format!("Opened {name}");
+                self.notebook = recognise_notebook(&path, &content);
+                let suffix = match &self.notebook {
+                    Some(nb) => format!(" — notebook ({} cells)", nb.cells.len()),
+                    None => String::new(),
+                };
+                self.status = format!("Opened {name}{suffix}");
                 let mut editor = Editor::new(&content);
                 editor.set_language(Language::from_path(&path));
                 self.document = Some(OpenDocument { editor, path, name });
@@ -2268,6 +2308,192 @@ impl AppModel {
         };
     }
 
+    // ---- v0.5 notebook + analytics wire-up ------------------------------
+
+    /// Execute the active notebook cell through DuckDB or ggsql, route
+    /// the result back into [`Cell::apply_result`] (M5.3 wire-up).
+    fn run_active_notebook_cell(&mut self) {
+        let root = self.detection.root_path.clone();
+        let Some(notebook) = self.notebook.as_mut() else {
+            self.status = "No notebook open.".to_string();
+            return;
+        };
+        let Some(cell) = notebook.active_cell_mut() else {
+            self.status = "No active cell.".to_string();
+            return;
+        };
+        if !cell.kind.executable() {
+            self.status = format!("Cell {} is not executable.", notebook.active);
+            return;
+        }
+        let source = cell.source.clone();
+        let kind = cell.kind;
+        cell.mark_running();
+        let active = notebook.active;
+        let result = run_cell_against_engines(&root, kind, &source);
+        let Some(cell) = notebook.active_cell_mut() else {
+            return;
+        };
+        cell.apply_result(result);
+        let summary = match &cell.result {
+            Some(cockpit_notebook::CellResult::Ok(query)) => {
+                format!("Cell {active} ran: {} row(s).", query.rows.len())
+            }
+            Some(cockpit_notebook::CellResult::Err { message }) => {
+                format!("Cell {active} failed: {message}")
+            }
+            None => format!("Cell {active}: no result."),
+        };
+        self.status = summary;
+    }
+
+    fn notebook_next_cell(&mut self) {
+        let Some(notebook) = self.notebook.as_mut() else {
+            self.status = "No notebook open.".to_string();
+            return;
+        };
+        notebook.move_down();
+        self.status = format!(
+            "Notebook cell {} of {}.",
+            notebook.active + 1,
+            notebook.cells.len()
+        );
+    }
+
+    fn notebook_previous_cell(&mut self) {
+        let Some(notebook) = self.notebook.as_mut() else {
+            self.status = "No notebook open.".to_string();
+            return;
+        };
+        notebook.move_up();
+        self.status = format!(
+            "Notebook cell {} of {}.",
+            notebook.active + 1,
+            notebook.cells.len()
+        );
+    }
+
+    fn notebook_insert_cell_below(&mut self) {
+        let Some(notebook) = self.notebook.as_mut() else {
+            self.status = "No notebook open.".to_string();
+            return;
+        };
+        notebook.insert_cell_below();
+        self.status = format!(
+            "Inserted cell — active {} of {}.",
+            notebook.active + 1,
+            notebook.cells.len()
+        );
+    }
+
+    /// Re-detect the analytics project (if any) and run every
+    /// non-ephemeral [`BuildStep`] through DuckDB (M5.8 wire-up).
+    fn run_build_all_models(&mut self) {
+        let root = self.detection.root_path.clone();
+        let Some(project) = self.refresh_analytics_project() else {
+            self.status =
+                "No `models/` directory — add one or a cockpit-analytics.toml.".to_string();
+            return;
+        };
+        let plan: BuildPlan = match build_plan(&project) {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.status = format!("Build plan failed: {err}");
+                return;
+            }
+        };
+        let engine = DuckDbEngine::with_runner(root, self.process_arc());
+        let mut ok = 0usize;
+        let mut failed: Option<String> = None;
+        for step in &plan.steps {
+            if step.materialisation == Materialisation::Ephemeral || step.statement.is_empty() {
+                continue;
+            }
+            match engine.execute(&step.statement) {
+                Ok(_) => ok += 1,
+                Err(err) => {
+                    failed = Some(format!("{}: {err}", step.model));
+                    break;
+                }
+            }
+        }
+        self.status = match failed {
+            Some(why) => format!("Models build failed at {why} ({ok} ok before)"),
+            None => format!("Models build ok — {ok} statement(s) executed."),
+        };
+    }
+
+    /// Surface the DAG topological order + cycle info in the status line.
+    fn show_dag_summary(&mut self) {
+        let Some(project) = self.refresh_analytics_project() else {
+            self.status = "No analytics project detected.".to_string();
+            return;
+        };
+        let dag = cockpit_analytics::ModelDag::from_models(&project.models);
+        match dag.topological_order() {
+            Ok(order) => {
+                self.status = if order.is_empty() {
+                    "Analytics project: no models.".to_string()
+                } else {
+                    format!(
+                        "Models: {} → {} ({} model(s))",
+                        order.first().unwrap(),
+                        order.last().unwrap(),
+                        order.len()
+                    )
+                };
+            }
+            Err(err) => self.status = format!("Models DAG: {err}"),
+        }
+    }
+
+    /// Re-run analytics detection. Uses `cockpit_project::StdFileSystem`
+    /// plus the analytics crate's `scan_models_dir` helper to enumerate
+    /// `.sql` files (the trait FS doesn't iterate directories yet —
+    /// `read_dir` lives in the `scan_models_dir` adapter so detection
+    /// itself stays pure). Caches the result in `self.analytics`.
+    fn refresh_analytics_project(&mut self) -> Option<AnalyticsProject> {
+        let root = self.detection.root_path.clone();
+        let models_dir = root.join("models");
+        if !models_dir.is_dir() {
+            self.analytics = None;
+            return None;
+        }
+        // Seed the fake fs with the real models so the pure
+        // `detect_analytics_project` can stay path-driven.
+        let model_paths = scan_models_dir(&models_dir).unwrap_or_default();
+        let fs = cockpit_project::FakeFileSystem::new();
+        fs.insert_dir(&root);
+        fs.insert_dir(&models_dir);
+        for path in &model_paths {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                fs.insert_file(path.clone(), &text);
+            }
+        }
+        match detect_analytics_project(&root, &fs) {
+            Ok(Some(project)) => {
+                self.analytics = Some(project.clone());
+                Some(project)
+            }
+            Ok(None) => {
+                self.analytics = None;
+                None
+            }
+            Err(err) => {
+                self.status = format!("Analytics detect failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// Fresh `Arc<StdProcessRunner>` for the cockpit-sql engines. The
+    /// model's own `process: Box<dyn ProcessRunner>` is not cloneable;
+    /// the SQL engines just spawn `mise exec` so a separate
+    /// std-backed handle is fine.
+    fn process_arc(&self) -> std::sync::Arc<dyn ProcessRunner> {
+        std::sync::Arc::new(StdProcessRunner)
+    }
+
     /// Drive the modal yes/no confirmation prompt from one key chord.
     fn handle_confirm_key(&mut self, chord: &KeyChord) {
         if is_chord(chord, "Escape") || is_chord(chord, "n") || is_chord(chord, "N") {
@@ -3118,6 +3344,54 @@ fn chord_to_terminal_bytes(chord: &KeyChord) -> Option<Vec<u8>> {
 /// Build the spawn argv for `config`'s language server, wrapping it in
 /// `mise exec --` so every server inherits the project's mise environment
 /// (spec §19 / M4.5). Result: `["mise", "exec", "--", <command>, <args>...]`.
+/// Pick a notebook view-model when `path`'s contents look like a
+/// Jupytext or Quarto source. The two file-level cues are:
+///
+/// * `.qmd` extension → Quarto, parsed with [`parse_quarto`].
+/// * `.sql` / `.ggsql` extension with at least one `-- %% cell` marker
+///   → Jupytext, parsed with [`parse_notebook`].
+///
+/// Returns `None` for plain text files so opening a regular `.sql`
+/// file without markers keeps the normal editor experience.
+fn recognise_notebook(path: &Path, content: &str) -> Option<Notebook> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("qmd") => parse_quarto(content).ok(),
+        Some("sql") | Some("ggsql") if is_notebook_source(content) => {
+            let default_kind = if ext.as_deref() == Some("ggsql") {
+                CellKind::Ggsql
+            } else {
+                CellKind::Sql
+            };
+            parse_notebook(content, default_kind).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Route one cell's source through the right SQL engine based on its
+/// [`CellKind`]. Both engines share the M5.1 `SqlEngine` trait;
+/// production callers always spawn through `StdProcessRunner` because
+/// these are external `mise exec` invocations.
+fn run_cell_against_engines(
+    root: &Path,
+    kind: CellKind,
+    source: &str,
+) -> Result<cockpit_sql::QueryResult, cockpit_sql::QueryError> {
+    let process = std::sync::Arc::new(StdProcessRunner) as std::sync::Arc<dyn ProcessRunner>;
+    match kind {
+        CellKind::Ggsql => GgsqlEngine::with_runner(root.to_path_buf(), process).execute(source),
+        CellKind::Sql if statement_targets_ggsql(source) => {
+            GgsqlEngine::with_runner(root.to_path_buf(), process).execute(source)
+        }
+        CellKind::Sql => DuckDbEngine::with_runner(root.to_path_buf(), process).execute(source),
+        CellKind::Markdown => Ok(cockpit_sql::QueryResult::empty()),
+    }
+}
+
 fn lsp_launch_argv(config: &ServerConfig) -> Vec<String> {
     let inner: Vec<&str> = std::iter::once(config.command.as_str())
         .chain(config.args.iter().map(String::as_str))
@@ -3382,6 +3656,12 @@ fn palette_entries() -> Vec<PaletteEntry> {
             EDITOR_TOGGLE_FORMAT_ON_SAVE,
             "Editor: Toggle Format on Save",
         ),
+        PaletteEntry::new(NOTEBOOK_RUN_ACTIVE_CELL, "Notebook: Run Active Cell"),
+        PaletteEntry::new(NOTEBOOK_NEXT_CELL, "Notebook: Next Cell"),
+        PaletteEntry::new(NOTEBOOK_PREVIOUS_CELL, "Notebook: Previous Cell"),
+        PaletteEntry::new(NOTEBOOK_INSERT_CELL_BELOW, "Notebook: Insert Cell Below"),
+        PaletteEntry::new(MODELS_BUILD_ALL, "Models: Build All"),
+        PaletteEntry::new(MODELS_SHOW_DAG, "Models: Show DAG"),
         PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
         PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
@@ -4760,6 +5040,103 @@ mod tests {
     }
 
     // ---- M4.4 — Format on save -------------------------------------------
+
+    #[test]
+    fn opening_a_jupytext_sql_file_populates_the_notebook_view_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("queries.sql");
+        std::fs::write(&path, "-- %% cell\nSELECT 1;\n-- %% cell\nSELECT 2;\n").expect("seed file");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(path.clone());
+
+        let notebook = model.notebook.as_ref().expect("notebook populated");
+        assert_eq!(notebook.cells.len(), 2);
+        assert_eq!(notebook.cells[0].source, "SELECT 1;");
+        assert_eq!(notebook.cells[1].source, "SELECT 2;");
+        assert!(model.status.contains("notebook"));
+    }
+
+    #[test]
+    fn opening_a_plain_sql_file_leaves_notebook_view_model_unset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plain.sql");
+        std::fs::write(&path, "SELECT 1;\n").expect("seed file");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(path);
+
+        assert!(model.notebook.is_none(), "no notebook for plain SQL");
+    }
+
+    #[test]
+    fn notebook_navigation_commands_walk_the_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("queries.sql");
+        std::fs::write(&path, "-- %% cell\nSELECT 1;\n-- %% cell\nSELECT 2;\n").expect("seed file");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(path);
+
+        assert_eq!(model.notebook.as_ref().unwrap().active, 0);
+        model.run_command(NOTEBOOK_NEXT_CELL);
+        assert_eq!(model.notebook.as_ref().unwrap().active, 1);
+        model.run_command(NOTEBOOK_PREVIOUS_CELL);
+        assert_eq!(model.notebook.as_ref().unwrap().active, 0);
+        model.run_command(NOTEBOOK_INSERT_CELL_BELOW);
+        assert_eq!(model.notebook.as_ref().unwrap().cells.len(), 3);
+    }
+
+    #[test]
+    fn show_dag_with_no_models_directory_reports_no_project() {
+        let mut model = model();
+        // The `file-tree` fixture has no `models/` dir.
+        model.run_command(MODELS_SHOW_DAG);
+        assert!(
+            model.status.contains("No analytics project"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn show_dag_with_a_models_dir_reports_a_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("models")).expect("mkdir models");
+        std::fs::write(
+            dir.path().join("models").join("stg_orders.sql"),
+            "SELECT 1 AS id",
+        )
+        .expect("seed model");
+        std::fs::write(
+            dir.path().join("models").join("fct_orders.sql"),
+            "SELECT * FROM {{ ref('stg_orders') }}",
+        )
+        .expect("seed model");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+
+        model.run_command(MODELS_SHOW_DAG);
+        // Summary mentions both models in topological order.
+        assert!(
+            model.status.contains("stg_orders"),
+            "status: {}",
+            model.status
+        );
+        assert!(
+            model.status.contains("fct_orders"),
+            "status: {}",
+            model.status
+        );
+    }
 
     #[test]
     fn editor_toggle_format_on_save_flips_the_session_preference() {
