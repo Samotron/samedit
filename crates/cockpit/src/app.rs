@@ -18,7 +18,7 @@ use cockpit_project::{
 };
 use cockpit_render::theme::Color;
 use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
-use cockpit_terminal::bridge::detect_paths_in_grid;
+use cockpit_terminal::bridge::{detect_paths_in_grid, paste_to_terminal, render_document_path};
 use cockpit_terminal::live::{LiveTerminal, WakeFn};
 use cockpit_terminal::path_detect::detect_paths;
 use cockpit_terminal::pty::PtyDimensions;
@@ -46,6 +46,10 @@ const APP_QUIT: &str = "app.quit";
 const MISE_RUN_TASK: &str = "mise.run_task";
 /// Command id for "open a file path from the terminal output".
 const TERMINAL_OPEN_PATH: &str = "terminal.open_path";
+/// Command id for "send the current file path to the terminal" (spec §17).
+const TERMINAL_SEND_FILE_PATH: &str = "terminal.send_file_path";
+/// Command id for "send the editor's visual selection to the terminal" (spec §17).
+const TERMINAL_SEND_SELECTION: &str = "terminal.send_selection";
 
 /// What activating a palette entry does — the palette is reused as both the
 /// command palette and the mise-task picker.
@@ -217,6 +221,8 @@ impl AppModel {
             command_ids::FUZZY_OPEN => self.open_finder(),
             MISE_RUN_TASK => self.open_mise_tasks(),
             TERMINAL_OPEN_PATH => self.open_terminal_paths(),
+            TERMINAL_SEND_FILE_PATH => self.send_file_path_to_terminal(),
+            TERMINAL_SEND_SELECTION => self.send_selection_to_terminal(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -264,6 +270,53 @@ impl AppModel {
                 Err(err) => self.status = format!("Could not run `{task}`: {err}"),
             },
             None => self.status = format!("Cannot run `{task}` — terminal unavailable."),
+        }
+    }
+
+    /// Paste the current file's path into the terminal prompt (spec §17). The
+    /// path is project-relative when possible, matching the `path:line:col`
+    /// form printed in terminal output.
+    fn send_file_path_to_terminal(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No file open to send.".to_string();
+            return;
+        };
+        let rendered = render_document_path(&doc.path, &self.detection.root_path);
+        let bytes = paste_to_terminal(&rendered);
+        let success = format!("Sent `{rendered}` to terminal.");
+        self.paste_into_terminal(&bytes, success);
+    }
+
+    /// Paste the editor's visual-mode selection into the terminal prompt (spec
+    /// §17). Reports a clear status when there is no document or no selection.
+    fn send_selection_to_terminal(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No file open to send a selection from.".to_string();
+            return;
+        };
+        let Some((start, end)) = doc.editor.selection() else {
+            self.status = "No selection — enter Visual mode and select first.".to_string();
+            return;
+        };
+        let text = doc.editor.buffer().slice(start..end);
+        let bytes = paste_to_terminal(&text);
+        let success = format!("Sent selection ({} bytes) to terminal.", text.len());
+        self.paste_into_terminal(&bytes, success);
+    }
+
+    /// Paste `bytes` into the terminal, starting one on demand and focusing the
+    /// terminal pane on success.
+    fn paste_into_terminal(&mut self, bytes: &[u8], success: String) {
+        self.ensure_terminal();
+        match self.terminal.as_mut() {
+            Some(terminal) => match terminal.send_input(bytes) {
+                Ok(()) => {
+                    self.layout.focus(PaneId::Terminal);
+                    self.status = success;
+                }
+                Err(err) => self.status = format!("Terminal write failed: {err}"),
+            },
+            None => self.status = "Terminal unavailable.".to_string(),
         }
     }
 
@@ -1261,6 +1314,8 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(command_ids::TOGGLE_TERMINAL, "View: Toggle Terminal Pane"),
         PaletteEntry::new(MISE_RUN_TASK, "Mise: Run Task"),
         PaletteEntry::new(TERMINAL_OPEN_PATH, "Terminal: Open Path"),
+        PaletteEntry::new(TERMINAL_SEND_FILE_PATH, "Terminal: Send Current File Path"),
+        PaletteEntry::new(TERMINAL_SEND_SELECTION, "Terminal: Send Selection"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -1520,6 +1575,42 @@ mod tests {
         assert!(model.document.is_none());
         assert!(
             model.status.contains("No terminal"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn send_file_path_without_a_document_reports_it() {
+        let mut model = rust_model();
+        model.send_file_path_to_terminal();
+        assert!(
+            model.status.contains("No file open"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn send_selection_without_a_document_reports_it() {
+        let mut model = rust_model();
+        model.send_selection_to_terminal();
+        assert!(
+            model.status.contains("No file open"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn send_selection_without_a_visual_selection_reports_it() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+        assert!(model.document.is_some(), "fixture file should open");
+
+        model.send_selection_to_terminal();
+        assert!(
+            model.status.contains("No selection"),
             "status: {}",
             model.status
         );
