@@ -27,3 +27,7 @@ pub use client::{ClientError, LspClient, RecvMessage};
 pub use codec::CodecError;
 pub use jsonrpc::{Notification, Request, Response, RpcError};
 pub use registry::ServerConfig;
+
+/// Re-export of the protocol types so callers depend on one crate, not two.
+pub use lsp_types;
+pub use lsp_types::{Diagnostic, DiagnosticSeverity, PublishDiagnosticsParams};

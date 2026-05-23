@@ -16,7 +16,9 @@ use cockpit_editor::vim::{Key as VimKey, Mode};
 use cockpit_editor::{
     Editor, EditorSignal, HighlightKind, HighlightSpan, Language, nearest_test_name,
 };
-use cockpit_lsp::{LspClient, ServerConfig};
+use cockpit_lsp::{
+    Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, ServerConfig,
+};
 use cockpit_project::{
     FileNodeKind, FileTree, ProjectCache, ProjectDetection, project_cache_path, walk_project_files,
 };
@@ -127,6 +129,8 @@ pub struct AppModel {
     lsp_clients: HashMap<Language, LspClient>,
     /// Languages whose servers have already received `initialize`/`initialized`.
     lsp_initialized: HashSet<Language>,
+    /// Latest `publishDiagnostics` payload per file (spec §23 v0.4 / M4.1).
+    diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     exit: bool,
 }
 
@@ -156,6 +160,7 @@ impl AppModel {
             command_log: VecDeque::with_capacity(DEBUG_LOG_SIZE),
             lsp_clients: HashMap::new(),
             lsp_initialized: HashSet::new(),
+            diagnostics: HashMap::new(),
             exit: false,
             detection,
         })
@@ -1008,8 +1013,74 @@ impl AppModel {
         self.status = "Document closed.".to_string();
     }
 
+    /// Drain every queued LSP message and apply it to model state. Cheap when
+    /// quiescent (a few `try_recv`s) so it is safe to call once per frame.
+    fn drain_lsp_messages(&mut self) {
+        let mut messages: Vec<RecvMessage> = Vec::new();
+        for client in self.lsp_clients.values() {
+            while let Some(message) = client.try_recv() {
+                messages.push(message);
+            }
+        }
+        for message in messages {
+            self.handle_lsp_message(message);
+        }
+    }
+
+    /// Dispatch one inbound LSP message into the right place in the model.
+    fn handle_lsp_message(&mut self, message: RecvMessage) {
+        match message {
+            RecvMessage::ServerNotification { method, params }
+                if method == "textDocument/publishDiagnostics" =>
+            {
+                match serde_json::from_value::<PublishDiagnosticsParams>(params) {
+                    Ok(parsed) => self.apply_publish_diagnostics(parsed),
+                    Err(err) => {
+                        tracing::warn!(?err, "publishDiagnostics: failed to parse params");
+                    }
+                }
+            }
+            RecvMessage::ServerNotification { method, .. } => {
+                tracing::trace!(method = %method, "LSP notification");
+            }
+            RecvMessage::Response(response) => {
+                if let Some(error) = &response.error {
+                    tracing::warn!(?response.id, code = error.code, message = %error.message, "LSP error response");
+                } else {
+                    tracing::trace!(?response.id, "LSP response");
+                }
+            }
+            RecvMessage::ServerRequest { id, method, .. } => {
+                tracing::debug!(id, method = %method, "LSP server request (ignored — M4.x will route)");
+            }
+            RecvMessage::Decode { error, .. } => {
+                tracing::warn!(error = %error, "LSP decode failed");
+            }
+        }
+    }
+
+    /// Replace the stored diagnostics for the URI in `params`. An empty list
+    /// clears the slot so badges disappear once the server clears them.
+    fn apply_publish_diagnostics(&mut self, params: PublishDiagnosticsParams) {
+        let Some(path) = path_from_file_uri(params.uri.as_str()) else {
+            tracing::warn!(uri = %params.uri.as_str(), "publishDiagnostics: URI is not a file://");
+            return;
+        };
+        if params.diagnostics.is_empty() {
+            self.diagnostics.remove(&path);
+        } else {
+            self.diagnostics.insert(path, params.diagnostics);
+        }
+    }
+
+    /// Diagnostics currently attached to `path`, in document order.
+    fn diagnostics_for(&self, path: &Path) -> &[Diagnostic] {
+        self.diagnostics.get(path).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Paint the whole window for one frame.
     pub fn paint(&mut self, painter: &mut Painter, viewport: Viewport) {
+        self.drain_lsp_messages();
         let scale = viewport.scale.max(0.5);
         let width = viewport.width as f32 / scale;
         let height = viewport.height as f32 / scale;
@@ -1163,6 +1234,15 @@ impl AppModel {
         let top = content.y + PAD * 0.5;
         let char_w = FONT * CHAR_W_RATIO;
 
+        // Diagnostics keyed by starting line for cheap per-row lookup.
+        let mut diagnostics_by_line: HashMap<u32, Vec<&Diagnostic>> = HashMap::new();
+        for diagnostic in self.diagnostics_for(&doc.path) {
+            diagnostics_by_line
+                .entry(diagnostic.range.start.line)
+                .or_default()
+                .push(diagnostic);
+        }
+
         if let Some((sel_start, sel_end)) = editor.selection() {
             for row in 0..visible {
                 let line_index = first + row;
@@ -1207,6 +1287,36 @@ impl AppModel {
                 self.theme.muted_text,
                 FONT,
             );
+
+            // Diagnostic marker + inline message for this line, if any.
+            if let Some(diagnostics) = diagnostics_by_line.get(&(line_index as u32))
+                && let Some(strongest) = diagnostics
+                    .iter()
+                    .min_by_key(|d| d.severity.unwrap_or(cockpit_lsp::DiagnosticSeverity::ERROR))
+            {
+                let color = self.diagnostic_color(strongest.severity);
+                canvas.rect(
+                    content.x + GUTTER_W - 6.0,
+                    line_y - 3.0,
+                    3.0,
+                    ROW_H - 2.0,
+                    color,
+                );
+                let line_pixel_width = line.chars().count() as f32 * char_w;
+                let mut message = strongest.message.lines().next().unwrap_or("").to_string();
+                let max_chars = 80;
+                if message.chars().count() > max_chars {
+                    message = message.chars().take(max_chars).collect::<String>() + "…";
+                }
+                canvas.text(
+                    content.x + GUTTER_W + line_pixel_width + PAD * 2.0,
+                    line_y,
+                    message,
+                    color,
+                    FONT - 1.0,
+                );
+            }
+
             self.paint_code_line(
                 canvas,
                 content.x + GUTTER_W,
@@ -1312,6 +1422,15 @@ impl AppModel {
             HighlightKind::Operator => syntax.operator,
             HighlightKind::Attribute => syntax.attribute,
             HighlightKind::Punctuation => syntax.punctuation,
+        }
+    }
+
+    fn diagnostic_color(&self, severity: Option<DiagnosticSeverity>) -> Color {
+        match severity {
+            Some(s) if s == DiagnosticSeverity::WARNING => self.theme.diagnostic_warning,
+            Some(s) if s == DiagnosticSeverity::INFORMATION => self.theme.diagnostic_info,
+            Some(s) if s == DiagnosticSeverity::HINT => self.theme.diagnostic_hint,
+            _ => self.theme.diagnostic_error,
         }
     }
 
@@ -1664,6 +1783,20 @@ fn file_uri(path: &Path) -> String {
         }
     } else {
         format!("file://{raw}")
+    }
+}
+
+/// Inverse of [`file_uri`] — pull a [`PathBuf`] out of a `file://` URI.
+/// Returns `None` when the URI is not a file scheme cockpit can reverse.
+fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let trimmed = uri.strip_prefix("file://")?;
+    if cfg!(windows) {
+        // Windows file URIs round-trip as `file:///C:/...` — strip the leading
+        // slash and put backslashes back.
+        let body = trimmed.strip_prefix('/').unwrap_or(trimmed);
+        Some(PathBuf::from(body.replace('/', "\\")))
+    } else {
+        Some(PathBuf::from(trimmed))
     }
 }
 
@@ -2075,6 +2208,104 @@ mod tests {
             "status: {}",
             model.status,
         );
+    }
+
+    #[test]
+    fn file_uri_and_path_round_trip() {
+        let path = PathBuf::from(if cfg!(windows) {
+            "C:\\code\\proj\\src\\main.rs"
+        } else {
+            "/code/proj/src/main.rs"
+        });
+        let uri = file_uri(&path);
+        assert_eq!(path_from_file_uri(&uri), Some(path));
+    }
+
+    #[test]
+    fn apply_publish_diagnostics_stores_diagnostics_for_path() {
+        let mut model = rust_model();
+        let path = if cfg!(windows) {
+            "C:/code/main.rs"
+        } else {
+            "/code/main.rs"
+        };
+        let params: PublishDiagnosticsParams = serde_json::from_value(serde_json::json!({
+            "uri": format!("file://{}{}", if cfg!(windows) { "/" } else { "" }, path),
+            "diagnostics": [
+                {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                    "severity": 1,
+                    "message": "expected `;`"
+                },
+                {
+                    "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 8}},
+                    "severity": 2,
+                    "message": "unused variable"
+                }
+            ]
+        }))
+        .unwrap();
+
+        model.apply_publish_diagnostics(params);
+
+        let expected = PathBuf::from(if cfg!(windows) {
+            "C:\\code\\main.rs"
+        } else {
+            "/code/main.rs"
+        });
+        let stored = model.diagnostics_for(&expected);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].message, "expected `;`");
+        assert_eq!(stored[1].message, "unused variable");
+    }
+
+    #[test]
+    fn apply_publish_diagnostics_clears_on_empty_list() {
+        let mut model = rust_model();
+        let uri_prefix = if cfg!(windows) { "file:///" } else { "file://" };
+        let path_str = if cfg!(windows) { "C:/x.rs" } else { "/x.rs" };
+        let with_diags: PublishDiagnosticsParams = serde_json::from_value(serde_json::json!({
+            "uri": format!("{uri_prefix}{path_str}"),
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "message": "bad"
+            }]
+        }))
+        .unwrap();
+        model.apply_publish_diagnostics(with_diags);
+        let expected = PathBuf::from(if cfg!(windows) { "C:\\x.rs" } else { "/x.rs" });
+        assert_eq!(model.diagnostics_for(&expected).len(), 1);
+
+        let cleared: PublishDiagnosticsParams = serde_json::from_value(serde_json::json!({
+            "uri": format!("{uri_prefix}{path_str}"),
+            "diagnostics": []
+        }))
+        .unwrap();
+        model.apply_publish_diagnostics(cleared);
+        assert!(model.diagnostics_for(&expected).is_empty());
+    }
+
+    #[test]
+    fn diagnostic_color_picks_per_severity() {
+        let model = rust_model();
+        assert_eq!(
+            model.diagnostic_color(Some(DiagnosticSeverity::ERROR)),
+            model.theme.diagnostic_error,
+        );
+        assert_eq!(
+            model.diagnostic_color(Some(DiagnosticSeverity::WARNING)),
+            model.theme.diagnostic_warning,
+        );
+        assert_eq!(
+            model.diagnostic_color(Some(DiagnosticSeverity::INFORMATION)),
+            model.theme.diagnostic_info,
+        );
+        assert_eq!(
+            model.diagnostic_color(Some(DiagnosticSeverity::HINT)),
+            model.theme.diagnostic_hint,
+        );
+        // Missing severity defaults to error (matching VS Code / rust-analyzer).
+        assert_eq!(model.diagnostic_color(None), model.theme.diagnostic_error,);
     }
 
     #[test]
