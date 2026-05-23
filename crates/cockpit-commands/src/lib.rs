@@ -186,6 +186,11 @@ impl Modifiers {
         shift: true,
         ..Self::NONE
     };
+
+    /// True when no modifiers are active.
+    pub fn is_none(self) -> bool {
+        self == Self::NONE
+    }
 }
 
 /// One key press in a keybinding chord.

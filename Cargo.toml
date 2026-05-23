@@ -16,7 +16,6 @@ cockpit-project = { path = "crates/cockpit-project" }
 cockpit-editor = { path = "crates/cockpit-editor" }
 cockpit-lsp = { path = "crates/cockpit-lsp" }
 cockpit-terminal = { path = "crates/cockpit-terminal" }
-cockpit-lsp = { path = "crates/cockpit-lsp" }
 cockpit-ui = { path = "crates/cockpit-ui" }
 cockpit-render = { path = "crates/cockpit-render" }
 cockpit-testkit = { path = "crates/cockpit-testkit" }

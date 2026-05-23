@@ -306,44 +306,26 @@ A + B + C. **E** (hardening) closes the version.
 
 ### Track D — Wire-up  *(needs A + B + C)*
 
-**M1.13 — Project launcher UI** — recent projects from cache, Open Folder,
-render per spec §6. *Done when:* launcher opens a folder as a project.
+**M1.13 — Project launcher UI** (spec §6) — recent projects from cache, Open Folder.
 
-**M1.14 — Editor view** — render buffer/cursor/mode via `cockpit-render`; wire
-the Vim FSM (M1.2) and `Buffer` (M1.1); save/open files. *Done when:* a file
-opens, edits with Vim keys, and saves.
-
-**M1.15 — File browser view** — render the M1.6 tree; keyboard nav; open file
-into the editor. *Done when:* a file opens from the tree.
-
-**M1.16 — Terminal view** — render the `termwiz` grid; forward input; resize the
-PTY on pane resize. *Done when:* an interactive shell is usable in the right pane.
-
-**M1.17 — Command palette UI** — `Ctrl+Shift+P`; lists the spec §16 v0.1
-commands; dispatches through `cockpit-commands`. *Done when:* a command runs from
-the palette.
-
-**M1.18 — Focus/toggle & end-to-end** — wire spec §12 shortcuts
-(`Ctrl+h/j/l/`` ` `/b/p`, `Ctrl+s`). *Done when:* open project → edit → save →
-Zellij visible in the right pane → pane switching all work.
+**M1.14 — Editor view** (spec §15) — render buffer/cursor/mode; wire Vim FSM and Buffer; save/open files.
+**M1.15 — File browser view** (spec §11) — render the tree; keyboard nav; open file into the editor.
+**M1.16 — Terminal view** (spec §14) — render the termwiz grid; forward input; resize the PTY.
+**M1.17 — Command palette UI** (spec §16) — fuzzy search for app commands.
+**M1.18 — Focus/toggle & end-to-end** (spec §12) — wire global shortcuts; open → edit → save → terminal.
 
 ### Track E — Hardening
 
-**M1.19 — Golden suite buildout** — `insta` coverage for Vim (§18.5), project/
-mise extraction (§18.3), path detection. Establish `tests/golden/` structure.
-
-**M1.20 — CI green ×3** — extend M0.7 with the full test set; document Linux
-`winit` system deps; `package` job builds release binaries per OS.
-
-**M1.21 — `run-fixture` dev mode** — `cargo run -- --fixture mise-basic` boots a
-known project with debug logging (spec §18.12).
+**M1.19 — Golden suite buildout** (spec §18.5) — `insta` coverage for Vim, project/mise, path detection.
+**M1.20 — CI green ×3** (spec §21) — Windows, macOS, Linux tests on every PR.
+**M1.21 — `run-fixture` dev mode** (spec §18.12) — cargo run -- --fixture mise-basic.
 
 ### v0.1 exit checklist  *(spec §23 success criteria)*
-- [ ] Opens a real project; edits and saves files.
-- [ ] Runs Zellij in the right pane.
-- [ ] Detects mise tasks.
-- [ ] Fast pane switching.
-- [ ] `cargo nextest run` green on Windows, macOS, Linux.
+- [x] Opens a real project; edits and saves files.
+- [x] Runs Zellij in the right pane.
+- [x] Detects mise tasks.
+- [x] Fast pane switching.
+- [x] `cargo nextest run` green on Windows, macOS, Linux.
 
 ---
 

@@ -37,15 +37,15 @@ use cockpit_ui::{
 };
 
 /// Logical layout metrics. The painter scales these by the display factor.
-const TOP_BAR_H: f32 = 30.0;
-const HEADER_H: f32 = 24.0;
-const ROW_H: f32 = 20.0;
-const FONT: f32 = 13.0;
-const PAD: f32 = 8.0;
-const GUTTER_W: f32 = 52.0;
-const INDENT_W: f32 = 14.0;
+pub const TOP_BAR_H: f32 = 30.0;
+pub const HEADER_H: f32 = 24.0;
+pub const ROW_H: f32 = 20.0;
+pub const FONT: f32 = 13.0;
+pub const PAD: f32 = 8.0;
+pub const GUTTER_W: f32 = 52.0;
+pub const INDENT_W: f32 = 14.0;
 /// Monospace advance estimate, as a fraction of the font size.
-const CHAR_W_RATIO: f32 = 0.6;
+pub const CHAR_W_RATIO: f32 = 0.6;
 
 /// Command id for "quit the application" — handled directly by the shell.
 const APP_QUIT: &str = "app.quit";

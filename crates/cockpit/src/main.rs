@@ -6,6 +6,7 @@
 //! without a display server.
 
 mod app;
+mod launcher;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,6 +19,7 @@ use cockpit_project::{
 use cockpit_testkit::{BUILTIN_FIXTURES, fixture_path};
 
 use crate::app::{AppModel, AppShell};
+use crate::launcher::{LauncherModel, LauncherResult};
 
 #[derive(Debug, Parser)]
 #[command(name = "cockpit", version, about = "Coding Cockpit")]
@@ -58,40 +60,48 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     if let Some(name) = cli.fixture {
-        run_fixture(&name, cli.print)
+        if !BUILTIN_FIXTURES.contains(&name.as_str()) {
+            anyhow::bail!(
+                "unknown fixture `{name}`. Bundled fixtures: {}",
+                BUILTIN_FIXTURES.join(", ")
+            );
+        }
+        run_project_or_launcher(Some(fixture_path(&name)), cli.print)
     } else if let Some(path) = cli.project {
-        run_project(&path, cli.print)
+        run_project_or_launcher(Some(path), cli.print)
     } else {
-        println!(
-            "cockpit {} — coding cockpit shell.",
-            env!("CARGO_PKG_VERSION")
-        );
-        print_recent_projects();
-        println!("Pass --fixture <name> or --project <path> to open a project.");
-        println!("Add --print for a headless project-detection dump.");
-        println!("Bundled fixtures: {}", BUILTIN_FIXTURES.join(", "));
-        Ok(())
+        run_project_or_launcher(None, cli.print)
     }
 }
 
-/// List the launcher's cached recent projects. Loaded from one small cache
-/// file, so this stays instant no matter how many projects exist (spec §24).
-fn print_recent_projects() {
-    let recents = recent_projects_path()
-        .ok()
-        .and_then(|path| RecentProjects::load(path).ok())
-        .unwrap_or_default();
-    if recents.projects.is_empty() {
-        return;
+/// Start either a project workspace or the project launcher. If a launcher
+/// selection results in a project, this function tail-calls itself to open
+/// that project.
+fn run_project_or_launcher(path: Option<PathBuf>, print: bool) -> Result<()> {
+    let Some(path) = path else {
+        return run_launcher();
+    };
+
+    let detection =
+        detect_project(&path).with_context(|| format!("detect project at `{}`", path.display()))?;
+
+    if print {
+        print_detection(&detection);
+        return Ok(());
     }
-    println!("Recent projects:");
-    for project in &recents.projects {
-        println!(
-            "  - {}  ({})",
-            project.display_name,
-            project.root_path.display()
-        );
-    }
+
+    record_recent_project(&detection);
+
+    let tree =
+        FileTree::load(&path).with_context(|| format!("load file tree at `{}`", path.display()))?;
+    let mut model = AppModel::new(detection, tree).map_err(|err| anyhow!(err))?;
+    model.refresh_git_status();
+    model.restore_cached_state();
+    let title = format!("Coding Cockpit — {}", model.project_name());
+    tracing::info!(project = model.project_name(), "opening window");
+
+    cockpit_render::run_app(title, AppShell::new(model)).context("windowing harness failed")?;
+    Ok(())
 }
 
 /// Add a project to the launcher's recent-projects registry. Best-effort: a
@@ -107,40 +117,26 @@ fn record_recent_project(detection: &ProjectDetection) {
     }
 }
 
-fn run_fixture(name: &str, print: bool) -> Result<()> {
-    if !BUILTIN_FIXTURES.contains(&name) {
-        anyhow::bail!(
-            "unknown fixture `{name}`. Bundled fixtures: {}",
-            BUILTIN_FIXTURES.join(", ")
-        );
+/// Run the GUI project launcher (spec §6, M1.13).
+fn run_launcher() -> Result<()> {
+    let recents = recent_projects_path()
+        .ok()
+        .and_then(|path| RecentProjects::load(path).ok())
+        .map(|r| {
+            r.projects
+                .into_iter()
+                .map(|p| cockpit_ui::launcher::RecentProject::new(p.display_name, p.root_path))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut model = LauncherModel::new(recents);
+    cockpit_render::run_app("Coding Cockpit", &mut model).context("launcher harness failed")?;
+
+    match model.result() {
+        Some(LauncherResult::OpenProject(path)) => run_project_or_launcher(Some(path), false),
+        Some(LauncherResult::Exit) | None => Ok(()),
     }
-    let path = fixture_path(name);
-    tracing::info!(fixture = name, path = %path.display(), "loading fixture");
-    run_project(&path, print)
-}
-
-fn run_project(path: &std::path::Path, print: bool) -> Result<()> {
-    let detection =
-        detect_project(path).with_context(|| format!("detect project at `{}`", path.display()))?;
-
-    if print {
-        print_detection(&detection);
-        return Ok(());
-    }
-
-    record_recent_project(&detection);
-
-    let tree =
-        FileTree::load(path).with_context(|| format!("load file tree at `{}`", path.display()))?;
-    let mut model = AppModel::new(detection, tree).map_err(|err| anyhow!(err))?;
-    model.refresh_git_statuses();
-    model.restore_cached_state();
-    model.refresh_git_status();
-    let title = format!("Coding Cockpit — {}", model.project_name());
-    tracing::info!(project = model.project_name(), "opening window");
-
-    cockpit_render::run_app(title, AppShell::new(model)).context("windowing harness failed")?;
-    Ok(())
 }
 
 fn print_detection(detection: &ProjectDetection) {
