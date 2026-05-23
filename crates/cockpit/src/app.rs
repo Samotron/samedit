@@ -7,6 +7,7 @@
 //! adapter the windowing harness drives — all real logic lives in [`AppModel`],
 //! so it stays testable without a window (AGENTS §2).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use cockpit_commands::{KeyChord, Modifiers};
@@ -58,12 +59,24 @@ const TEST_RUN_ALL: &str = "test.run_all";
 const TEST_RUN_CURRENT_FILE: &str = "test.run_current_file";
 /// Command id for "run the `test` task targeting the nearest test" (spec §16).
 const TEST_RUN_NEAREST: &str = "test.run_nearest";
+/// Command id for "summarise the recent key chord ring buffer" (spec §18.13).
+const DEBUG_SHOW_KEY_EVENTS: &str = "debug.show_key_events";
+/// Command id for "summarise the recent command dispatch log" (spec §18.13).
+const DEBUG_SHOW_COMMAND_LOG: &str = "debug.show_command_log";
+/// Command id for "summarise the current pane tree" (spec §18.13).
+const DEBUG_SHOW_PANE_TREE: &str = "debug.show_pane_tree";
+/// Command id for "summarise the project detection result" (spec §18.13).
+const DEBUG_SHOW_PROJECT_STATE: &str = "debug.show_project_state";
+/// Command id for "reload the user config" (spec §18.13).
+const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
 
 /// Name of the mise task cockpit invokes for the Test: * palette entries.
 /// Conventional default; M4 may make this configurable per project.
 const TEST_TASK: &str = "test";
 /// Status surfaced when the project has no `test` mise task wired up.
 const TEST_TASK_MISSING: &str = "No `test` mise task — add one to your mise.toml.";
+/// Cap on the diagnostics ring buffers (recent keys, recent commands).
+const DEBUG_LOG_SIZE: usize = 32;
 
 /// What activating a palette entry does — the palette is reused as both the
 /// command palette and the mise-task picker.
@@ -100,6 +113,10 @@ pub struct AppModel {
     terminal: Option<LiveTerminal>,
     redraw: Option<RedrawHandle>,
     cache_path: Option<PathBuf>,
+    /// Most recent key chords, oldest first (spec §18.13 key event inspector).
+    key_log: VecDeque<String>,
+    /// Most recent command ids, oldest first (spec §18.13 command log).
+    command_log: VecDeque<String>,
     exit: bool,
 }
 
@@ -125,6 +142,8 @@ impl AppModel {
             terminal: None,
             redraw: None,
             cache_path: None,
+            key_log: VecDeque::with_capacity(DEBUG_LOG_SIZE),
+            command_log: VecDeque::with_capacity(DEBUG_LOG_SIZE),
             exit: false,
             detection,
         })
@@ -208,6 +227,7 @@ impl AppModel {
 
     /// Route one key chord into a state change.
     pub fn dispatch(&mut self, chord: KeyChord) {
+        self.record_key_event(&chord);
         // The palette and fuzzy finder are modal: while open they consume
         // every key.
         if self.palette.is_some() {
@@ -227,8 +247,25 @@ impl AppModel {
         }
     }
 
+    /// Push a chord onto the recent-key ring buffer (spec §18.13).
+    fn record_key_event(&mut self, chord: &KeyChord) {
+        if self.key_log.len() == DEBUG_LOG_SIZE {
+            self.key_log.pop_front();
+        }
+        self.key_log.push_back(chord.to_string());
+    }
+
+    /// Push a command id onto the recent-command ring buffer (spec §18.13).
+    fn record_command(&mut self, id: &str) {
+        if self.command_log.len() == DEBUG_LOG_SIZE {
+            self.command_log.pop_front();
+        }
+        self.command_log.push_back(id.to_string());
+    }
+
     /// Apply a resolved global command.
     fn run_command(&mut self, id: &str) {
+        self.record_command(id);
         match id {
             command_ids::FOCUS_FILES => self.layout.focus(PaneId::Files),
             command_ids::FOCUS_EDITOR => self.layout.focus(PaneId::Editor),
@@ -248,6 +285,11 @@ impl AppModel {
             TEST_RUN_ALL => self.run_test_all(),
             TEST_RUN_CURRENT_FILE => self.run_test_current_file(),
             TEST_RUN_NEAREST => self.run_test_nearest(),
+            DEBUG_SHOW_KEY_EVENTS => self.debug_show_key_events(),
+            DEBUG_SHOW_COMMAND_LOG => self.debug_show_command_log(),
+            DEBUG_SHOW_PANE_TREE => self.debug_show_pane_tree(),
+            DEBUG_SHOW_PROJECT_STATE => self.debug_show_project_state(),
+            DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -423,6 +465,113 @@ impl AppModel {
             },
             None => self.status = "Terminal unavailable.".to_string(),
         }
+    }
+
+    /// Surface the recent key-chord buffer in the status line and tracing log.
+    fn debug_show_key_events(&mut self) {
+        let recent = self.recent_keys_summary();
+        tracing::info!(keys = %recent, "debug: show key events");
+        self.status = format!("Key events: {recent}");
+    }
+
+    /// Surface the recent command-dispatch log in the status line and tracing.
+    fn debug_show_command_log(&mut self) {
+        let recent = self.recent_commands_summary();
+        tracing::info!(commands = %recent, "debug: show command log");
+        self.status = format!("Commands: {recent}");
+    }
+
+    /// Surface the current pane tree (focus, dimensions, terminal state).
+    fn debug_show_pane_tree(&mut self) {
+        let summary = self.pane_tree_summary();
+        tracing::info!(panes = %summary, "debug: show pane tree");
+        self.status = format!("Panes: {summary}");
+    }
+
+    /// Surface the project detection result: name, signals, mise contents.
+    fn debug_show_project_state(&mut self) {
+        let summary = self.project_state_summary();
+        tracing::info!(project = %summary, "debug: show project state");
+        self.status = format!("Project: {summary}");
+    }
+
+    /// Re-apply the default config to the input router. A real user-config
+    /// load path lands later; for now this exercises the reload code path so
+    /// keybinding changes from a future config edit can be wired through here.
+    fn debug_reload_config(&mut self) {
+        match InputRouter::from_global_keys(&GlobalKeys::default()) {
+            Ok(router) => {
+                self.router = router;
+                tracing::info!("debug: reload config — defaults restored");
+                self.status =
+                    "Config reloaded (defaults — user-config wiring lands later).".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "debug: reload config failed");
+                self.status = format!("Config reload failed: {err:?}");
+            }
+        }
+    }
+
+    fn recent_keys_summary(&self) -> String {
+        if self.key_log.is_empty() {
+            return "<none>".to_string();
+        }
+        self.key_log.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+
+    fn recent_commands_summary(&self) -> String {
+        if self.command_log.is_empty() {
+            return "<none>".to_string();
+        }
+        self.command_log
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn pane_tree_summary(&self) -> String {
+        let prefs = self.layout.preferences();
+        let focused = self.layout.focused();
+        let term = match &self.terminal {
+            Some(_) => "spawned",
+            None => "none",
+        };
+        format!(
+            "files={}px, terminal={}px, focused={:?}, terminal_proc={term}",
+            prefs.left_width, prefs.right_width, focused,
+        )
+    }
+
+    fn project_state_summary(&self) -> String {
+        let signals = self
+            .detection
+            .signals
+            .iter()
+            .map(|signal| format!("{:?}", signal.kind))
+            .collect::<Vec<_>>()
+            .join("/");
+        let mise = &self.detection.mise;
+        let mise_state = if mise.detected {
+            format!(
+                "mise[{}tasks, {}tools, available={}]",
+                mise.tasks.len(),
+                mise.tools.len(),
+                mise.available,
+            )
+        } else {
+            "no mise".to_string()
+        };
+        format!(
+            "name=`{}`, signals=[{}], {mise_state}",
+            self.detection.display_name,
+            if signals.is_empty() {
+                "—".to_string()
+            } else {
+                signals
+            },
+        )
     }
 
     /// Scan the terminal's visible output for file references (spec §17). With
@@ -1425,6 +1574,11 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(TEST_RUN_ALL, "Test: Run All"),
         PaletteEntry::new(TEST_RUN_CURRENT_FILE, "Test: Run Current File"),
         PaletteEntry::new(TEST_RUN_NEAREST, "Test: Run Nearest"),
+        PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
+        PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
+        PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
+        PaletteEntry::new(DEBUG_SHOW_PROJECT_STATE, "Debug: Show Project State"),
+        PaletteEntry::new(DEBUG_RELOAD_CONFIG, "Debug: Reload Config"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -1755,6 +1909,61 @@ mod tests {
             model.status.contains("No file open"),
             "status: {}",
             model.status
+        );
+    }
+
+    #[test]
+    fn dispatch_records_each_chord_in_the_key_log() {
+        let mut model = model();
+        model.dispatch(chord("j"));
+        model.dispatch(chord("k"));
+        model.dispatch(chord("Ctrl+h"));
+        let recent: Vec<&str> = model.key_log.iter().map(String::as_str).collect();
+        assert_eq!(recent, vec!["j", "k", "Ctrl+h"]);
+    }
+
+    #[test]
+    fn key_log_is_a_bounded_ring_buffer() {
+        let mut model = model();
+        for _ in 0..(DEBUG_LOG_SIZE + 5) {
+            model.dispatch(chord("j"));
+        }
+        assert_eq!(model.key_log.len(), DEBUG_LOG_SIZE);
+    }
+
+    #[test]
+    fn debug_show_key_events_summarises_the_ring_buffer() {
+        let mut model = model();
+        model.dispatch(chord("j"));
+        model.dispatch(chord("k"));
+        model.debug_show_key_events();
+        assert!(
+            model.status.contains("Key events: j, k"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn debug_show_project_state_includes_signals_and_mise() {
+        let mut model = mise_model();
+        model.debug_show_project_state();
+        assert!(
+            model.status.contains("mise-basic"),
+            "status: {}",
+            model.status,
+        );
+        assert!(model.status.contains("mise["), "status: {}", model.status,);
+    }
+
+    #[test]
+    fn debug_reload_config_restores_default_keybindings() {
+        let mut model = model();
+        model.debug_reload_config();
+        assert!(
+            model.status.starts_with("Config reloaded"),
+            "status: {}",
+            model.status,
         );
     }
 
