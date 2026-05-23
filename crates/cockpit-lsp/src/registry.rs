@@ -3,7 +3,9 @@
 //! The single seam where adding a language means adding a row. Stays pure so
 //! tests assert on the table without spawning anything; the binary wraps the
 //! command in `mise exec` separately so cockpit never bypasses the project
-//! environment (spec §19).
+//! environment (spec §19). Syntax highlighting can lag this table; unsupported
+//! highlighters simply return no spans while LSP still starts for recognised
+//! source files.
 
 use cockpit_editor::Language;
 
@@ -23,10 +25,25 @@ impl ServerConfig {
     /// no entry for it yet.
     pub fn for_language(language: Language) -> Option<Self> {
         match language {
+            Language::Python => Some(Self {
+                language,
+                command: "basedpyright-langserver".to_string(),
+                args: vec!["--stdio".to_string()],
+            }),
             Language::Rust => Some(Self {
                 language,
                 command: "rust-analyzer".to_string(),
                 args: Vec::new(),
+            }),
+            Language::Sql => Some(Self {
+                language,
+                command: "sqls".to_string(),
+                args: Vec::new(),
+            }),
+            Language::TypeScript => Some(Self {
+                language,
+                command: "typescript-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
             }),
         }
     }
@@ -35,7 +52,10 @@ impl ServerConfig {
     /// (e.g. `"rust"` for rust-analyzer).
     pub fn language_id(&self) -> &'static str {
         match self.language {
+            Language::Python => "python",
             Language::Rust => "rust",
+            Language::Sql => "sql",
+            Language::TypeScript => "typescript",
         }
     }
 }
@@ -51,5 +71,31 @@ mod tests {
         assert_eq!(config.command, "rust-analyzer");
         assert!(config.args.is_empty());
         assert_eq!(config.language_id(), "rust");
+    }
+
+    #[test]
+    fn v04_lsp_languages_resolve_to_servers() {
+        let cases = [
+            (
+                Language::TypeScript,
+                "typescript-language-server",
+                &["--stdio"][..],
+                "typescript",
+            ),
+            (
+                Language::Python,
+                "basedpyright-langserver",
+                &["--stdio"][..],
+                "python",
+            ),
+            (Language::Sql, "sqls", &[][..], "sql"),
+        ];
+
+        for (language, command, args, language_id) in cases {
+            let config = ServerConfig::for_language(language).expect("language has a server");
+            assert_eq!(config.command, command);
+            assert_eq!(config.args, args);
+            assert_eq!(config.language_id(), language_id);
+        }
     }
 }

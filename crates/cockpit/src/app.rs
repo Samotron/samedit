@@ -33,8 +33,9 @@ use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
 use cockpit_terminal::zellij::{LaunchPlan, PathBinaryLookup, ShellProfile, plan_launch};
 use cockpit_ui::{
-    ComputedLayout, FileBrowser, FileBrowserAction, FuzzyFinder, InputRouter, Palette,
-    PaletteEntry, PaneId, Rect as UiRect, RoutedInput, WorkspaceLayout, command_ids,
+    CompletionItem, CompletionPopup, ComputedLayout, FileBrowser, FileBrowserAction, FuzzyFinder,
+    InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput, WorkspaceLayout,
+    command_ids,
 };
 
 /// Logical layout metrics. The painter scales these by the display factor.
@@ -78,6 +79,12 @@ const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
 const LSP_GOTO_DEFINITION: &str = "lsp.goto_definition";
 /// Command id for "show hover information for the symbol under the cursor" (M4.2).
 const LSP_SHOW_HOVER: &str = "lsp.show_hover";
+/// Command id for "rename the symbol under the cursor" (M4.3a).
+const LSP_RENAME: &str = "lsp.rename";
+/// Command id for manually requesting completions (M4.3b).
+const LSP_COMPLETION: &str = "lsp.completion";
+/// Command id for "apply the first quick-fix for the current diagnostic" (M4.5).
+const LSP_CODE_ACTION: &str = "lsp.code_action";
 
 /// Name of the mise task cockpit invokes for the Test: * palette entries.
 /// Conventional default; M4 may make this configurable per project.
@@ -118,6 +125,20 @@ enum LspPending {
     GotoDefinition,
     /// `textDocument/hover` — show the result in [`AppModel::hover`].
     Hover { path: PathBuf },
+    /// `textDocument/codeAction` — apply the first returned quick-fix edit.
+    CodeAction,
+    /// `textDocument/prepareRename` — validate before issuing rename.
+    PrepareRename {
+        language: Language,
+        path: PathBuf,
+        line: usize,
+        col: usize,
+        new_name: String,
+    },
+    /// `textDocument/rename` — apply the returned workspace edit.
+    Rename,
+    /// `textDocument/completion` — show candidates in the completion popup.
+    Completion,
 }
 
 /// The most recently received hover result (M4.2). Cleared when a new
@@ -129,6 +150,15 @@ struct HoverInfo {
     path: PathBuf,
     /// Rendered text content (Markdown stripped to plain runs for now).
     contents: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenameInput {
+    language: Language,
+    path: PathBuf,
+    line: usize,
+    col: usize,
+    value: String,
 }
 
 /// Headless application state for the v0.1 cockpit shell.
@@ -164,6 +194,16 @@ pub struct AppModel {
     /// Latest hover result, if any. Shown in the mode line / status bar
     /// until cleared (M4.2).
     hover: Option<HoverInfo>,
+    /// Inline rename input (M4.3a), modal over the editor while active.
+    rename_input: Option<RenameInput>,
+    /// Manual LSP completion popup (M4.3b).
+    completion: Option<CompletionPopup>,
+    /// Tracks a pending `g` in the editor pane so local `gd` can dispatch LSP
+    /// definition while non-LSP Vim chords like `gg` still reach the Vim FSM.
+    editor_pending_g: bool,
+    /// Tracks `<leader>c` in the editor pane so `<leader>ca` can dispatch the
+    /// quick-fix command without adding a parallel command path.
+    editor_pending_leader: u8,
     exit: bool,
 }
 
@@ -196,6 +236,10 @@ impl AppModel {
             diagnostics: HashMap::new(),
             lsp_pending: HashMap::new(),
             hover: None,
+            rename_input: None,
+            completion: None,
+            editor_pending_g: false,
+            editor_pending_leader: 0,
             exit: false,
             detection,
         })
@@ -282,6 +326,14 @@ impl AppModel {
         self.record_key_event(&chord);
         // The palette and fuzzy finder are modal: while open they consume
         // every key.
+        if self.rename_input.is_some() {
+            self.handle_rename_key(&chord);
+            return;
+        }
+        if self.completion.is_some() {
+            self.handle_completion_key(&chord);
+            return;
+        }
         if self.palette.is_some() {
             self.handle_palette_key(&chord);
             return;
@@ -344,6 +396,9 @@ impl AppModel {
             DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
             LSP_GOTO_DEFINITION => self.request_goto_definition(),
             LSP_SHOW_HOVER => self.request_show_hover(),
+            LSP_RENAME => self.open_rename_input(),
+            LSP_COMPLETION => self.request_completion(),
+            LSP_CODE_ACTION => self.request_code_action(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -793,6 +848,51 @@ impl AppModel {
         }
     }
 
+    /// Drive the inline rename prompt (M4.3a).
+    fn handle_rename_key(&mut self, chord: &KeyChord) {
+        if is_chord(chord, "Escape") {
+            self.rename_input = None;
+            self.status = "Rename cancelled.".to_string();
+            return;
+        }
+        if is_chord(chord, "Enter") {
+            self.submit_rename();
+            return;
+        }
+        let Some(input) = self.rename_input.as_mut() else {
+            return;
+        };
+        if is_chord(chord, "Backspace") {
+            input.value.pop();
+        } else if let Some(c) = chord_to_char(chord)
+            && is_rename_input_char(c)
+        {
+            input.value.push(c);
+        }
+        self.status = format!("Rename: {}", input.value);
+    }
+
+    /// Drive the manual completion popup (M4.3b).
+    fn handle_completion_key(&mut self, chord: &KeyChord) {
+        if is_chord(chord, "Escape") {
+            self.completion = None;
+            self.status = "Completion closed.".to_string();
+            return;
+        }
+        if is_chord(chord, "Enter") || is_chord(chord, "Tab") {
+            self.accept_completion();
+            return;
+        }
+        let Some(completion) = self.completion.as_mut() else {
+            return;
+        };
+        if is_chord(chord, "ArrowDown") || is_chord(chord, "j") {
+            completion.move_down();
+        } else if is_chord(chord, "ArrowUp") || is_chord(chord, "k") {
+            completion.move_up();
+        }
+    }
+
     /// Handle a chord no global binding claimed (pane-local shortcuts).
     fn handle_local(&mut self, focused: PaneId, chord: &KeyChord) {
         if *chord == KeyChord::single("q", Modifiers::CTRL) {
@@ -902,9 +1002,73 @@ impl AppModel {
 
     /// Feed a chord into the Vim state machine when the editor is focused.
     fn handle_editor_key(&mut self, chord: &KeyChord) {
+        if *chord == KeyChord::single("Space", Modifiers::CTRL) {
+            self.run_command(LSP_COMPLETION);
+            return;
+        }
+        let normal_mode = self
+            .document
+            .as_ref()
+            .is_some_and(|doc| doc.editor.mode() == Mode::Normal);
+        if normal_mode {
+            if is_chord(chord, "K") {
+                self.editor_pending_g = false;
+                self.editor_pending_leader = 0;
+                self.run_command(LSP_SHOW_HOVER);
+                return;
+            }
+            if self.editor_pending_leader == 2 {
+                self.editor_pending_leader = 0;
+                if is_chord(chord, "a") {
+                    self.editor_pending_g = false;
+                    self.run_command(LSP_CODE_ACTION);
+                    return;
+                }
+                if is_chord(chord, "r") {
+                    self.editor_pending_g = false;
+                    self.run_command(LSP_RENAME);
+                    return;
+                }
+            }
+            if self.editor_pending_leader == 1 {
+                self.editor_pending_leader = 0;
+                if is_chord(chord, "c") {
+                    self.editor_pending_leader = 2;
+                    self.editor_pending_g = false;
+                    return;
+                }
+            }
+            if is_chord(chord, "Space") {
+                self.editor_pending_leader = 1;
+                self.editor_pending_g = false;
+                return;
+            }
+            let mut replayed_pending = false;
+            if self.editor_pending_g {
+                self.editor_pending_g = false;
+                if is_chord(chord, "d") {
+                    self.run_command(LSP_GOTO_DEFINITION);
+                    return;
+                }
+                self.feed_vim_key(VimKey::Char('g'));
+                replayed_pending = true;
+            }
+            if !replayed_pending && is_chord(chord, "g") {
+                self.editor_pending_g = true;
+                return;
+            }
+        } else {
+            self.editor_pending_g = false;
+            self.editor_pending_leader = 0;
+        }
         let Some(key) = chord_to_vim_key(chord) else {
             return;
         };
+        self.feed_vim_key(key);
+    }
+
+    /// Feed one already-normalised key into the Vim state machine.
+    fn feed_vim_key(&mut self, key: VimKey) {
         let signal = match self.document.as_mut() {
             Some(doc) => doc.editor.handle_key(key),
             None => return,
@@ -1181,6 +1345,128 @@ impl AppModel {
         }
     }
 
+    /// Start inline rename input seeded from the identifier under the cursor.
+    fn open_rename_input(&mut self) {
+        let Some((language, path, line, col)) = self.cursor_for_lsp_request() else {
+            return;
+        };
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No document open.".to_string();
+            return;
+        };
+        let seed = symbol_under_cursor(&doc.editor.text(), doc.editor.cursor().byte())
+            .unwrap_or_else(|| "new_name".to_string());
+        self.rename_input = Some(RenameInput {
+            language,
+            path,
+            line,
+            col,
+            value: seed.clone(),
+        });
+        self.status = format!("Rename: {seed}");
+    }
+
+    /// Submit the inline rename value through `prepareRename` first.
+    fn submit_rename(&mut self) {
+        let Some(input) = self.rename_input.take() else {
+            return;
+        };
+        if input.value.trim().is_empty() {
+            self.status = "Rename requires a non-empty name.".to_string();
+            return;
+        }
+        let Some(client) = self.lsp_clients.get(&input.language) else {
+            self.status = "Language server is not running for this file.".to_string();
+            return;
+        };
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&input.path) },
+            "position": { "line": input.line as u64, "character": input.col as u64 },
+        });
+        match client.request("textDocument/prepareRename", params) {
+            Ok(id) => {
+                self.lsp_pending.insert(
+                    id,
+                    LspPending::PrepareRename {
+                        language: input.language,
+                        path: input.path,
+                        line: input.line,
+                        col: input.col,
+                        new_name: input.value,
+                    },
+                );
+                self.status = "Preparing rename...".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "LSP prepareRename request failed to queue");
+                self.status = format!("LSP request failed: {err}");
+            }
+        }
+    }
+
+    /// Request manual LSP completions at the cursor (M4.3b).
+    fn request_completion(&mut self) {
+        let Some((language, path, line, col)) = self.cursor_for_lsp_request() else {
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&language) else {
+            self.status = "Language server is not running for this file.".to_string();
+            return;
+        };
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "position": { "line": line as u64, "character": col as u64 },
+            "context": { "triggerKind": 1 },
+        });
+        match client.request("textDocument/completion", params) {
+            Ok(id) => {
+                self.lsp_pending.insert(id, LspPending::Completion);
+                self.status = "Looking up completions...".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "LSP completion request failed to queue");
+                self.status = format!("LSP request failed: {err}");
+            }
+        }
+    }
+
+    /// Request code actions for the diagnostic nearest the cursor (M4.5).
+    fn request_code_action(&mut self) {
+        let Some((language, path, line, col)) = self.cursor_for_lsp_request() else {
+            return;
+        };
+        let Some(diagnostic) = self.current_diagnostic(&path, line).cloned() else {
+            self.status = "No diagnostic at the cursor.".to_string();
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&language) else {
+            self.status = "Language server is not running for this file.".to_string();
+            return;
+        };
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "range": {
+                "start": { "line": diagnostic.range.start.line, "character": diagnostic.range.start.character },
+                "end": { "line": diagnostic.range.end.line, "character": diagnostic.range.end.character },
+            },
+            "context": {
+                "diagnostics": [diagnostic],
+                "only": ["quickfix"],
+            },
+            "position": { "line": line as u64, "character": col as u64 },
+        });
+        match client.request("textDocument/codeAction", params) {
+            Ok(id) => {
+                self.lsp_pending.insert(id, LspPending::CodeAction);
+                self.status = "Looking up code actions...".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "LSP codeAction request failed to queue");
+                self.status = format!("LSP request failed: {err}");
+            }
+        }
+    }
+
     /// Common preflight for the two M4.2 request commands: returns the
     /// `(language, path, line, col)` needed to build a `TextDocumentPositionParams`
     /// payload, or sets `status` and yields `None` when the request cannot
@@ -1198,6 +1484,16 @@ impl AppModel {
         Some((language, doc.path.clone(), line, col))
     }
 
+    fn current_diagnostic(&self, path: &Path, line: usize) -> Option<&Diagnostic> {
+        let line = line as u32;
+        self.diagnostics_for(path)
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.range.start.line <= line && diagnostic.range.end.line >= line
+            })
+            .or_else(|| self.diagnostics_for(path).first())
+    }
+
     /// Apply a `Response` that matched a pending [`LspPending`] entry. Splits
     /// out so the dispatch in [`handle_lsp_message`] stays small.
     fn apply_lsp_response(&mut self, pending: LspPending, response: Response) {
@@ -1209,6 +1505,16 @@ impl AppModel {
         match pending {
             LspPending::GotoDefinition => self.apply_goto_definition_result(result),
             LspPending::Hover { path } => self.apply_hover_result(path, result),
+            LspPending::CodeAction => self.apply_code_action_result(result),
+            LspPending::PrepareRename {
+                language,
+                path,
+                line,
+                col,
+                new_name,
+            } => self.apply_prepare_rename_result(language, path, line, col, new_name, result),
+            LspPending::Rename => self.apply_rename_result(result),
+            LspPending::Completion => self.apply_completion_result(result),
         }
     }
 
@@ -1247,6 +1553,190 @@ impl AppModel {
         };
     }
 
+    /// Apply the first LSP code action that carries a workspace edit.
+    fn apply_code_action_result(&mut self, result: serde_json::Value) {
+        let Some(actions) = result.as_array() else {
+            self.status = "No code actions available.".to_string();
+            return;
+        };
+        for action in actions {
+            let title = action
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("code action");
+            let Some(edit) = action.get("edit") else {
+                continue;
+            };
+            match self.apply_workspace_edit(edit) {
+                Ok(count) if count > 0 => {
+                    self.status = format!("Applied code action `{title}` ({count} edit(s)).");
+                    return;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.status = format!("Code action failed: {err}");
+                    return;
+                }
+            }
+        }
+        self.status = "No code action edit available.".to_string();
+    }
+
+    /// After `prepareRename` succeeds, issue the actual rename request.
+    fn apply_prepare_rename_result(
+        &mut self,
+        language: Language,
+        path: PathBuf,
+        line: usize,
+        col: usize,
+        new_name: String,
+        result: serde_json::Value,
+    ) {
+        if result.is_null() {
+            self.status = "Rename is not available at the cursor.".to_string();
+            return;
+        }
+        let Some(client) = self.lsp_clients.get(&language) else {
+            self.status = "Language server is not running for this file.".to_string();
+            return;
+        };
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "position": { "line": line as u64, "character": col as u64 },
+            "newName": new_name,
+        });
+        match client.request("textDocument/rename", params) {
+            Ok(id) => {
+                self.lsp_pending.insert(id, LspPending::Rename);
+                self.status = "Renaming symbol...".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "LSP rename request failed to queue");
+                self.status = format!("LSP request failed: {err}");
+            }
+        }
+    }
+
+    /// Apply a `textDocument/rename` workspace edit.
+    fn apply_rename_result(&mut self, result: serde_json::Value) {
+        if result.is_null() {
+            self.status = "Rename produced no edits.".to_string();
+            return;
+        }
+        match self.apply_workspace_edit(&result) {
+            Ok(count) if count > 0 => {
+                self.status = format!("Rename applied ({count} edit(s)).");
+            }
+            Ok(_) => self.status = "Rename produced no edits.".to_string(),
+            Err(err) => self.status = format!("Rename failed: {err}"),
+        }
+    }
+
+    /// Store returned completion candidates in the popup view-model.
+    fn apply_completion_result(&mut self, result: serde_json::Value) {
+        let items_value = result
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| result.as_array());
+        let Some(items_value) = items_value else {
+            self.completion = None;
+            self.status = "No completions available.".to_string();
+            return;
+        };
+        let items: Vec<CompletionItem> = items_value
+            .iter()
+            .filter_map(parse_completion_item)
+            .take(50)
+            .collect();
+        if items.is_empty() {
+            self.completion = None;
+            self.status = "No completions available.".to_string();
+            return;
+        }
+        let first = items[0].label.clone();
+        let count = items.len();
+        self.completion = Some(CompletionPopup::new(items));
+        self.status = format!("Completions: {count} candidate(s), first `{first}`.");
+    }
+
+    /// Insert the highlighted completion text at the current cursor.
+    fn accept_completion(&mut self) {
+        let Some(item) = self
+            .completion
+            .as_ref()
+            .and_then(CompletionPopup::highlighted)
+            .cloned()
+        else {
+            self.completion = None;
+            self.status = "No completion selected.".to_string();
+            return;
+        };
+        self.completion = None;
+        let Some(doc) = self.document.as_mut() else {
+            self.status = "No document open.".to_string();
+            return;
+        };
+        let at = doc.editor.cursor().byte();
+        doc.editor.replace_range(at..at, item.insert_text());
+        self.status = format!("Inserted completion `{}`.", item.label);
+    }
+
+    /// Apply an LSP `WorkspaceEdit`. Edits for the open document stay in the
+    /// editor buffer; edits for other files are written directly to disk.
+    fn apply_workspace_edit(&mut self, edit: &serde_json::Value) -> Result<usize, String> {
+        let mut by_path: HashMap<PathBuf, Vec<LspTextEdit>> = HashMap::new();
+        if let Some(changes) = edit.get("changes").and_then(serde_json::Value::as_object) {
+            for (uri, edits) in changes {
+                let Some(path) = path_from_file_uri(uri) else {
+                    return Err(format!("unsupported edit URI `{uri}`"));
+                };
+                collect_lsp_text_edits(edits, &mut by_path, path)?;
+            }
+        }
+        if let Some(document_changes) = edit
+            .get("documentChanges")
+            .and_then(serde_json::Value::as_array)
+        {
+            for change in document_changes {
+                let Some(uri) = change
+                    .get("textDocument")
+                    .and_then(|doc| doc.get("uri"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(path) = path_from_file_uri(uri) else {
+                    return Err(format!("unsupported edit URI `{uri}`"));
+                };
+                if let Some(edits) = change.get("edits") {
+                    collect_lsp_text_edits(edits, &mut by_path, path)?;
+                }
+            }
+        }
+
+        let mut applied = 0;
+        for (path, mut edits) in by_path {
+            edits.sort_by(|a, b| {
+                b.start_line
+                    .cmp(&a.start_line)
+                    .then_with(|| b.start_character.cmp(&a.start_character))
+            });
+            if let Some(doc) = self.document.as_mut()
+                && doc.path == path
+            {
+                applied += apply_lsp_text_edits_to_editor(&mut doc.editor, &edits)?;
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .map_err(|err| format!("read {}: {err}", path.display()))?;
+            let mut editor = Editor::new(&text);
+            applied += apply_lsp_text_edits_to_editor(&mut editor, &edits)?;
+            std::fs::write(&path, editor.text())
+                .map_err(|err| format!("write {}: {err}", path.display()))?;
+        }
+        Ok(applied)
+    }
+
     /// Paint the whole window for one frame.
     pub fn paint(&mut self, painter: &mut Painter, viewport: Viewport) {
         self.drain_lsp_messages();
@@ -1282,6 +1772,9 @@ impl AppModel {
         }
         if let Some(finder) = &self.finder {
             paint_finder(&mut canvas, &self.theme, finder, width, height);
+        }
+        if let Some(completion) = &self.completion {
+            paint_completion(&mut canvas, &self.theme, completion, width, height);
         }
     }
 
@@ -1949,6 +2442,147 @@ fn lsp_launch_argv(config: &ServerConfig) -> Vec<String> {
     mise_exec_command(&inner)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LspTextEdit {
+    start_line: usize,
+    start_character: usize,
+    end_line: usize,
+    end_character: usize,
+    new_text: String,
+}
+
+fn collect_lsp_text_edits(
+    value: &serde_json::Value,
+    by_path: &mut HashMap<PathBuf, Vec<LspTextEdit>>,
+    path: PathBuf,
+) -> Result<(), String> {
+    let Some(items) = value.as_array() else {
+        return Err("workspace edit entry is not an array".to_string());
+    };
+    for item in items {
+        by_path
+            .entry(path.clone())
+            .or_default()
+            .push(parse_lsp_text_edit(item)?);
+    }
+    Ok(())
+}
+
+fn parse_lsp_text_edit(value: &serde_json::Value) -> Result<LspTextEdit, String> {
+    let range = value
+        .get("range")
+        .ok_or_else(|| "text edit missing range".to_string())?;
+    let start = range
+        .get("start")
+        .ok_or_else(|| "text edit missing start".to_string())?;
+    let end = range
+        .get("end")
+        .ok_or_else(|| "text edit missing end".to_string())?;
+    let new_text = value
+        .get("newText")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "text edit missing newText".to_string())?;
+    Ok(LspTextEdit {
+        start_line: lsp_position_field(start, "line")?,
+        start_character: lsp_position_field(start, "character")?,
+        end_line: lsp_position_field(end, "line")?,
+        end_character: lsp_position_field(end, "character")?,
+        new_text: new_text.to_string(),
+    })
+}
+
+fn lsp_position_field(value: &serde_json::Value, field: &str) -> Result<usize, String> {
+    let raw = value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("LSP position missing `{field}`"))?;
+    usize::try_from(raw).map_err(|_| format!("LSP position `{field}` is too large"))
+}
+
+fn apply_lsp_text_edits_to_editor(
+    editor: &mut Editor,
+    edits: &[LspTextEdit],
+) -> Result<usize, String> {
+    for edit in edits {
+        let start = editor
+            .buffer()
+            .line_col_to_byte(edit.start_line, edit.start_character);
+        let end = editor
+            .buffer()
+            .line_col_to_byte(edit.end_line, edit.end_character);
+        if start > end {
+            return Err("text edit range starts after it ends".to_string());
+        }
+        editor.replace_range(start..end, &edit.new_text);
+    }
+    Ok(edits.len())
+}
+
+fn symbol_under_cursor(text: &str, cursor: usize) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let cursor = cursor.min(text.len());
+    let mut start = cursor;
+    while start > 0 {
+        let prev = text[..start].chars().next_back()?;
+        if !is_symbol_char(prev) {
+            break;
+        }
+        start -= prev.len_utf8();
+    }
+    let mut end = cursor;
+    while end < text.len() {
+        let next = text[end..].chars().next()?;
+        if !is_symbol_char(next) {
+            break;
+        }
+        end += next.len_utf8();
+    }
+    (start < end).then(|| text[start..end].to_string())
+}
+
+fn is_symbol_char(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric()
+}
+
+fn is_rename_input_char(c: char) -> bool {
+    c == '_' || c == '-' || c.is_ascii_alphanumeric()
+}
+
+fn parse_completion_item(value: &serde_json::Value) -> Option<CompletionItem> {
+    let label = value.get("label")?.as_str()?.to_string();
+    let mut item = CompletionItem::new(label);
+    item.detail = value
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    item.documentation = completion_documentation(value.get("documentation"));
+    item.insert_text = value
+        .get("insertText")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("textEdit")
+                .and_then(|edit| edit.get("newText"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string);
+    Some(item)
+}
+
+fn completion_documentation(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+        serde_json::Value::Object(map) => map
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Format `path` as an LSP `file://` URI. The path is treated as absolute;
 /// callers above resolve project-relative paths against the project root.
 fn file_uri(path: &Path) -> String {
@@ -2057,6 +2691,9 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(TEST_RUN_NEAREST, "Test: Run Nearest"),
         PaletteEntry::new(LSP_GOTO_DEFINITION, "LSP: Go to Definition"),
         PaletteEntry::new(LSP_SHOW_HOVER, "LSP: Show Hover"),
+        PaletteEntry::new(LSP_RENAME, "LSP: Rename Symbol"),
+        PaletteEntry::new(LSP_COMPLETION, "LSP: Complete"),
+        PaletteEntry::new(LSP_CODE_ACTION, "LSP: Code Action"),
         PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
         PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
@@ -2202,6 +2839,55 @@ fn paint_finder(
             theme.muted_text
         };
         canvas.text(panel_x + PAD, row_y + 3.0, path.clone(), color, FONT);
+    }
+}
+
+fn paint_completion(
+    canvas: &mut Canvas<'_>,
+    theme: &Theme,
+    completion: &CompletionPopup,
+    view_width: f32,
+    view_height: f32,
+) {
+    let panel_w = 460.0_f32.min(view_width - 2.0 * PAD);
+    let panel_x = (view_width * 0.5).min(view_width - panel_w - PAD).max(PAD);
+    let panel_y = (view_height * 0.35).max(TOP_BAR_H + PAD);
+    let max_rows = 8usize;
+    let shown = completion.items().len().clamp(1, max_rows);
+    let docs_h = completion
+        .highlighted()
+        .and_then(|item| item.documentation.as_ref().or(item.detail.as_ref()))
+        .map(|_| ROW_H * 2.0)
+        .unwrap_or(0.0);
+    let panel_h = shown as f32 * ROW_H + docs_h + PAD;
+
+    canvas.rect(panel_x, panel_y, panel_w, panel_h, theme.pane_background);
+    canvas.rect(panel_x, panel_y, panel_w, 2.0, theme.accent);
+    for (row, item) in completion.items().iter().take(max_rows).enumerate() {
+        let row_y = panel_y + PAD * 0.5 + row as f32 * ROW_H;
+        let selected = row == completion.selection();
+        if selected {
+            canvas.rect(panel_x + 2.0, row_y, panel_w - 4.0, ROW_H, theme.selection);
+        }
+        let color = if selected {
+            theme.text
+        } else {
+            theme.muted_text
+        };
+        canvas.text(panel_x + PAD, row_y + 3.0, item.label.clone(), color, FONT);
+    }
+    if let Some(item) = completion.highlighted()
+        && let Some(text) = item.documentation.as_ref().or(item.detail.as_ref())
+    {
+        let docs_y = panel_y + PAD * 0.5 + shown as f32 * ROW_H + PAD * 0.5;
+        canvas.rect(panel_x, docs_y - 2.0, panel_w, 1.0, theme.pane_border);
+        canvas.text(
+            panel_x + PAD,
+            docs_y + 3.0,
+            text.lines().next().unwrap_or("").to_string(),
+            theme.muted_text,
+            FONT,
+        );
     }
 }
 
@@ -2655,6 +3341,263 @@ mod tests {
         model.apply_hover_result(PathBuf::from("/tmp/x.rs"), serde_json::Value::Null);
         assert!(model.hover.is_none());
         assert_eq!(model.status, "No hover information.");
+    }
+
+    #[test]
+    fn apply_workspace_edit_updates_the_open_document() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+        let path = model.document.as_ref().unwrap().path.clone();
+        let edit = serde_json::json!({
+            "changes": {
+                file_uri(&path): [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 2}
+                    },
+                    "newText": "pub fn"
+                }]
+            }
+        });
+
+        let count = model.apply_workspace_edit(&edit).expect("edit applies");
+
+        assert_eq!(count, 1);
+        let doc = model.document.as_ref().unwrap();
+        assert!(doc.editor.text().starts_with("pub fn"));
+        assert!(doc.editor.is_dirty());
+    }
+
+    #[test]
+    fn apply_code_action_result_applies_first_edit() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+        let path = model.document.as_ref().unwrap().path.clone();
+        let result = serde_json::json!([{
+            "title": "Make function public",
+            "edit": {
+                "changes": {
+                    file_uri(&path): [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 0}
+                        },
+                        "newText": "pub "
+                    }]
+                }
+            }
+        }]);
+
+        model.apply_code_action_result(result);
+
+        assert!(
+            model
+                .document
+                .as_ref()
+                .unwrap()
+                .editor
+                .text()
+                .starts_with("pub ")
+        );
+        assert!(model.status.contains("Make function public"));
+    }
+
+    #[test]
+    fn open_rename_input_seeds_symbol_under_cursor() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs:1:4");
+
+        model.open_rename_input();
+
+        let input = model.rename_input.as_ref().expect("rename input open");
+        assert_eq!(input.value, "main");
+        assert!(model.status.contains("main"));
+    }
+
+    #[test]
+    fn rename_input_edits_and_escape_cancels() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs:1:4");
+        model.open_rename_input();
+
+        model.handle_rename_key(&chord("Backspace"));
+        model.handle_rename_key(&chord("x"));
+        assert!(model.rename_input.as_ref().unwrap().value.ends_with('x'));
+
+        model.handle_rename_key(&chord("Escape"));
+        assert!(model.rename_input.is_none());
+        assert_eq!(model.status, "Rename cancelled.");
+    }
+
+    #[test]
+    fn apply_rename_result_applies_workspace_edit() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+        let path = model.document.as_ref().unwrap().path.clone();
+        let result = serde_json::json!({
+            "changes": {
+                file_uri(&path): [{
+                    "range": {
+                        "start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 7}
+                    },
+                    "newText": "entry"
+                }]
+            }
+        });
+
+        model.apply_rename_result(result);
+
+        assert!(
+            model
+                .document
+                .as_ref()
+                .unwrap()
+                .editor
+                .text()
+                .contains("entry")
+        );
+        assert!(model.status.contains("Rename applied"));
+    }
+
+    #[test]
+    fn apply_completion_result_opens_popup_with_docs() {
+        let mut model = rust_model();
+        let result = serde_json::json!({
+            "isIncomplete": false,
+            "items": [{
+                "label": "println!",
+                "detail": "macro",
+                "documentation": {"kind": "markdown", "value": "Prints a line."},
+                "insertText": "println!($0)"
+            }]
+        });
+
+        model.apply_completion_result(result);
+
+        let completion = model.completion.as_ref().expect("completion popup");
+        let item = completion.highlighted().unwrap();
+        assert_eq!(item.label, "println!");
+        assert_eq!(item.insert_text(), "println!($0)");
+        assert_eq!(item.documentation.as_deref(), Some("Prints a line."));
+    }
+
+    #[test]
+    fn accepting_completion_inserts_selected_text() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs:1:1");
+        model.completion = Some(CompletionPopup::new(vec![CompletionItem {
+            label: "main".to_string(),
+            detail: None,
+            documentation: None,
+            insert_text: Some("main()".to_string()),
+        }]));
+
+        model.handle_completion_key(&chord("Enter"));
+
+        assert!(model.completion.is_none());
+        assert!(
+            model
+                .document
+                .as_ref()
+                .unwrap()
+                .editor
+                .text()
+                .starts_with("main()")
+        );
+    }
+
+    #[test]
+    fn request_code_action_requires_a_current_diagnostic() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+
+        model.request_code_action();
+
+        assert_eq!(model.status, "No diagnostic at the cursor.");
+    }
+
+    #[test]
+    fn editor_k_dispatches_show_hover_command() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+
+        model.handle_editor_key(&chord("K"));
+
+        assert_eq!(
+            model.command_log.back().map(String::as_str),
+            Some(LSP_SHOW_HOVER)
+        );
+    }
+
+    #[test]
+    fn editor_gd_dispatches_goto_definition_command() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+
+        model.handle_editor_key(&chord("g"));
+        model.handle_editor_key(&chord("d"));
+
+        assert_eq!(
+            model.command_log.back().map(String::as_str),
+            Some(LSP_GOTO_DEFINITION)
+        );
+    }
+
+    #[test]
+    fn editor_leader_ca_dispatches_code_action_command() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+
+        model.handle_editor_key(&chord("Space"));
+        model.handle_editor_key(&chord("c"));
+        model.handle_editor_key(&chord("a"));
+
+        assert_eq!(
+            model.command_log.back().map(String::as_str),
+            Some(LSP_CODE_ACTION)
+        );
+    }
+
+    #[test]
+    fn editor_leader_cr_dispatches_rename_command() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+
+        model.handle_editor_key(&chord("Space"));
+        model.handle_editor_key(&chord("c"));
+        model.handle_editor_key(&chord("r"));
+
+        assert_eq!(
+            model.command_log.back().map(String::as_str),
+            Some(LSP_RENAME)
+        );
+        assert!(model.rename_input.is_some());
+    }
+
+    #[test]
+    fn ctrl_space_dispatches_completion_command() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+
+        model.handle_editor_key(&chord("Ctrl+Space"));
+
+        assert_eq!(
+            model.command_log.back().map(String::as_str),
+            Some(LSP_COMPLETION)
+        );
+    }
+
+    #[test]
+    fn editor_gg_still_reaches_vim() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs:2:1");
+
+        model.handle_editor_key(&chord("g"));
+        model.handle_editor_key(&chord("g"));
+
+        let doc = model.document.as_ref().expect("document remains open");
+        assert_eq!(doc.editor.cursor().line_col(doc.editor.buffer()).0, 0);
     }
 
     #[test]

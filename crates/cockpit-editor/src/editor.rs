@@ -137,6 +137,16 @@ impl Editor {
         self.buffer.text()
     }
 
+    /// Replace a byte range and record it as one undoable edit. The range is
+    /// clamped to valid buffer bounds by [`History`].
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
+        let cursor = range.start + text.len();
+        self.history.replace(&mut self.buffer, range, text);
+        self.cursor.set_byte(&self.buffer, cursor);
+        self.dirty = true;
+        self.refresh_highlights();
+    }
+
     /// The active visual selection as an inclusive-resolved `[start, end)` byte
     /// range, or `None` when no Visual mode is active.
     pub fn selection(&self) -> Option<(usize, usize)> {
@@ -893,6 +903,18 @@ mod tests {
         assert!(editor.is_dirty());
         editor.mark_saved();
         assert!(!editor.is_dirty());
+    }
+
+    #[test]
+    fn replace_range_records_an_undoable_edit() {
+        let mut editor = Editor::new("hello world");
+        editor.replace_range(6..11, "there");
+
+        assert_eq!(editor.text(), "hello there");
+        assert!(editor.is_dirty());
+
+        editor.handle_key(Key::Char('u'));
+        assert_eq!(editor.text(), "hello world");
     }
 
     #[test]

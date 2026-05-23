@@ -4,11 +4,13 @@
 //! command palette, project launcher) that is a pure function of app state
 //! and fully unit-testable without a window (spec §18.8).
 
+pub mod completion;
 pub mod file_browser;
 pub mod file_finder;
 pub mod launcher;
 pub mod palette;
 
+pub use completion::{CompletionItem, CompletionPopup};
 pub use file_browser::{FileBrowser, FileBrowserAction, FileRow};
 pub use file_finder::{FuzzyFinder, FuzzyMatch};
 pub use launcher::{Launcher, LauncherAction, LauncherIntent, LauncherSelection, RecentProject};

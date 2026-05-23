@@ -404,13 +404,13 @@ inherit the project environment (spec §19).
 
 - [x] **M4.1 — Diagnostics** — ingest `publishDiagnostics` and render LSP
   diagnostics in the editor gutter/inline.
-- [ ] **M4.2 — Navigation** — `textDocument/definition` + `hover`. New
+- [x] **M4.2 — Navigation** — `textDocument/definition` + `hover`. New
   commands: `Go to Definition` (default `gd`), `Show Hover` (default `K`).
   Reuses the existing path-jump plumbing from
   `cockpit-terminal`/`bridge.rs` to open the target file at line:col.
-- [ ] **M4.3a — Rename** — `prepareRename` + `rename`; **inline edit at
+- [x] **M4.3a — Rename** — `prepareRename` + `rename`; **inline edit at
   cursor** (LazyVim/VSCode style), then apply the returned `WorkspaceEdit`.
-- [ ] **M4.3b — Completion** — `textDocument/completion` (+ `resolve` for
+- [x] **M4.3b — Completion** — `textDocument/completion` (+ `resolve` for
   detail/docs). **Manual trigger only (`Ctrl+Space`)** — no
   on-keystroke debounce in v0.4 to avoid fighting the Vim FSM. UI is
   inline ghost text **and** a popup list with docs; view-model lives in
@@ -423,12 +423,12 @@ inherit the project environment (spec §19).
   #6: "Detect, surface, prompt — never silently modify"). LSP `formatting`
   is used **only** when no formatter is detectable and the server
   advertises the capability.
-- [ ] **M4.5 — Code actions / quick-fix** — `textDocument/codeAction` wired
+- [x] **M4.5 — Code actions / quick-fix** — `textDocument/codeAction` wired
   to current diagnostic; palette command + keybinding (default `<leader>ca`).
-- [ ] **M4.6 — Vim/editor conformance** — extend the golden suite for the
+- [x] **M4.6 — Vim/editor conformance** — extend the golden suite for the
   new motions and operators introduced by navigation/rename (`gd`, `K`,
   rename interactions). Property tests gain a rename-round-trip case.
-- [ ] **M4.8 — SQL LSP** — `sqls` (most mature, cross-DB). `postgrestools`
+- [x] **M4.8 — SQL LSP** — `sqls` (most mature, cross-DB). `postgrestools`
   deferred to a later milestone. Registry entry in `cockpit-lsp`.
 
 ### Mouse support (new — not in spec §12)

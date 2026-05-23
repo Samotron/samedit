@@ -36,17 +36,23 @@ pub struct HighlightSpan {
     pub kind: HighlightKind,
 }
 
-/// A source language with tree-sitter support.
+/// A source language recognised by the editor/LSP layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
+    Python,
     Rust,
+    Sql,
+    TypeScript,
 }
 
 impl Language {
     /// Pick a language from a file extension (case-insensitive), if supported.
     pub fn from_extension(extension: &str) -> Option<Self> {
         match extension.to_ascii_lowercase().as_str() {
+            "py" => Some(Language::Python),
             "rs" => Some(Language::Rust),
+            "sql" => Some(Language::Sql),
+            "ts" | "tsx" => Some(Language::TypeScript),
             _ => None,
         }
     }
@@ -92,6 +98,9 @@ pub fn compute(language: Language, text: &str) -> Vec<HighlightSpan> {
     if text.len() > MAX_HIGHLIGHT_BYTES {
         return Vec::new();
     }
+    if language != Language::Rust {
+        return Vec::new();
+    }
     with_config(language, |config| {
         HIGHLIGHTER.with(|cell| {
             let mut highlighter = cell.borrow_mut();
@@ -109,6 +118,9 @@ fn with_config<R>(language: Language, f: impl FnOnce(&HighlightConfiguration) ->
             let mut slot = cell.borrow_mut();
             f(slot.get_or_insert_with(build_rust_config))
         }),
+        Language::Python | Language::Sql | Language::TypeScript => {
+            unreachable!("non-Rust languages return before requesting a highlight config")
+        }
     }
 }
 
@@ -189,6 +201,18 @@ mod tests {
         assert_eq!(
             Language::from_path(Path::new("src/main.rs")),
             Some(Language::Rust)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("script.py")),
+            Some(Language::Python)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("query.sql")),
+            Some(Language::Sql)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("app.tsx")),
+            Some(Language::TypeScript)
         );
         assert_eq!(Language::from_path(Path::new("README")), None);
     }

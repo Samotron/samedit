@@ -109,4 +109,25 @@ proptest! {
             previous_end = span.range.end;
         }
     }
+
+    /// Rename-style replacements are ordinary undoable editor edits: applying
+    /// one symbol replacement and undoing it must round-trip exactly.
+    #[test]
+    fn rename_replacement_round_trips_through_undo(
+        prefix in "[a-z]{0,12}",
+        suffix in "[a-z]{0,12}",
+        replacement in "[a-z_][a-z0-9_]{0,12}",
+    ) {
+        let old = "target";
+        let text = format!("{prefix}{old}{suffix}");
+        let start = prefix.len();
+        let end = start + old.len();
+        let mut editor = Editor::new(&text);
+
+        editor.replace_range(start..end, &replacement);
+        prop_assert_eq!(editor.text(), format!("{prefix}{replacement}{suffix}"));
+
+        editor.handle_key(Key::Char('u'));
+        prop_assert_eq!(editor.text(), text);
+    }
 }
