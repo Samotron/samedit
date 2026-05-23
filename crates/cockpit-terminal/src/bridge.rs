@@ -1,9 +1,17 @@
-//! Editor↔terminal bridge.
+//! Editor↔terminal bridge (spec §17).
 //!
-//! Surfaces file references printed in terminal output so the UI can jump to
-//! them in the editor (spec §17 / M2.6). The detection itself lives in
-//! [`path_detect`](crate::path_detect); this module scans a parsed
-//! [`ScreenGrid`](crate::engine::ScreenGrid) row by row.
+//! Two directions:
+//!
+//! * **Terminal → editor** — [`detect_paths_in_grid`] surfaces file references
+//!   printed in terminal output so the UI can jump to them (M2.6). The
+//!   detection itself lives in [`path_detect`](crate::path_detect).
+//! * **Editor → terminal** — [`paste_to_terminal`] wraps editor content in
+//!   bracketed-paste markers so the receiving shell treats it as an inserted
+//!   block (no accidental execution for multi-line selections, and the cursor
+//!   ends after the text). [`render_document_path`] formats a document path
+//!   project-relative when possible, matching the §17 `path:line:col` form.
+
+use std::path::Path;
 
 use crate::engine::ScreenGrid;
 use crate::path_detect::{PathMatch, detect_paths};
@@ -17,28 +25,30 @@ pub fn detect_paths_in_grid(grid: &ScreenGrid) -> Vec<PathMatch> {
         .collect()
 }
 
-/// Bytes to send when bridging a file path from the editor into the terminal.
-/// The path is shell-quoted and terminated with Enter so it is ready for
-/// commands that expect one path argument.
-pub fn terminal_input_for_path(path: &str) -> Vec<u8> {
-    let mut input = shell_quote_arg(path).into_bytes();
-    input.push(b'\r');
-    input
+/// Bracketed-paste start sequence (DEC `\e[200~`).
+const PASTE_START: &[u8] = b"\x1b[200~";
+/// Bracketed-paste end sequence (DEC `\e[201~`).
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Wrap `text` in bracketed-paste markers so the receiving shell's line editor
+/// treats it as a pasted block. Without this, multi-line selections would run
+/// each line as a command the moment it hit the shell.
+pub fn paste_to_terminal(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(PASTE_START.len() + text.len() + PASTE_END.len());
+    bytes.extend_from_slice(PASTE_START);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(PASTE_END);
+    bytes
 }
 
-/// Bytes to send when bridging selected editor text into the terminal.
-/// Newlines become carriage returns because PTY input uses CR for Enter.
-pub fn terminal_input_for_selection(text: &str) -> Vec<u8> {
-    let mut input = text.replace("\r\n", "\n").replace('\n', "\r").into_bytes();
-    if !input.ends_with(b"\r") {
-        input.push(b'\r');
-    }
-    input
-}
-
-/// Quote one shell argument using POSIX single-quote escaping.
-pub fn shell_quote_arg(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+/// Render a document path for the terminal: project-relative when `path` lives
+/// under `project_root`, otherwise the absolute path. The relative form
+/// matches the §17 `path:line:col` references printed by tools.
+pub fn render_document_path(path: &Path, project_root: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -77,26 +87,39 @@ mod tests {
     }
 
     #[test]
-    fn formats_current_file_path_for_terminal_input() {
+    fn paste_wraps_text_in_bracketed_paste_markers() {
+        let bytes = paste_to_terminal("ls -la");
+        assert_eq!(bytes, b"\x1b[200~ls -la\x1b[201~");
+    }
+
+    #[test]
+    fn paste_preserves_newlines_inside_the_block() {
+        let bytes = paste_to_terminal("fn main() {\n    println!(\"hi\");\n}");
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        // The body sits verbatim between the markers, newlines included.
         assert_eq!(
-            terminal_input_for_path("src/main.rs"),
-            b"'src/main.rs'\r".to_vec()
-        );
-        assert_eq!(
-            terminal_input_for_path("src/it's.rs"),
-            b"'src/it'\\''s.rs'\r".to_vec()
+            &bytes[PASTE_START.len()..bytes.len() - PASTE_END.len()],
+            b"fn main() {\n    println!(\"hi\");\n}",
         );
     }
 
     #[test]
-    fn formats_selected_text_for_terminal_input() {
-        assert_eq!(
-            terminal_input_for_selection("cargo test"),
-            b"cargo test\r".to_vec()
-        );
-        assert_eq!(
-            terminal_input_for_selection("echo one\necho two\n"),
-            b"echo one\recho two\r".to_vec()
-        );
+    fn paste_handles_empty_text() {
+        assert_eq!(paste_to_terminal(""), b"\x1b[200~\x1b[201~");
+    }
+
+    #[test]
+    fn renders_document_paths_project_relative() {
+        let root = Path::new("/code/geotech");
+        let path = Path::new("/code/geotech/src/main.rs");
+        assert_eq!(render_document_path(path, root), "src/main.rs");
+    }
+
+    #[test]
+    fn renders_document_paths_absolute_when_outside_the_project() {
+        let root = Path::new("/code/geotech");
+        let path = Path::new("/etc/hosts");
+        assert_eq!(render_document_path(path, root), "/etc/hosts");
     }
 }

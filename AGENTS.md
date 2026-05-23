@@ -68,6 +68,7 @@ samedit/                            # Cargo workspace root
 │   ├── cockpit-editor/             # ropey buffer, cursor, undo, vim FSM, search
 │   ├── cockpit-project/            # detection, mise, project cache, file tree
 │   ├── cockpit-terminal/           # pty, termwiz engine, zellij, path detect
+│   ├── cockpit-lsp/                # LSP transport — codec, JSON-RPC, client
 │   ├── cockpit-commands/           # command registry + keybinding resolution
 │   ├── cockpit-config/             # serde config types, TOML/KDL loading
 │   ├── cockpit-ui/                 # view-model tree, layout, panes, palette
@@ -95,6 +96,7 @@ should never gain a window/GPU dependency.
 | Buffer / cursor / undo / Vim mode logic  | `cockpit-editor`         |
 | Project detection, mise parsing, tasks   | `cockpit-project`        |
 | PTY, terminal engine, Zellij, path parse | `cockpit-terminal`       |
+| LSP codec / JSON-RPC / client transport  | `cockpit-lsp`            |
 | A new command ID or keybinding           | `cockpit-commands`       |
 | Config schema, TOML/KDL parsing          | `cockpit-config`         |
 | View-model state (panes, palette, tree)  | `cockpit-ui`             |
@@ -127,9 +129,10 @@ mise run run           # cargo run -p cockpit
 mise run run-fixture -- mise-basic
 ```
 
-`test-integration` and `test-ui-smoke` are placeholders today; they land in
-v0.2 and v0.3 behind the `integration` and `ui-smoke` Cargo features
-respectively.
+`test-integration` runs the opt-in, `integration`-gated tests: the real-PTY
+terminal tests and the `mise` CLI tests (which skip cleanly when `mise` is not
+installed). `test-ui-smoke` runs the `ui-smoke`-gated tests in `crates/cockpit`
+that assert on the `cockpit-ui` view-model tree (spec §18.8 — no pixel checks).
 
 ### Before you say "done"
 

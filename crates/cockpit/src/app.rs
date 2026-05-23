@@ -7,28 +7,30 @@
 //! adapter the windowing harness drives — all real logic lives in [`AppModel`],
 //! so it stays testable without a window (AGENTS §2).
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use cockpit_commands::{KeyChord, Modifiers};
-use cockpit_config::GlobalKeys;
+use cockpit_config::{GlobalKeys, ZellijLayout};
 use cockpit_editor::vim::{Key as VimKey, Mode};
-use cockpit_editor::{Editor, EditorSignal, HighlightKind, HighlightSpan, Language};
+use cockpit_editor::{
+    Editor, EditorSignal, HighlightKind, HighlightSpan, Language, nearest_test_name,
+};
+use cockpit_lsp::{
+    Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, ServerConfig,
+};
 use cockpit_project::{
-    FileNodeKind, FileTree, GitFileStatus, ProjectCache, ProjectDetection, git_status,
-    project_cache_path, walk_project_files,
+    FileNodeKind, FileTree, ProjectCache, ProjectDetection, mise_exec_command, project_cache_path,
+    walk_project_files,
 };
 use cockpit_render::theme::Color;
 use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
-use cockpit_terminal::bridge::{
-    detect_paths_in_grid, shell_quote_arg, terminal_input_for_path, terminal_input_for_selection,
-};
+use cockpit_terminal::bridge::{detect_paths_in_grid, paste_to_terminal, render_document_path};
 use cockpit_terminal::live::{LiveTerminal, WakeFn};
 use cockpit_terminal::path_detect::detect_paths;
 use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
-use cockpit_terminal::zellij::{
-    LaunchPlan, PathBinaryLookup, ShellProfile, ZellijLayout, plan_launch,
-};
+use cockpit_terminal::zellij::{LaunchPlan, PathBinaryLookup, ShellProfile, plan_launch};
 use cockpit_ui::{
     ComputedLayout, FileBrowser, FileBrowserAction, FuzzyFinder, InputRouter, Palette,
     PaletteEntry, PaneId, Rect as UiRect, RoutedInput, WorkspaceLayout, command_ids,
@@ -51,28 +53,38 @@ const APP_QUIT: &str = "app.quit";
 const MISE_RUN_TASK: &str = "mise.run_task";
 /// Command id for "open a file path from the terminal output".
 const TERMINAL_OPEN_PATH: &str = "terminal.open_path";
-/// Command id for "send the current editor file path to the terminal".
-const TERMINAL_SEND_CURRENT_FILE: &str = "terminal.send_current_file";
-/// Command id for "send the active editor selection to the terminal".
+/// Command id for "send the current file path to the terminal" (spec §17).
+const TERMINAL_SEND_FILE_PATH: &str = "terminal.send_file_path";
+/// Command id for "send the editor's visual selection to the terminal" (spec §17).
 const TERMINAL_SEND_SELECTION: &str = "terminal.send_selection";
-/// Command id for "run all tests".
+/// Command id for "run the project's mise `test` task" (spec §16).
 const TEST_RUN_ALL: &str = "test.run_all";
-/// Command id for "run tests for the active file".
+/// Command id for "run the `test` task targeting the current file" (spec §16).
 const TEST_RUN_CURRENT_FILE: &str = "test.run_current_file";
-/// Command id for "run the nearest test to the cursor".
+/// Command id for "run the `test` task targeting the nearest test" (spec §16).
 const TEST_RUN_NEAREST: &str = "test.run_nearest";
-/// Command id for "show recent key events".
+/// Command id for "summarise the recent key chord ring buffer" (spec §18.13).
 const DEBUG_SHOW_KEY_EVENTS: &str = "debug.show_key_events";
-/// Command id for "show recent command executions".
+/// Command id for "summarise the recent command dispatch log" (spec §18.13).
 const DEBUG_SHOW_COMMAND_LOG: &str = "debug.show_command_log";
-/// Command id for "show the current pane tree".
+/// Command id for "summarise the current pane tree" (spec §18.13).
 const DEBUG_SHOW_PANE_TREE: &str = "debug.show_pane_tree";
-/// Command id for "show project state".
+/// Command id for "summarise the project detection result" (spec §18.13).
 const DEBUG_SHOW_PROJECT_STATE: &str = "debug.show_project_state";
-/// Command id for "reload config".
+/// Command id for "reload the user config" (spec §18.13).
 const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
 
-const MAX_DEBUG_EVENTS: usize = 50;
+/// Name of the mise task cockpit invokes for the Test: * palette entries.
+/// Conventional default; M4 may make this configurable per project.
+const TEST_TASK: &str = "test";
+/// Status surfaced when the project has no `test` mise task wired up.
+const TEST_TASK_MISSING: &str = "No `test` mise task — add one to your mise.toml.";
+/// Cap on the diagnostics ring buffers (recent keys, recent commands).
+const DEBUG_LOG_SIZE: usize = 32;
+/// Hard cap on file size before cockpit will start a language server for it
+/// (spec §19 — never for huge files). 1 MiB matches the spec's "huge files"
+/// posture; anything bigger keeps the LSP path cold.
+const LSP_MAX_BYTES: usize = 1_048_576;
 
 /// What activating a palette entry does — the palette is reused as both the
 /// command palette and the mise-task picker.
@@ -84,19 +96,6 @@ enum PaletteMode {
     MiseTasks,
     /// Entries are `path:line:col` references opened in the editor.
     TerminalPaths,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TestScope {
-    All,
-    CurrentFile,
-    Nearest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DebugView {
-    title: String,
-    lines: Vec<String>,
 }
 
 /// The document open in the editor pane: an [`Editor`] plus its file path.
@@ -122,9 +121,17 @@ pub struct AppModel {
     terminal: Option<LiveTerminal>,
     redraw: Option<RedrawHandle>,
     cache_path: Option<PathBuf>,
-    key_events: Vec<String>,
-    command_log: Vec<String>,
-    debug_view: Option<DebugView>,
+    /// Most recent key chords, oldest first (spec §18.13 key event inspector).
+    key_log: VecDeque<String>,
+    /// Most recent command ids, oldest first (spec §18.13 command log).
+    command_log: VecDeque<String>,
+    /// Lazy per-language LSP clients (spec §19 / M3.5). Spawned on first
+    /// open of a relevant file; never started on app launch.
+    lsp_clients: HashMap<Language, LspClient>,
+    /// Languages whose servers have already received `initialize`/`initialized`.
+    lsp_initialized: HashSet<Language>,
+    /// Latest `publishDiagnostics` payload per file (spec §23 v0.4 / M4.1).
+    diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     exit: bool,
 }
 
@@ -136,7 +143,6 @@ impl AppModel {
     pub fn new(detection: ProjectDetection, tree: FileTree) -> Result<Self, String> {
         let router = InputRouter::from_global_keys(&GlobalKeys::default())
             .map_err(|err| format!("input router setup failed: {err:?}"))?;
-
         Ok(Self {
             browser: FileBrowser::new(tree),
             layout: WorkspaceLayout::new(),
@@ -151,20 +157,14 @@ impl AppModel {
             terminal: None,
             redraw: None,
             cache_path: None,
-            key_events: Vec::new(),
-            command_log: Vec::new(),
-            debug_view: None,
+            key_log: VecDeque::with_capacity(DEBUG_LOG_SIZE),
+            command_log: VecDeque::with_capacity(DEBUG_LOG_SIZE),
+            lsp_clients: HashMap::new(),
+            lsp_initialized: HashSet::new(),
+            diagnostics: HashMap::new(),
             exit: false,
             detection,
         })
-    }
-
-    /// Refresh best-effort Git badges for the file browser.
-    pub fn refresh_git_statuses(&mut self) {
-        match git_status(&self.detection.root_path) {
-            Ok(statuses) => self.browser.set_git_statuses(statuses),
-            Err(err) => tracing::debug!(error = %err, "failed to refresh git status badges"),
-        }
     }
 
     /// Resolve this project's cache file and restore persisted state from it
@@ -177,6 +177,14 @@ impl AppModel {
         let cache = ProjectCache::load(&path).unwrap_or_default();
         self.cache_path = Some(path);
         self.apply_cache(cache);
+    }
+
+    /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
+    /// out to `git status --porcelain`; no-ops when `git` is missing or the
+    /// project is not a git working tree.
+    pub fn refresh_git_status(&mut self) {
+        let statuses = cockpit_project::git_status(&self.detection.root_path);
+        self.browser.set_git_statuses(statuses);
     }
 
     /// Restore persisted pane widths and reopen the last active file.
@@ -257,6 +265,22 @@ impl AppModel {
         }
     }
 
+    /// Push a chord onto the recent-key ring buffer (spec §18.13).
+    fn record_key_event(&mut self, chord: &KeyChord) {
+        if self.key_log.len() == DEBUG_LOG_SIZE {
+            self.key_log.pop_front();
+        }
+        self.key_log.push_back(chord.to_string());
+    }
+
+    /// Push a command id onto the recent-command ring buffer (spec §18.13).
+    fn record_command(&mut self, id: &str) {
+        if self.command_log.len() == DEBUG_LOG_SIZE {
+            self.command_log.pop_front();
+        }
+        self.command_log.push_back(id.to_string());
+    }
+
     /// Apply a resolved global command.
     fn run_command(&mut self, id: &str) {
         self.record_command(id);
@@ -274,113 +298,18 @@ impl AppModel {
             command_ids::FUZZY_OPEN => self.open_finder(),
             MISE_RUN_TASK => self.open_mise_tasks(),
             TERMINAL_OPEN_PATH => self.open_terminal_paths(),
-            TERMINAL_SEND_CURRENT_FILE => self.send_current_file_to_terminal(),
+            TERMINAL_SEND_FILE_PATH => self.send_file_path_to_terminal(),
             TERMINAL_SEND_SELECTION => self.send_selection_to_terminal(),
-            TEST_RUN_ALL => self.run_test_command(TestScope::All),
-            TEST_RUN_CURRENT_FILE => self.run_test_command(TestScope::CurrentFile),
-            TEST_RUN_NEAREST => self.run_test_command(TestScope::Nearest),
-            DEBUG_SHOW_KEY_EVENTS => self.show_key_events(),
-            DEBUG_SHOW_COMMAND_LOG => self.show_command_log(),
-            DEBUG_SHOW_PANE_TREE => self.show_pane_tree(),
-            DEBUG_SHOW_PROJECT_STATE => self.show_project_state(),
-            DEBUG_RELOAD_CONFIG => self.reload_config(),
+            TEST_RUN_ALL => self.run_test_all(),
+            TEST_RUN_CURRENT_FILE => self.run_test_current_file(),
+            TEST_RUN_NEAREST => self.run_test_nearest(),
+            DEBUG_SHOW_KEY_EVENTS => self.debug_show_key_events(),
+            DEBUG_SHOW_COMMAND_LOG => self.debug_show_command_log(),
+            DEBUG_SHOW_PANE_TREE => self.debug_show_pane_tree(),
+            DEBUG_SHOW_PROJECT_STATE => self.debug_show_project_state(),
+            DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
-        }
-    }
-
-    fn record_key_event(&mut self, chord: &KeyChord) {
-        self.key_events.push(chord.to_string());
-        if self.key_events.len() > MAX_DEBUG_EVENTS {
-            self.key_events.remove(0);
-        }
-    }
-
-    fn record_command(&mut self, id: &str) {
-        self.command_log.push(id.to_string());
-        if self.command_log.len() > MAX_DEBUG_EVENTS {
-            self.command_log.remove(0);
-        }
-    }
-
-    fn set_debug_view(&mut self, title: impl Into<String>, lines: Vec<String>) {
-        self.debug_view = Some(DebugView {
-            title: title.into(),
-            lines,
-        });
-        self.layout.focus(PaneId::Editor);
-    }
-
-    fn show_key_events(&mut self) {
-        let lines = if self.key_events.is_empty() {
-            vec!["No key events recorded.".to_string()]
-        } else {
-            self.key_events
-                .iter()
-                .rev()
-                .map(|event| format!("key  {event}"))
-                .collect()
-        };
-        self.set_debug_view("Key Events", lines);
-        self.status = "Debug: showing key events.".to_string();
-    }
-
-    fn show_command_log(&mut self) {
-        let lines = if self.command_log.is_empty() {
-            vec!["No commands recorded.".to_string()]
-        } else {
-            self.command_log
-                .iter()
-                .rev()
-                .map(|command| format!("cmd  {command}"))
-                .collect()
-        };
-        self.set_debug_view("Command Log", lines);
-        self.status = "Debug: showing command log.".to_string();
-    }
-
-    fn show_pane_tree(&mut self) {
-        let prefs = self.layout.preferences();
-        let lines = vec![
-            format!("focus             {:?}", self.layout.focused()),
-            format!("files.visible     {}", prefs.files_visible),
-            format!("files.width       {}", prefs.left_width),
-            "editor.visible    true".to_string(),
-            format!("terminal.visible  {}", prefs.terminal_visible),
-            format!("terminal.width    {}", prefs.right_width),
-            format!("terminal.live     {}", self.terminal.is_some()),
-        ];
-        self.set_debug_view("Pane Tree", lines);
-        self.status = "Debug: showing pane tree.".to_string();
-    }
-
-    fn show_project_state(&mut self) {
-        let active_file = self
-            .document
-            .as_ref()
-            .map(|doc| doc.path.display().to_string())
-            .unwrap_or_else(|| "(none)".to_string());
-        let lines = vec![
-            format!("project       {}", self.detection.display_name),
-            format!("root          {}", self.detection.root_path.display()),
-            format!("strongest     {:?}", self.detection.strongest_signal),
-            format!("signals       {}", self.detection.signals.len()),
-            format!("mise.detected {}", self.detection.mise.detected),
-            format!("mise.tasks    {}", self.detection.mise.tasks.len()),
-            format!("active_file   {active_file}"),
-            format!("browser.rows  {}", self.browser.rows().len()),
-        ];
-        self.set_debug_view("Project State", lines);
-        self.status = "Debug: showing project state.".to_string();
-    }
-
-    fn reload_config(&mut self) {
-        match InputRouter::from_global_keys(&GlobalKeys::default()) {
-            Ok(router) => {
-                self.router = router;
-                self.status = "Config reloaded.".to_string();
-            }
-            Err(err) => self.status = format!("Config reload failed: {err:?}"),
         }
     }
 
@@ -429,66 +358,238 @@ impl AppModel {
         }
     }
 
-    fn run_test_command(&mut self, scope: TestScope) {
-        if !self
-            .detection
-            .mise
-            .tasks
-            .iter()
-            .any(|task| task.name == "test")
-        {
-            self.status = "No `test` mise task detected for this project.".to_string();
-            return;
-        }
-
-        let Some(command) = self.test_command(scope) else {
+    /// Paste the current file's path into the terminal prompt (spec §17). The
+    /// path is project-relative when possible, matching the `path:line:col`
+    /// form printed in terminal output.
+    fn send_file_path_to_terminal(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No file open to send.".to_string();
             return;
         };
-        self.send_bridge_input(
-            command.into_bytes(),
-            match scope {
-                TestScope::All => "Running all tests.".to_string(),
-                TestScope::CurrentFile => "Running tests for current file.".to_string(),
-                TestScope::Nearest => "Running nearest test.".to_string(),
+        let rendered = render_document_path(&doc.path, &self.detection.root_path);
+        let bytes = paste_to_terminal(&rendered);
+        let success = format!("Sent `{rendered}` to terminal.");
+        self.paste_into_terminal(&bytes, success);
+    }
+
+    /// Paste the editor's visual-mode selection into the terminal prompt (spec
+    /// §17). Reports a clear status when there is no document or no selection.
+    fn send_selection_to_terminal(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No file open to send a selection from.".to_string();
+            return;
+        };
+        let Some((start, end)) = doc.editor.selection() else {
+            self.status = "No selection — enter Visual mode and select first.".to_string();
+            return;
+        };
+        let text = doc.editor.buffer().slice(start..end);
+        let bytes = paste_to_terminal(&text);
+        let success = format!("Sent selection ({} bytes) to terminal.", text.len());
+        self.paste_into_terminal(&bytes, success);
+    }
+
+    /// Paste `bytes` into the terminal, starting one on demand and focusing the
+    /// terminal pane on success.
+    fn paste_into_terminal(&mut self, bytes: &[u8], success: String) {
+        self.ensure_terminal();
+        match self.terminal.as_mut() {
+            Some(terminal) => match terminal.send_input(bytes) {
+                Ok(()) => {
+                    self.layout.focus(PaneId::Terminal);
+                    self.status = success;
+                }
+                Err(err) => self.status = format!("Terminal write failed: {err}"),
             },
+            None => self.status = "Terminal unavailable.".to_string(),
+        }
+    }
+
+    /// Run `mise run test` for the whole project (spec §16 Test: Run All).
+    fn run_test_all(&mut self) {
+        if !self.has_test_task() {
+            self.status = TEST_TASK_MISSING.to_string();
+            return;
+        }
+        self.send_command_to_terminal(
+            &format!("mise run {TEST_TASK}"),
+            "Running `mise run test`.".to_string(),
         );
     }
 
-    fn test_command(&mut self, scope: TestScope) -> Option<String> {
-        match scope {
-            TestScope::All => Some("mise run test\r".to_string()),
-            TestScope::CurrentFile => {
-                let path = self.current_document_reference(None)?;
-                Some(format!("mise run test -- {}\r", shell_quote_arg(&path)))
+    /// Run `mise run test -- <file>` targeting the current document (spec §16
+    /// Test: Run Current File). Whether the file path is honoured depends on
+    /// the user's `test` task forwarding extra args (e.g. via `$@`).
+    fn run_test_current_file(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No file open to test.".to_string();
+            return;
+        };
+        if !self.has_test_task() {
+            self.status = TEST_TASK_MISSING.to_string();
+            return;
+        }
+        let path = render_document_path(&doc.path, &self.detection.root_path);
+        self.send_command_to_terminal(
+            &format!("mise run {TEST_TASK} -- {path}"),
+            format!("Running tests for `{path}`."),
+        );
+    }
+
+    /// Run `mise run test -- <name>` targeting the function declaration nearest
+    /// to the cursor (spec §16 Test: Run Nearest).
+    fn run_test_nearest(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No file open to test.".to_string();
+            return;
+        };
+        if !self.has_test_task() {
+            self.status = TEST_TASK_MISSING.to_string();
+            return;
+        }
+        let language = Language::from_path(&doc.path);
+        let cursor_byte = doc.editor.cursor().byte();
+        let Some(name) = nearest_test_name(doc.editor.buffer(), cursor_byte, language) else {
+            self.status = "No nearby test function found.".to_string();
+            return;
+        };
+        self.send_command_to_terminal(
+            &format!("mise run {TEST_TASK} -- {name}"),
+            format!("Running test `{name}`."),
+        );
+    }
+
+    /// True when the detected project defines a [`TEST_TASK`] mise task.
+    fn has_test_task(&self) -> bool {
+        self.detection
+            .mise
+            .tasks
+            .iter()
+            .any(|task| task.name == TEST_TASK)
+    }
+
+    /// Type `command\r` into the terminal — start one on demand, focus it on
+    /// success, and report status either way. Used by the Test: * commands.
+    fn send_command_to_terminal(&mut self, command: &str, success: String) {
+        self.ensure_terminal();
+        let line = format!("{command}\r");
+        match self.terminal.as_mut() {
+            Some(terminal) => match terminal.send_input(line.as_bytes()) {
+                Ok(()) => {
+                    self.layout.focus(PaneId::Terminal);
+                    self.status = success;
+                }
+                Err(err) => self.status = format!("Terminal write failed: {err}"),
+            },
+            None => self.status = "Terminal unavailable.".to_string(),
+        }
+    }
+
+    /// Surface the recent key-chord buffer in the status line and tracing log.
+    fn debug_show_key_events(&mut self) {
+        let recent = self.recent_keys_summary();
+        tracing::info!(keys = %recent, "debug: show key events");
+        self.status = format!("Key events: {recent}");
+    }
+
+    /// Surface the recent command-dispatch log in the status line and tracing.
+    fn debug_show_command_log(&mut self) {
+        let recent = self.recent_commands_summary();
+        tracing::info!(commands = %recent, "debug: show command log");
+        self.status = format!("Commands: {recent}");
+    }
+
+    /// Surface the current pane tree (focus, dimensions, terminal state).
+    fn debug_show_pane_tree(&mut self) {
+        let summary = self.pane_tree_summary();
+        tracing::info!(panes = %summary, "debug: show pane tree");
+        self.status = format!("Panes: {summary}");
+    }
+
+    /// Surface the project detection result: name, signals, mise contents.
+    fn debug_show_project_state(&mut self) {
+        let summary = self.project_state_summary();
+        tracing::info!(project = %summary, "debug: show project state");
+        self.status = format!("Project: {summary}");
+    }
+
+    /// Re-apply the default config to the input router. A real user-config
+    /// load path lands later; for now this exercises the reload code path so
+    /// keybinding changes from a future config edit can be wired through here.
+    fn debug_reload_config(&mut self) {
+        match InputRouter::from_global_keys(&GlobalKeys::default()) {
+            Ok(router) => {
+                self.router = router;
+                tracing::info!("debug: reload config — defaults restored");
+                self.status =
+                    "Config reloaded (defaults — user-config wiring lands later).".to_string();
             }
-            TestScope::Nearest => {
-                let Some(document) = self.document.as_ref() else {
-                    self.status = "No open file for nearest test.".to_string();
-                    return None;
-                };
-                let (line, _) = document.editor.cursor().line_col(document.editor.buffer());
-                let path = self.current_document_reference(Some(line + 1))?;
-                Some(format!("mise run test -- {}\r", shell_quote_arg(&path)))
+            Err(err) => {
+                tracing::warn!(?err, "debug: reload config failed");
+                self.status = format!("Config reload failed: {err:?}");
             }
         }
     }
 
-    fn current_document_reference(&mut self, line: Option<usize>) -> Option<String> {
-        let Some(document) = self.document.as_ref() else {
-            self.status = "No open file for test command.".to_string();
-            return None;
-        };
-        let mut reference = document
-            .path
-            .strip_prefix(&self.detection.root_path)
-            .unwrap_or(&document.path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if let Some(line) = line {
-            reference.push(':');
-            reference.push_str(&line.to_string());
+    fn recent_keys_summary(&self) -> String {
+        if self.key_log.is_empty() {
+            return "<none>".to_string();
         }
-        Some(reference)
+        self.key_log.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+
+    fn recent_commands_summary(&self) -> String {
+        if self.command_log.is_empty() {
+            return "<none>".to_string();
+        }
+        self.command_log
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn pane_tree_summary(&self) -> String {
+        let prefs = self.layout.preferences();
+        let focused = self.layout.focused();
+        let term = match &self.terminal {
+            Some(_) => "spawned",
+            None => "none",
+        };
+        format!(
+            "files={}px, terminal={}px, focused={:?}, terminal_proc={term}",
+            prefs.left_width, prefs.right_width, focused,
+        )
+    }
+
+    fn project_state_summary(&self) -> String {
+        let signals = self
+            .detection
+            .signals
+            .iter()
+            .map(|signal| format!("{:?}", signal.kind))
+            .collect::<Vec<_>>()
+            .join("/");
+        let mise = &self.detection.mise;
+        let mise_state = if mise.detected {
+            format!(
+                "mise[{}tasks, {}tools, available={}]",
+                mise.tasks.len(),
+                mise.tools.len(),
+                mise.available,
+            )
+        } else {
+            "no mise".to_string()
+        };
+        format!(
+            "name=`{}`, signals=[{}], {mise_state}",
+            self.detection.display_name,
+            if signals.is_empty() {
+                "—".to_string()
+            } else {
+                signals
+            },
+        )
     }
 
     /// Scan the terminal's visible output for file references (spec §17). With
@@ -535,54 +636,6 @@ impl AppModel {
             return;
         }
         self.open_document_at(path, path_match.line, path_match.column);
-    }
-
-    fn send_current_file_to_terminal(&mut self) {
-        let Some(document) = self.document.as_ref() else {
-            self.status = "No open file to send to the terminal.".to_string();
-            return;
-        };
-        let display_path = document
-            .path
-            .strip_prefix(&self.detection.root_path)
-            .unwrap_or(&document.path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let input = terminal_input_for_path(&display_path);
-        self.send_bridge_input(input, format!("Sent `{display_path}` to terminal."));
-    }
-
-    fn send_selection_to_terminal(&mut self) {
-        let Some(document) = self.document.as_ref() else {
-            self.status = "No open file selection to send to the terminal.".to_string();
-            return;
-        };
-        let Some((start, end)) = document.editor.selection() else {
-            self.status = "No active editor selection to send to the terminal.".to_string();
-            return;
-        };
-        let selected = document.editor.buffer().slice(start..end);
-        if selected.trim().is_empty() {
-            self.status = "Editor selection is empty.".to_string();
-            return;
-        }
-        let input = terminal_input_for_selection(&selected);
-        self.send_bridge_input(input, "Sent selection to terminal.".to_string());
-    }
-
-    fn send_bridge_input(&mut self, input: Vec<u8>, success: String) {
-        self.ensure_terminal();
-        let Some(terminal) = self.terminal.as_mut() else {
-            self.status = "Cannot send to terminal — terminal unavailable.".to_string();
-            return;
-        };
-        match terminal.send_input(&input) {
-            Ok(()) => {
-                self.layout.focus(PaneId::Terminal);
-                self.status = success;
-            }
-            Err(err) => self.status = format!("Terminal write failed: {err}"),
-        }
     }
 
     /// Open `path`, then place the cursor at a 1-based `line`/`column` when the
@@ -717,6 +770,27 @@ impl AppModel {
         }
     }
 
+    /// Resolve the optional per-project Zellij layout file (spec §9 / §10 v0.3).
+    /// Returns the absolute path on a successful KDL parse; surfaces a status
+    /// warning and falls back to no-layout on read/parse errors so a broken
+    /// layout never blocks the terminal from launching.
+    fn resolve_zellij_layout(&mut self) -> Option<PathBuf> {
+        let configured = self
+            .detection
+            .mise
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.zellij_layout.as_deref())?;
+        let absolute = self.detection.root_path.join(configured);
+        match ZellijLayout::load(&absolute) {
+            Ok(layout) => Some(layout.path),
+            Err(err) => {
+                self.status = format!("Zellij layout {} ignored: {err}", configured.display(),);
+                None
+            }
+        }
+    }
+
     /// Spawn the terminal session on first use of the terminal pane.
     fn ensure_terminal(&mut self) {
         if self.terminal.is_some() {
@@ -726,15 +800,21 @@ impl AppModel {
             self.status = "Terminal unavailable — no redraw handle.".to_string();
             return;
         };
-        let layout = self.configured_zellij_layout();
+        let layout = self.resolve_zellij_layout();
         let plan = plan_launch(
             &self.detection.display_name,
-            layout.as_ref(),
+            layout.as_deref(),
             &PathBinaryLookup,
             ShellProfile::host_default(),
         );
         let (command, label) = match plan {
-            LaunchPlan::Zellij(command) => (command, "zellij".to_string()),
+            LaunchPlan::Zellij(command) => {
+                let label = match layout.as_deref() {
+                    Some(path) => format!("zellij ({})", path.display()),
+                    None => "zellij".to_string(),
+                };
+                (command, label)
+            }
             LaunchPlan::Fallback { command, reason } => (command, format!("shell — {reason:?}")),
         };
         let wake: WakeFn = Box::new(move || redraw.request());
@@ -744,27 +824,6 @@ impl AppModel {
                 self.status = format!("Terminal started ({label}).");
             }
             Err(err) => self.status = format!("Terminal failed to start: {err}"),
-        }
-    }
-
-    fn configured_zellij_layout(&mut self) -> Option<ZellijLayout> {
-        let layout_path = self
-            .detection
-            .mise
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.zellij_layout.as_ref())?;
-        let path = if layout_path.is_absolute() {
-            layout_path.clone()
-        } else {
-            self.detection.root_path.join(layout_path)
-        };
-        match ZellijLayout::load(&path) {
-            Ok(layout) => Some(layout),
-            Err(err) => {
-                self.status = format!("Ignoring invalid Zellij layout {}: {err}", path.display());
-                None
-            }
         }
     }
 
@@ -846,10 +905,93 @@ impl AppModel {
                 let mut editor = Editor::new(&content);
                 editor.set_language(Language::from_path(&path));
                 self.document = Some(OpenDocument { editor, path, name });
-                self.debug_view = None;
                 self.layout.focus(PaneId::Editor);
+                self.start_lsp_for_document();
             }
             Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
+        }
+    }
+
+    /// Lazily spawn (and `initialize` / `didOpen`) the LSP client for the
+    /// document just opened. Spec §19 hard rules apply: never on launch, only
+    /// when a relevant file opens, never blocking, never for huge files,
+    /// servers launched via `mise exec` so we never bypass the project env.
+    fn start_lsp_for_document(&mut self) {
+        let (path, language, text) = {
+            let Some(doc) = self.document.as_ref() else {
+                return;
+            };
+            let Some(language) = Language::from_path(&doc.path) else {
+                return;
+            };
+            let size = doc.editor.buffer().len_bytes();
+            if size > LSP_MAX_BYTES {
+                tracing::info!(
+                    ?language,
+                    size,
+                    "LSP skipped: file exceeds size cap (spec §19)",
+                );
+                return;
+            }
+            (doc.path.clone(), language, doc.editor.buffer().text())
+        };
+        let Some(config) = ServerConfig::for_language(language) else {
+            return;
+        };
+
+        if !self.lsp_clients.contains_key(&language) {
+            let argv = lsp_launch_argv(&config);
+            let (program, args) = argv
+                .split_first()
+                .expect("lsp_launch_argv always returns a non-empty argv");
+            match LspClient::spawn(program, args, Some(&self.detection.root_path)) {
+                Ok(client) => {
+                    tracing::info!(?language, command = %config.command, "LSP client spawned");
+                    self.lsp_clients.insert(language, client);
+                }
+                Err(err) => {
+                    tracing::warn!(?err, ?language, "LSP spawn failed — continuing without it");
+                    return;
+                }
+            }
+        }
+        let client = self
+            .lsp_clients
+            .get(&language)
+            .expect("client inserted above");
+
+        if !self.lsp_initialized.contains(&language) {
+            let root_uri = file_uri(&self.detection.root_path);
+            let init_params = serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "cockpit",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            });
+            if let Err(err) = client.request("initialize", init_params) {
+                tracing::warn!(?err, "LSP initialize request failed to queue");
+                return;
+            }
+            if let Err(err) = client.notify("initialized", serde_json::json!({})) {
+                tracing::warn!(?err, "LSP initialized notification failed to queue");
+                return;
+            }
+            self.lsp_initialized.insert(language);
+        }
+
+        let didopen_params = serde_json::json!({
+            "textDocument": {
+                "uri": file_uri(&path),
+                "languageId": config.language_id(),
+                "version": 1,
+                "text": text,
+            }
+        });
+        if let Err(err) = client.notify("textDocument/didOpen", didopen_params) {
+            tracing::warn!(?err, "LSP textDocument/didOpen failed to queue");
         }
     }
 
@@ -874,8 +1016,74 @@ impl AppModel {
         self.status = "Document closed.".to_string();
     }
 
+    /// Drain every queued LSP message and apply it to model state. Cheap when
+    /// quiescent (a few `try_recv`s) so it is safe to call once per frame.
+    fn drain_lsp_messages(&mut self) {
+        let mut messages: Vec<RecvMessage> = Vec::new();
+        for client in self.lsp_clients.values() {
+            while let Some(message) = client.try_recv() {
+                messages.push(message);
+            }
+        }
+        for message in messages {
+            self.handle_lsp_message(message);
+        }
+    }
+
+    /// Dispatch one inbound LSP message into the right place in the model.
+    fn handle_lsp_message(&mut self, message: RecvMessage) {
+        match message {
+            RecvMessage::ServerNotification { method, params }
+                if method == "textDocument/publishDiagnostics" =>
+            {
+                match serde_json::from_value::<PublishDiagnosticsParams>(params) {
+                    Ok(parsed) => self.apply_publish_diagnostics(parsed),
+                    Err(err) => {
+                        tracing::warn!(?err, "publishDiagnostics: failed to parse params");
+                    }
+                }
+            }
+            RecvMessage::ServerNotification { method, .. } => {
+                tracing::trace!(method = %method, "LSP notification");
+            }
+            RecvMessage::Response(response) => {
+                if let Some(error) = &response.error {
+                    tracing::warn!(?response.id, code = error.code, message = %error.message, "LSP error response");
+                } else {
+                    tracing::trace!(?response.id, "LSP response");
+                }
+            }
+            RecvMessage::ServerRequest { id, method, .. } => {
+                tracing::debug!(id, method = %method, "LSP server request (ignored — M4.x will route)");
+            }
+            RecvMessage::Decode { error, .. } => {
+                tracing::warn!(error = %error, "LSP decode failed");
+            }
+        }
+    }
+
+    /// Replace the stored diagnostics for the URI in `params`. An empty list
+    /// clears the slot so badges disappear once the server clears them.
+    fn apply_publish_diagnostics(&mut self, params: PublishDiagnosticsParams) {
+        let Some(path) = path_from_file_uri(params.uri.as_str()) else {
+            tracing::warn!(uri = %params.uri.as_str(), "publishDiagnostics: URI is not a file://");
+            return;
+        };
+        if params.diagnostics.is_empty() {
+            self.diagnostics.remove(&path);
+        } else {
+            self.diagnostics.insert(path, params.diagnostics);
+        }
+    }
+
+    /// Diagnostics currently attached to `path`, in document order.
+    fn diagnostics_for(&self, path: &Path) -> &[Diagnostic] {
+        self.diagnostics.get(path).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Paint the whole window for one frame.
     pub fn paint(&mut self, painter: &mut Painter, viewport: Viewport) {
+        self.drain_lsp_messages();
         let scale = viewport.scale.max(0.5);
         let width = viewport.width as f32 / scale;
         let height = viewport.height as f32 / scale;
@@ -984,6 +1192,7 @@ impl AppModel {
                 (FileNodeKind::Directory, false) => "> ",
                 (FileNodeKind::File, _) => "  ",
             };
+            let badge = row.git_status.map(|status| status.badge()).unwrap_or(' ');
             let text_x = content.x + PAD + row.depth as f32 * INDENT_W;
             let color = if row.is_dir() {
                 self.theme.text
@@ -993,11 +1202,7 @@ impl AppModel {
             canvas.text(
                 text_x,
                 row_y + 3.0,
-                format!(
-                    "{marker}{}{}",
-                    row.name,
-                    row.git_status.map(git_badge).unwrap_or("")
-                ),
+                format!("{badge} {marker}{}", row.name),
                 color,
                 FONT,
             );
@@ -1005,44 +1210,15 @@ impl AppModel {
     }
 
     fn paint_editor(&self, canvas: &mut Canvas<'_>, rect: UiRect, focused: bool) {
-        let title = if let Some(debug) = &self.debug_view {
-            format!("DEBUG  ·  {}", debug.title)
-        } else {
-            match &self.document {
-                Some(doc) => format!("EDITOR  ·  {}", doc.name),
-                None => "EDITOR".to_string(),
-            }
+        let title = match &self.document {
+            Some(doc) => format!("EDITOR  ·  {}", doc.name),
+            None => "EDITOR".to_string(),
         };
         let content = self.paint_pane(canvas, rect, &title, focused);
-
-        if let Some(debug) = &self.debug_view {
-            self.paint_debug_view(canvas, &content, debug);
-            return;
-        }
 
         match &self.document {
             Some(doc) => self.paint_document(canvas, &content, doc),
             None => self.paint_welcome(canvas, &content),
-        }
-    }
-
-    fn paint_debug_view(&self, canvas: &mut Canvas<'_>, content: &ContentRect, debug: &DebugView) {
-        let top = content.y + PAD;
-        canvas.text(
-            content.x + PAD,
-            top + 3.0,
-            debug.title.clone(),
-            self.theme.text,
-            FONT,
-        );
-        for (index, line) in debug.lines.iter().take(40).enumerate() {
-            canvas.text(
-                content.x + PAD,
-                top + (index + 2) as f32 * ROW_H + 3.0,
-                line.clone(),
-                self.theme.muted_text,
-                FONT - 1.0,
-            );
         }
     }
 
@@ -1060,6 +1236,15 @@ impl AppModel {
         let lines: Vec<&str> = text.split('\n').collect();
         let top = content.y + PAD * 0.5;
         let char_w = FONT * CHAR_W_RATIO;
+
+        // Diagnostics keyed by starting line for cheap per-row lookup.
+        let mut diagnostics_by_line: HashMap<u32, Vec<&Diagnostic>> = HashMap::new();
+        for diagnostic in self.diagnostics_for(&doc.path) {
+            diagnostics_by_line
+                .entry(diagnostic.range.start.line)
+                .or_default()
+                .push(diagnostic);
+        }
 
         if let Some((sel_start, sel_end)) = editor.selection() {
             for row in 0..visible {
@@ -1105,6 +1290,36 @@ impl AppModel {
                 self.theme.muted_text,
                 FONT,
             );
+
+            // Diagnostic marker + inline message for this line, if any.
+            if let Some(diagnostics) = diagnostics_by_line.get(&(line_index as u32))
+                && let Some(strongest) = diagnostics
+                    .iter()
+                    .min_by_key(|d| d.severity.unwrap_or(cockpit_lsp::DiagnosticSeverity::ERROR))
+            {
+                let color = self.diagnostic_color(strongest.severity);
+                canvas.rect(
+                    content.x + GUTTER_W - 6.0,
+                    line_y - 3.0,
+                    3.0,
+                    ROW_H - 2.0,
+                    color,
+                );
+                let line_pixel_width = line.chars().count() as f32 * char_w;
+                let mut message = strongest.message.lines().next().unwrap_or("").to_string();
+                let max_chars = 80;
+                if message.chars().count() > max_chars {
+                    message = message.chars().take(max_chars).collect::<String>() + "…";
+                }
+                canvas.text(
+                    content.x + GUTTER_W + line_pixel_width + PAD * 2.0,
+                    line_y,
+                    message,
+                    color,
+                    FONT - 1.0,
+                );
+            }
+
             self.paint_code_line(
                 canvas,
                 content.x + GUTTER_W,
@@ -1210,6 +1425,15 @@ impl AppModel {
             HighlightKind::Operator => syntax.operator,
             HighlightKind::Attribute => syntax.attribute,
             HighlightKind::Punctuation => syntax.punctuation,
+        }
+    }
+
+    fn diagnostic_color(&self, severity: Option<DiagnosticSeverity>) -> Color {
+        match severity {
+            Some(s) if s == DiagnosticSeverity::WARNING => self.theme.diagnostic_warning,
+            Some(s) if s == DiagnosticSeverity::INFORMATION => self.theme.diagnostic_info,
+            Some(s) if s == DiagnosticSeverity::HINT => self.theme.diagnostic_hint,
+            _ => self.theme.diagnostic_error,
         }
     }
 
@@ -1409,18 +1633,6 @@ struct ContentRect {
     h: f32,
 }
 
-fn git_badge(status: GitFileStatus) -> &'static str {
-    match status {
-        GitFileStatus::Modified => " [M]",
-        GitFileStatus::Added => " [A]",
-        GitFileStatus::Deleted => " [D]",
-        GitFileStatus::Renamed => " [R]",
-        GitFileStatus::Untracked => " [?]",
-        GitFileStatus::Conflicted => " [!]",
-        GitFileStatus::Ignored => " [I]",
-    }
-}
-
 /// Painter wrapper that scales logical coordinates to physical pixels.
 struct Canvas<'p> {
     painter: &'p mut Painter,
@@ -1561,6 +1773,46 @@ fn chord_to_terminal_bytes(chord: &KeyChord) -> Option<Vec<u8>> {
     }
 }
 
+/// Build the spawn argv for `config`'s language server, wrapping it in
+/// `mise exec --` so every server inherits the project's mise environment
+/// (spec §19 / M4.5). Result: `["mise", "exec", "--", <command>, <args>...]`.
+fn lsp_launch_argv(config: &ServerConfig) -> Vec<String> {
+    let inner: Vec<&str> = std::iter::once(config.command.as_str())
+        .chain(config.args.iter().map(String::as_str))
+        .collect();
+    mise_exec_command(&inner)
+}
+
+/// Format `path` as an LSP `file://` URI. The path is treated as absolute;
+/// callers above resolve project-relative paths against the project root.
+fn file_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if cfg!(windows) {
+        let normalised = raw.replace('\\', "/");
+        if normalised.starts_with('/') {
+            format!("file://{normalised}")
+        } else {
+            format!("file:///{normalised}")
+        }
+    } else {
+        format!("file://{raw}")
+    }
+}
+
+/// Inverse of [`file_uri`] — pull a [`PathBuf`] out of a `file://` URI.
+/// Returns `None` when the URI is not a file scheme cockpit can reverse.
+fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let trimmed = uri.strip_prefix("file://")?;
+    if cfg!(windows) {
+        // Windows file URIs round-trip as `file:///C:/...` — strip the leading
+        // slash and put backslashes back.
+        let body = trimmed.strip_prefix('/').unwrap_or(trimmed);
+        Some(PathBuf::from(body.replace('/', "\\")))
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
 /// The command palette's v0.1 command set (spec §16).
 fn palette_entries() -> Vec<PaletteEntry> {
     vec![
@@ -1573,7 +1825,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(command_ids::TOGGLE_TERMINAL, "View: Toggle Terminal Pane"),
         PaletteEntry::new(MISE_RUN_TASK, "Mise: Run Task"),
         PaletteEntry::new(TERMINAL_OPEN_PATH, "Terminal: Open Path"),
-        PaletteEntry::new(TERMINAL_SEND_CURRENT_FILE, "Terminal: Send Current File"),
+        PaletteEntry::new(TERMINAL_SEND_FILE_PATH, "Terminal: Send Current File Path"),
         PaletteEntry::new(TERMINAL_SEND_SELECTION, "Terminal: Send Selection"),
         PaletteEntry::new(TEST_RUN_ALL, "Test: Run All"),
         PaletteEntry::new(TEST_RUN_CURRENT_FILE, "Test: Run Current File"),
@@ -1848,76 +2100,45 @@ mod tests {
     }
 
     #[test]
-    fn send_current_file_without_a_terminal_is_a_safe_no_op() {
-        let (mut model, _dir) = open_temp_doc("hello");
-
-        model.send_current_file_to_terminal();
-
-        assert!(model.terminal.is_none());
-        assert!(
-            model.status.contains("terminal unavailable"),
-            "status: {}",
-            model.status
-        );
-    }
-
-    #[test]
-    fn send_selection_requires_an_active_selection() {
-        let (mut model, _dir) = open_temp_doc("echo hi");
-
-        model.send_selection_to_terminal();
-
-        assert!(
-            model.status.contains("No active editor selection"),
-            "status: {}",
-            model.status
-        );
-    }
-
-    #[test]
-    fn send_selection_without_a_terminal_is_a_safe_no_op() {
-        let (mut model, _dir) = open_temp_doc("echo hi");
-        model.dispatch(chord("v"));
-        model.dispatch(chord("l"));
-        model.dispatch(chord("l"));
-
-        model.send_selection_to_terminal();
-
-        assert!(model.terminal.is_none());
-        assert!(
-            model.status.contains("terminal unavailable"),
-            "status: {}",
-            model.status
-        );
-    }
-
-    #[test]
-    fn test_commands_build_mise_test_invocations() {
-        let mut model = mise_model();
-        model.open_document_at(
-            model.detection.root_path.join("src/main.rs"),
-            Some(1),
-            Some(1),
-        );
-        assert_eq!(
-            model.test_command(TestScope::All),
-            Some("mise run test\r".to_string())
-        );
-        assert_eq!(
-            model.test_command(TestScope::CurrentFile),
-            Some("mise run test -- 'src/main.rs'\r".to_string())
-        );
-        assert_eq!(
-            model.test_command(TestScope::Nearest),
-            Some("mise run test -- 'src/main.rs:1'\r".to_string())
-        );
-    }
-
-    #[test]
-    fn test_command_requires_a_mise_test_task() {
+    fn send_file_path_without_a_document_reports_it() {
         let mut model = rust_model();
-        model.run_test_command(TestScope::All);
+        model.send_file_path_to_terminal();
+        assert!(
+            model.status.contains("No file open"),
+            "status: {}",
+            model.status
+        );
+    }
 
+    #[test]
+    fn send_selection_without_a_document_reports_it() {
+        let mut model = rust_model();
+        model.send_selection_to_terminal();
+        assert!(
+            model.status.contains("No file open"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn send_selection_without_a_visual_selection_reports_it() {
+        let mut model = rust_model();
+        model.open_path_reference("src/main.rs");
+        assert!(model.document.is_some(), "fixture file should open");
+
+        model.send_selection_to_terminal();
+        assert!(
+            model.status.contains("No selection"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn run_test_all_requires_a_test_mise_task() {
+        let mut model = rust_model();
+        model.run_test_all();
         assert!(
             model.status.contains("No `test` mise task"),
             "status: {}",
@@ -1926,14 +2147,187 @@ mod tests {
     }
 
     #[test]
-    fn test_current_file_requires_an_open_document() {
+    fn run_test_current_file_requires_a_document() {
         let mut model = mise_model();
-        assert_eq!(model.test_command(TestScope::CurrentFile), None);
+        model.run_test_current_file();
         assert!(
-            model.status.contains("No open file"),
+            model.status.contains("No file open"),
             "status: {}",
             model.status
         );
+    }
+
+    #[test]
+    fn run_test_nearest_requires_a_document() {
+        let mut model = mise_model();
+        model.run_test_nearest();
+        assert!(
+            model.status.contains("No file open"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn dispatch_records_each_chord_in_the_key_log() {
+        let mut model = model();
+        model.dispatch(chord("j"));
+        model.dispatch(chord("k"));
+        model.dispatch(chord("Ctrl+h"));
+        let recent: Vec<&str> = model.key_log.iter().map(String::as_str).collect();
+        assert_eq!(recent, vec!["j", "k", "Ctrl+h"]);
+    }
+
+    #[test]
+    fn key_log_is_a_bounded_ring_buffer() {
+        let mut model = model();
+        for _ in 0..(DEBUG_LOG_SIZE + 5) {
+            model.dispatch(chord("j"));
+        }
+        assert_eq!(model.key_log.len(), DEBUG_LOG_SIZE);
+    }
+
+    #[test]
+    fn debug_show_key_events_summarises_the_ring_buffer() {
+        let mut model = model();
+        model.dispatch(chord("j"));
+        model.dispatch(chord("k"));
+        model.debug_show_key_events();
+        assert!(
+            model.status.contains("Key events: j, k"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn debug_show_project_state_includes_signals_and_mise() {
+        let mut model = mise_model();
+        model.debug_show_project_state();
+        assert!(
+            model.status.contains("mise-basic"),
+            "status: {}",
+            model.status,
+        );
+        assert!(model.status.contains("mise["), "status: {}", model.status,);
+    }
+
+    #[test]
+    fn debug_reload_config_restores_default_keybindings() {
+        let mut model = model();
+        model.debug_reload_config();
+        assert!(
+            model.status.starts_with("Config reloaded"),
+            "status: {}",
+            model.status,
+        );
+    }
+
+    #[test]
+    fn file_uri_and_path_round_trip() {
+        let path = PathBuf::from(if cfg!(windows) {
+            "C:\\code\\proj\\src\\main.rs"
+        } else {
+            "/code/proj/src/main.rs"
+        });
+        let uri = file_uri(&path);
+        assert_eq!(path_from_file_uri(&uri), Some(path));
+    }
+
+    #[test]
+    fn apply_publish_diagnostics_stores_diagnostics_for_path() {
+        let mut model = rust_model();
+        let path = if cfg!(windows) {
+            "C:/code/main.rs"
+        } else {
+            "/code/main.rs"
+        };
+        let params: PublishDiagnosticsParams = serde_json::from_value(serde_json::json!({
+            "uri": format!("file://{}{}", if cfg!(windows) { "/" } else { "" }, path),
+            "diagnostics": [
+                {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                    "severity": 1,
+                    "message": "expected `;`"
+                },
+                {
+                    "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 8}},
+                    "severity": 2,
+                    "message": "unused variable"
+                }
+            ]
+        }))
+        .unwrap();
+
+        model.apply_publish_diagnostics(params);
+
+        let expected = PathBuf::from(if cfg!(windows) {
+            "C:\\code\\main.rs"
+        } else {
+            "/code/main.rs"
+        });
+        let stored = model.diagnostics_for(&expected);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].message, "expected `;`");
+        assert_eq!(stored[1].message, "unused variable");
+    }
+
+    #[test]
+    fn apply_publish_diagnostics_clears_on_empty_list() {
+        let mut model = rust_model();
+        let uri_prefix = if cfg!(windows) { "file:///" } else { "file://" };
+        let path_str = if cfg!(windows) { "C:/x.rs" } else { "/x.rs" };
+        let with_diags: PublishDiagnosticsParams = serde_json::from_value(serde_json::json!({
+            "uri": format!("{uri_prefix}{path_str}"),
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "message": "bad"
+            }]
+        }))
+        .unwrap();
+        model.apply_publish_diagnostics(with_diags);
+        let expected = PathBuf::from(if cfg!(windows) { "C:\\x.rs" } else { "/x.rs" });
+        assert_eq!(model.diagnostics_for(&expected).len(), 1);
+
+        let cleared: PublishDiagnosticsParams = serde_json::from_value(serde_json::json!({
+            "uri": format!("{uri_prefix}{path_str}"),
+            "diagnostics": []
+        }))
+        .unwrap();
+        model.apply_publish_diagnostics(cleared);
+        assert!(model.diagnostics_for(&expected).is_empty());
+    }
+
+    #[test]
+    fn lsp_servers_launch_via_mise_exec() {
+        let config = ServerConfig::for_language(Language::Rust).expect("rust-analyzer config");
+        let argv = lsp_launch_argv(&config);
+        assert_eq!(&argv[..3], &["mise", "exec", "--"]);
+        assert_eq!(argv[3], "rust-analyzer");
+        assert_eq!(argv.len(), 4, "no extra args today: argv was {argv:?}",);
+    }
+
+    #[test]
+    fn diagnostic_color_picks_per_severity() {
+        let model = rust_model();
+        assert_eq!(
+            model.diagnostic_color(Some(DiagnosticSeverity::ERROR)),
+            model.theme.diagnostic_error,
+        );
+        assert_eq!(
+            model.diagnostic_color(Some(DiagnosticSeverity::WARNING)),
+            model.theme.diagnostic_warning,
+        );
+        assert_eq!(
+            model.diagnostic_color(Some(DiagnosticSeverity::INFORMATION)),
+            model.theme.diagnostic_info,
+        );
+        assert_eq!(
+            model.diagnostic_color(Some(DiagnosticSeverity::HINT)),
+            model.theme.diagnostic_hint,
+        );
+        // Missing severity defaults to error (matching VS Code / rust-analyzer).
+        assert_eq!(model.diagnostic_color(None), model.theme.diagnostic_error,);
     }
 
     #[test]
@@ -2283,68 +2677,142 @@ mod tests {
         assert_eq!(cache.left_width, Some(260));
         assert_eq!(cache.right_width, Some(480));
     }
+}
 
-    #[test]
-    fn debug_commands_show_key_command_pane_and_project_state() {
-        let mut model = rust_model();
-        model.dispatch(chord("Ctrl+h"));
-        model.dispatch(chord("Ctrl+j"));
+/// UI smoke tests (spec §18.8 / M3.6).
+///
+/// Asserts on the headless `cockpit-ui` view-model tree rather than pixels —
+/// the spec is explicit that pixel-level coverage is out of scope. Gated
+/// behind the `ui-smoke` Cargo feature so they stay out of the default test
+/// run; CI has a dedicated `ui-smoke` leg that enables them.
+#[cfg(all(test, feature = "ui-smoke"))]
+mod ui_smoke {
+    use super::*;
+    use cockpit_project::{detect_project, recent_projects_path};
+    use cockpit_testkit::fixture_path;
+    use cockpit_ui::{Launcher, LauncherAction, LauncherSelection, RecentProject};
 
-        model.run_command(DEBUG_SHOW_KEY_EVENTS);
-        let debug = model.debug_view.as_ref().unwrap();
-        assert_eq!(debug.title, "Key Events");
-        assert!(debug.lines.iter().any(|line| line.contains("Ctrl+h")));
-
-        model.run_command(DEBUG_SHOW_COMMAND_LOG);
-        let debug = model.debug_view.as_ref().unwrap();
-        assert_eq!(debug.title, "Command Log");
-        assert!(
-            debug
-                .lines
-                .iter()
-                .any(|line| line.contains(DEBUG_SHOW_COMMAND_LOG))
-        );
-
-        model.run_command(DEBUG_SHOW_PANE_TREE);
-        let debug = model.debug_view.as_ref().unwrap();
-        assert_eq!(debug.title, "Pane Tree");
-        assert!(debug.lines.iter().any(|line| line.contains("focus")));
-
-        model.run_command(DEBUG_SHOW_PROJECT_STATE);
-        let debug = model.debug_view.as_ref().unwrap();
-        assert_eq!(debug.title, "Project State");
-        assert!(debug.lines.iter().any(|line| line.contains("rust-basic")));
-
-        model.run_command(DEBUG_RELOAD_CONFIG);
-        assert_eq!(model.status, "Config reloaded.");
+    /// Build an `AppModel` over the `rust-basic` fixture — the canonical
+    /// smoke-test project (it has a Cargo.toml and `src/main.rs`).
+    fn smoke_model() -> AppModel {
+        let path = fixture_path("rust-basic");
+        let detection = detect_project(&path).expect("detect rust-basic fixture");
+        let tree = FileTree::load(&path).expect("load rust-basic fixture");
+        AppModel::new(detection, tree).expect("build AppModel")
     }
 
-    #[cfg(feature = "ui-smoke")]
     #[test]
-    fn ui_smoke_project_flow_opens_file_focuses_terminal_and_quits() {
-        let mut model = rust_model();
-        let layout = model.layout.compute(1200, 800);
-        assert!(layout.files.is_some());
-        assert!(layout.terminal.is_some());
-        assert_eq!(layout.focused, PaneId::Editor);
+    fn smoke_app_starts() {
+        let model = smoke_model();
+        assert!(!model.exit, "app must not be exiting at startup");
+        assert!(
+            !model.status.is_empty(),
+            "the app should announce itself in the status line"
+        );
+    }
 
-        model.dispatch(chord("Ctrl+h"));
-        assert_eq!(model.layout.focused(), PaneId::Files);
-        model.dispatch(chord("j"));
-        model.dispatch(chord("Enter"));
+    #[test]
+    fn smoke_project_launcher_renders() {
+        let recents = vec![
+            RecentProject::new("alpha", "/code/alpha"),
+            RecentProject::new("bravo", "/code/bravo"),
+        ];
+        let launcher = Launcher::new(recents);
+        assert_eq!(launcher.recents().len(), 2);
+        assert_eq!(launcher.actions(), LauncherAction::ALL);
+        // With recents present, the cursor lands on the first recent project.
+        assert_eq!(launcher.selection(), LauncherSelection::Recent(0));
+
+        // The launcher must also render cleanly with no recent projects.
+        let empty = Launcher::new(Vec::new());
+        assert!(empty.recents().is_empty());
+        assert_eq!(
+            empty.selection(),
+            LauncherSelection::Action(LauncherAction::OpenFolder),
+        );
+
+        // And the recent-projects cache file path must be resolvable so the
+        // binary can persist the launcher state at all.
+        recent_projects_path().expect("recent-projects path resolves");
+    }
+
+    #[test]
+    fn smoke_project_opens() {
+        let model = smoke_model();
+        // Detection must produce a project with a usable display name and at
+        // least one signal — that is the "opened project" view-model.
+        assert!(!model.detection.display_name.is_empty());
+        assert!(
+            model.detection.detected(),
+            "rust-basic fixture should detect at least one project signal",
+        );
+        // The file-browser view-model has visible rows for the project root.
+        assert!(
+            !model.browser.rows().is_empty(),
+            "file browser should populate from the project tree",
+        );
+    }
+
+    #[test]
+    fn smoke_three_panes_render() {
+        let model = smoke_model();
+        let computed = model.layout.compute(1600, 900);
+        assert!(
+            computed.files.is_some(),
+            "files pane must render in the default layout",
+        );
+        assert!(
+            computed.editor.width > 0,
+            "editor pane must have non-zero width",
+        );
+        assert!(
+            computed.terminal.is_some(),
+            "terminal pane must render in the default layout",
+        );
+    }
+
+    #[test]
+    fn smoke_file_can_be_opened() {
+        let mut model = smoke_model();
+        assert!(model.document.is_none(), "no file is open at startup");
+        model.open_path_reference("src/main.rs");
+        let doc = model.document.as_ref().expect("file opens");
+        assert_eq!(doc.name, "main.rs");
         assert_eq!(model.layout.focused(), PaneId::Editor);
-        assert_eq!(model.document.as_ref().unwrap().name, "Cargo.toml");
+    }
 
-        model.dispatch(chord("Ctrl+Shift+p"));
-        assert!(model.palette.is_some());
-        model.dispatch(chord("Escape"));
-        assert!(model.palette.is_none());
-
-        model.dispatch(chord("Ctrl+l"));
+    #[test]
+    fn smoke_terminal_pane_can_be_created() {
+        let mut model = smoke_model();
+        // Focusing the terminal pane is the user-visible action that "creates"
+        // it from the layout view-model's perspective. The actual PTY spawn is
+        // covered separately by the integration leg.
+        model.run_command(command_ids::FOCUS_TERMINAL);
         assert_eq!(model.layout.focused(), PaneId::Terminal);
-        assert!(model.terminal.is_none());
+        let computed = model.layout.compute(1600, 900);
+        assert!(computed.terminal.is_some(), "terminal pane must be visible");
+    }
 
-        model.dispatch(chord("Ctrl+q"));
-        assert!(model.wants_exit());
+    #[test]
+    fn smoke_basic_keybindings_work() {
+        let mut model = smoke_model();
+        // The default global key map (cockpit-config::GlobalKeys::default())
+        // routes Ctrl+h → focus files, Ctrl+l → focus terminal, Ctrl+j → editor.
+        model.dispatch("Ctrl+h".parse().expect("valid chord"));
+        assert_eq!(model.layout.focused(), PaneId::Files);
+        model.dispatch("Ctrl+l".parse().expect("valid chord"));
+        assert_eq!(model.layout.focused(), PaneId::Terminal);
+        model.dispatch("Ctrl+j".parse().expect("valid chord"));
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+        // Every chord that traversed dispatch should have been recorded.
+        assert_eq!(model.key_log.len(), 3);
+    }
+
+    #[test]
+    fn smoke_app_exits_cleanly() {
+        let mut model = smoke_model();
+        assert!(!model.wants_exit());
+        model.run_command(APP_QUIT);
+        assert!(model.wants_exit(), "App: Quit must set the wants_exit flag",);
     }
 }

@@ -7,6 +7,10 @@ license.workspace = true
 description = "Typed user and project configuration for Coding Cockpit."
 
 [dependencies]
+kdl = { version = "6.5", features = ["v1-fallback"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 toml = "0.9.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"

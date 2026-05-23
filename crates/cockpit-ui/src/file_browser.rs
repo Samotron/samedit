@@ -6,11 +6,10 @@
 //! either tree mutations (expand/collapse) or an open-file intent. Like the
 //! rest of `cockpit-ui` it is plain data and fully testable without a window.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cockpit_project::{
-    FileNode, FileNodeKind, FileTree, GitFileStatus, GitStatusMap, ProjectError,
-};
+use cockpit_project::{FileNode, FileNodeKind, FileTree, GitStatus, ProjectError};
 
 /// One visible row in the flattened file-browser list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,8 +24,8 @@ pub struct FileRow {
     pub kind: FileNodeKind,
     /// For directories: whether the directory is currently expanded.
     pub expanded: bool,
-    /// Coarse Git status for the file, or aggregate status for a directory.
-    pub git_status: Option<GitFileStatus>,
+    /// Git status badge for this entry, if any (spec §23 v0.3 / M3.4).
+    pub git_status: Option<GitStatus>,
 }
 
 impl FileRow {
@@ -52,8 +51,8 @@ pub enum FileBrowserAction {
 pub struct FileBrowser {
     tree: FileTree,
     rows: Vec<FileRow>,
-    git_statuses: GitStatusMap,
     selected: usize,
+    git_statuses: BTreeMap<PathBuf, GitStatus>,
 }
 
 impl FileBrowser {
@@ -62,11 +61,19 @@ impl FileBrowser {
         let mut browser = Self {
             tree,
             rows: Vec::new(),
-            git_statuses: GitStatusMap::new(),
             selected: 0,
+            git_statuses: BTreeMap::new(),
         };
         browser.rebuild(None);
         browser
+    }
+
+    /// Attach a fresh set of git statuses keyed by project-relative path. Rows
+    /// are recomputed so their `git_status` reflects the new map.
+    pub fn set_git_statuses(&mut self, statuses: impl IntoIterator<Item = (PathBuf, GitStatus)>) {
+        self.git_statuses = statuses.into_iter().collect();
+        let kept = self.rows.get(self.selected).map(|row| row.path.clone());
+        self.rebuild(kept.as_deref());
     }
 
     /// Flattened visible rows, in display order.
@@ -92,13 +99,6 @@ impl FileBrowser {
     /// Borrow the underlying file tree.
     pub fn tree(&self) -> &FileTree {
         &self.tree
-    }
-
-    /// Replace Git status badges and refresh visible rows.
-    pub fn set_git_statuses(&mut self, git_statuses: GitStatusMap) {
-        let selected = self.selected().map(|row| row.path.clone());
-        self.git_statuses = git_statuses;
-        self.rebuild(selected.as_deref());
     }
 
     /// Move the selection up one row, saturating at the top.
@@ -154,7 +154,12 @@ impl FileBrowser {
 }
 
 /// Append `node`'s visible descendants to `out` in depth-first display order.
-fn flatten(node: &FileNode, depth: usize, git_statuses: &GitStatusMap, out: &mut Vec<FileRow>) {
+fn flatten(
+    node: &FileNode,
+    depth: usize,
+    statuses: &BTreeMap<PathBuf, GitStatus>,
+    out: &mut Vec<FileRow>,
+) {
     let Some(children) = node.children() else {
         return;
     };
@@ -165,34 +170,11 @@ fn flatten(node: &FileNode, depth: usize, git_statuses: &GitStatusMap, out: &mut
             depth,
             kind: child.kind,
             expanded: child.expanded,
-            git_status: git_status_for(child, git_statuses),
+            git_status: statuses.get(&child.path).copied(),
         });
         if child.kind == FileNodeKind::Directory && child.expanded {
-            flatten(child, depth + 1, git_statuses, out);
+            flatten(child, depth + 1, statuses, out);
         }
-    }
-}
-
-fn git_status_for(node: &FileNode, git_statuses: &GitStatusMap) -> Option<GitFileStatus> {
-    if node.kind == FileNodeKind::File {
-        return git_statuses.get(&node.path).copied();
-    }
-
-    git_statuses
-        .iter()
-        .filter_map(|(path, status)| path.starts_with(&node.path).then_some(*status))
-        .max_by_key(status_priority)
-}
-
-fn status_priority(status: &GitFileStatus) -> u8 {
-    match status {
-        GitFileStatus::Conflicted => 6,
-        GitFileStatus::Deleted => 5,
-        GitFileStatus::Added => 4,
-        GitFileStatus::Modified => 3,
-        GitFileStatus::Renamed => 2,
-        GitFileStatus::Untracked => 1,
-        GitFileStatus::Ignored => 0,
     }
 }
 
@@ -259,6 +241,46 @@ mod tests {
     }
 
     #[test]
+    fn set_git_statuses_attaches_a_badge_to_the_matching_row() {
+        let mut browser = browser();
+        browser.set_git_statuses(vec![
+            (PathBuf::from("README.md"), GitStatus::Modified),
+            (PathBuf::from("src"), GitStatus::Untracked),
+        ]);
+
+        let readme = browser
+            .rows()
+            .iter()
+            .find(|row| row.name == "README.md")
+            .expect("README.md row");
+        assert_eq!(readme.git_status, Some(GitStatus::Modified));
+
+        let src = browser
+            .rows()
+            .iter()
+            .find(|row| row.name == "src")
+            .expect("src row");
+        assert_eq!(src.git_status, Some(GitStatus::Untracked));
+
+        let tests = browser
+            .rows()
+            .iter()
+            .find(|row| row.name == "tests")
+            .expect("tests row");
+        assert_eq!(tests.git_status, None);
+    }
+
+    #[test]
+    fn set_git_statuses_preserves_the_current_selection() {
+        let mut browser = browser();
+        browser.move_down(); // selects `tests`
+        let selected_path = browser.selected().unwrap().path.clone();
+
+        browser.set_git_statuses(vec![(PathBuf::from("README.md"), GitStatus::Modified)]);
+        assert_eq!(browser.selected().unwrap().path, selected_path);
+    }
+
+    #[test]
     fn activating_a_file_reports_its_absolute_path() {
         let mut browser = browser();
         browser.activate().unwrap(); // expand src
@@ -273,30 +295,5 @@ mod tests {
             }
             other => panic!("expected OpenFile, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn rows_include_git_status_badges_for_files_and_directories() {
-        let mut browser = browser();
-        browser.set_git_statuses(GitStatusMap::from([
-            (PathBuf::from("src/lib.rs"), GitFileStatus::Modified),
-            (PathBuf::from("src/nested/mod.rs"), GitFileStatus::Added),
-            (PathBuf::from("README.md"), GitFileStatus::Untracked),
-        ]));
-
-        assert_eq!(browser.rows()[0].name, "src");
-        assert_eq!(browser.rows()[0].git_status, Some(GitFileStatus::Added));
-        assert_eq!(browser.rows()[2].git_status, Some(GitFileStatus::Untracked));
-
-        browser.activate().unwrap();
-        assert_eq!(
-            browser
-                .rows()
-                .iter()
-                .find(|row| row.path == Path::new("src/lib.rs"))
-                .unwrap()
-                .git_status,
-            Some(GitFileStatus::Modified)
-        );
     }
 }

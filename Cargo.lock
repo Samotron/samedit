@@ -372,11 +372,13 @@ dependencies = [
  "cockpit-commands",
  "cockpit-config",
  "cockpit-editor",
+ "cockpit-lsp",
  "cockpit-project",
  "cockpit-render",
  "cockpit-terminal",
  "cockpit-testkit",
  "cockpit-ui",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -390,7 +392,9 @@ version = "0.0.1"
 name = "cockpit-config"
 version = "0.0.1"
 dependencies = [
+ "kdl 6.5.0",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "toml",
 ]
@@ -411,10 +415,12 @@ dependencies = [
 name = "cockpit-lsp"
 version = "0.0.1"
 dependencies = [
+ "cockpit-editor",
  "lsp-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -452,9 +458,7 @@ dependencies = [
  "anyhow",
  "cockpit-testkit",
  "insta",
- "kdl",
  "portable-pty",
- "tempfile",
  "termwiz",
  "thiserror 2.0.18",
 ]
@@ -1203,11 +1207,23 @@ dependencies = [
 
 [[package]]
 name = "kdl"
+version = "4.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e03e2e96c5926fe761088d66c8c2aee3a4352a2573f4eaca50043ad130af9117"
+dependencies = [
+ "miette 5.10.0",
+ "nom",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "kdl"
 version = "6.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81a29e7b50079ff44549f68c0becb1c73d7f6de2a4ea952da77966daf3d4761e"
 dependencies = [
- "miette",
+ "kdl 4.7.1",
+ "miette 7.6.0",
  "num",
  "winnow 0.6.24",
 ]
@@ -1358,12 +1374,35 @@ dependencies = [
 
 [[package]]
 name = "miette"
+version = "5.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59bb584eaeeab6bd0226ccf3509a69d7936d148cf3d036ad350abe35e8c6856e"
+dependencies = [
+ "miette-derive",
+ "once_cell",
+ "thiserror 1.0.69",
+ "unicode-width",
+]
+
+[[package]]
+name = "miette"
 version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f98efec8807c63c752b5bd61f862c165c115b0a35685bdcfd9238c7aeb592b7"
 dependencies = [
  "cfg-if",
  "unicode-width",
+]
+
+[[package]]
+name = "miette-derive"
+version = "5.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49e7bc1560b95a3c4a25d03de42fe76ca718ab92d1a22a55b9b4cf67b3ae635c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
