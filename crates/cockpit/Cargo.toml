@@ -9,6 +9,9 @@ description = "A fast, native, multi-platform coding cockpit."
 [features]
 default = []
 ui-smoke = []
+# Cold-start budget check (v0.6 M6.1) — opt-in so the default
+# `cargo test` stays hermetic and fast.
+bench = []
 
 [dependencies]
 cockpit-project.workspace = true

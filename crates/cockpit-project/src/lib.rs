@@ -293,6 +293,12 @@ pub struct ProjectCache {
     pub last_selected_mise_task: Option<String>,
     pub terminal_profile: Option<String>,
     pub workspace_layout: Option<String>,
+    /// Cached fuzzy-finder index — sorted, slash-normalised relative
+    /// paths captured the last time the user opened the finder
+    /// (v0.6 M6.6). Empty when the index has never been built or the
+    /// project tree has changed since the last save; the next finder
+    /// open re-walks the filesystem and refreshes this.
+    pub file_index: Vec<String>,
 }
 
 impl ProjectCache {

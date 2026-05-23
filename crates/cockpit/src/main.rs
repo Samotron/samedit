@@ -7,6 +7,7 @@
 
 mod app;
 mod launcher;
+mod startup;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -82,8 +83,9 @@ fn run_project_or_launcher(path: Option<PathBuf>, print: bool) -> Result<()> {
         return run_launcher();
     };
 
-    let detection =
-        detect_project(&path).with_context(|| format!("detect project at `{}`", path.display()))?;
+    let detection = startup::time_phase("startup.detect", || {
+        detect_project(&path).with_context(|| format!("detect project at `{}`", path.display()))
+    })?;
 
     if print {
         print_detection(&detection);
@@ -92,11 +94,14 @@ fn run_project_or_launcher(path: Option<PathBuf>, print: bool) -> Result<()> {
 
     record_recent_project(&detection);
 
-    let tree =
-        FileTree::load(&path).with_context(|| format!("load file tree at `{}`", path.display()))?;
-    let mut model = AppModel::new(detection, tree).map_err(|err| anyhow!(err))?;
-    model.refresh_git_status();
-    model.restore_cached_state();
+    let tree = startup::time_phase("startup.tree", || {
+        FileTree::load(&path).with_context(|| format!("load file tree at `{}`", path.display()))
+    })?;
+    let mut model = startup::time_phase("startup.model", || {
+        AppModel::new(detection, tree).map_err(|err| anyhow!(err))
+    })?;
+    startup::time_phase("startup.git", || model.refresh_git_status());
+    startup::time_phase("startup.cache", || model.restore_cached_state());
     let title = format!("Coding Cockpit — {}", model.project_name());
     tracing::info!(project = model.project_name(), "opening window");
 

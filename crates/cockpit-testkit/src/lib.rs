@@ -6,6 +6,10 @@
 //! impls, and golden-file helpers will land here as the milestones that need
 //! them arrive.
 
+pub mod bench;
+
+pub use bench::{PhaseMeasurement, format_measurements, measure_phase, total};
+
 use std::path::{Path, PathBuf};
 
 /// Absolute path to the workspace's `tests/fixtures/` directory.

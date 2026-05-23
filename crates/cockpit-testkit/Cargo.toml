@@ -5,3 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Shared test fixtures and fakes for Coding Cockpit."
+
+[features]
+default = []
+# Cold-start benchmarks (v0.6 M6.1) — opt-in so the default `cargo
+# test` stays hermetic and fast.
+bench = []

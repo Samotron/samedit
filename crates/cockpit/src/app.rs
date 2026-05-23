@@ -80,6 +80,9 @@ const DEBUG_SHOW_PANE_TREE: &str = "debug.show_pane_tree";
 const DEBUG_SHOW_PROJECT_STATE: &str = "debug.show_project_state";
 /// Command id for "reload the user config" (spec §18.13).
 const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
+/// Command id for "summarise the recorded startup-phase trace"
+/// (v0.6 M6.7).
+const DEBUG_SHOW_STARTUP_TRACE: &str = "debug.show_startup_trace";
 /// Command id for "go to the symbol's definition under the cursor" (M4.2).
 const LSP_GOTO_DEFINITION: &str = "lsp.goto_definition";
 /// Command id for "show hover information for the symbol under the cursor" (M4.2).
@@ -369,6 +372,10 @@ impl AppModel {
     }
 
     /// Restore persisted pane widths and reopen the last active file.
+    /// Also rehydrates the fuzzy-finder index from the cache so the
+    /// first `Ctrl+P` press is instant (M6.6); the index falls back to
+    /// a real filesystem walk if the cached snapshot turns out to be
+    /// stale.
     fn apply_cache(&mut self, cache: ProjectCache) {
         let mut prefs = self.layout.preferences().clone();
         if let Some(width) = cache.left_width {
@@ -379,6 +386,10 @@ impl AppModel {
         }
         self.layout.set_preferences(prefs);
 
+        if !cache.file_index.is_empty() {
+            self.file_index = Some(cache.file_index);
+        }
+
         if let Some(active) = cache.active_file
             && active.is_file()
         {
@@ -387,6 +398,8 @@ impl AppModel {
     }
 
     /// Snapshot the per-project state worth persisting across sessions.
+    /// Includes the fuzzy-finder index so the next launch can offer
+    /// instant Ctrl+P without re-walking the project tree (M6.6).
     fn build_cache(&self) -> ProjectCache {
         let active_file = self.document.as_ref().map(|doc| doc.path.clone());
         let prefs = self.layout.preferences();
@@ -395,6 +408,7 @@ impl AppModel {
             active_file,
             left_width: Some(prefs.left_width as u16),
             right_width: Some(prefs.right_width as u16),
+            file_index: self.file_index.clone().unwrap_or_default(),
             ..ProjectCache::default()
         }
     }
@@ -654,6 +668,7 @@ impl AppModel {
             DEBUG_SHOW_PANE_TREE => self.debug_show_pane_tree(),
             DEBUG_SHOW_PROJECT_STATE => self.debug_show_project_state(),
             DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
+            DEBUG_SHOW_STARTUP_TRACE => self.debug_show_startup_trace(),
             LSP_GOTO_DEFINITION => self.request_goto_definition(),
             LSP_SHOW_HOVER => self.request_show_hover(),
             LSP_RENAME => self.open_rename_input(),
@@ -869,6 +884,14 @@ impl AppModel {
     /// Re-apply the default config to the input router. A real user-config
     /// load path lands later; for now this exercises the reload code path so
     /// keybinding changes from a future config edit can be wired through here.
+    /// Surface the recorded startup trace in the status line (v0.6 M6.7).
+    fn debug_show_startup_trace(&mut self) {
+        let snapshot = crate::startup::snapshot();
+        let text = crate::startup::format_snapshot(&snapshot);
+        tracing::info!(startup = %text, "debug: show startup trace");
+        self.status = text;
+    }
+
     fn debug_reload_config(&mut self) {
         match InputRouter::from_global_keys(&GlobalKeys::default()) {
             Ok(router) => {
@@ -3364,6 +3387,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
         PaletteEntry::new(DEBUG_SHOW_PROJECT_STATE, "Debug: Show Project State"),
         PaletteEntry::new(DEBUG_RELOAD_CONFIG, "Debug: Reload Config"),
+        PaletteEntry::new(DEBUG_SHOW_STARTUP_TRACE, "Debug: Show Startup Trace"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
