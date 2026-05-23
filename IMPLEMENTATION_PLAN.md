@@ -448,9 +448,14 @@ inherit the project environment (spec §19).
 
 ### Housekeeping (paid down alongside v0.4)
 
-- [ ] **M4.9 — Spec rewrite Zig → Rust** — update `spec.md` §5, §21, §22,
-  `build.zig` references, and code samples so spec and plan stop diverging
-  (AGENTS.md hard rule #8).
+- [x] **M4.9 — Spec rewrite Zig → Rust** — `spec.md` now opens with an
+  explicit "implementation language is Rust" note, drops the vestigial
+  `zig-cache`/`zig-out` entries from the file-browser ignore list, swaps
+  the `cargo nextest` references in §18.2 / §18.9 / §18.11 for the
+  `cargo test` that the workspace actually ships (with a one-line note
+  that nextest remains a future hardening option), and adds a forward
+  pointer to v0.5 / v0.6 in §23. `build.zig` stays in the project-signal
+  list — user projects can still be Zig; cockpit itself is not.
 - [x] **M4.10 — Trait injection cleanup** (architecture item from §1.7) —
   `cockpit-project::env` now hosts `FileSystem`, `ProcessRunner`, and `Clock`
   traits with `Std*` production impls and `Fake*` in-memory test impls.
