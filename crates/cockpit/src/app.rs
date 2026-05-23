@@ -21,8 +21,9 @@ use cockpit_lsp::{
     ServerConfig,
 };
 use cockpit_project::{
-    FileNodeKind, FileTree, ProjectCache, ProjectDetection, mise_exec_command, project_cache_path,
-    walk_project_files,
+    FileNodeKind, FileTree, FormatPlan, KnownFormatter, PathBinaryLookup as FormatPathLookup,
+    ProjectCache, ProjectDetection, mise_exec_command, plan_format, project_cache_path,
+    render_format_task_snippet, walk_project_files,
 };
 use cockpit_render::theme::Color;
 use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
@@ -33,9 +34,9 @@ use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
 use cockpit_terminal::zellij::{LaunchPlan, PathBinaryLookup, ShellProfile, plan_launch};
 use cockpit_ui::{
-    CompletionItem, CompletionPopup, ComputedLayout, FileBrowser, FileBrowserAction, FuzzyFinder,
-    InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput, WorkspaceLayout,
-    command_ids,
+    CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, FileBrowser, FileBrowserAction,
+    FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput,
+    WorkspaceLayout, command_ids,
 };
 
 /// Logical layout metrics. The painter scales these by the display factor.
@@ -85,6 +86,12 @@ const LSP_RENAME: &str = "lsp.rename";
 const LSP_COMPLETION: &str = "lsp.completion";
 /// Command id for "apply the first quick-fix for the current diagnostic" (M4.5).
 const LSP_CODE_ACTION: &str = "lsp.code_action";
+/// Command id for "format the open document" (M4.4). The implementation
+/// chooses between a mise task, a prompt to add one, or LSP `formatting`
+/// — see [`AppModel::request_format`] for the resolution rules.
+const EDITOR_FORMAT: &str = "editor.format";
+/// Command id for "toggle the per-session format-on-save preference" (M4.4).
+const EDITOR_TOGGLE_FORMAT_ON_SAVE: &str = "editor.toggle_format_on_save";
 
 /// Name of the mise task cockpit invokes for the Test: * palette entries.
 /// Conventional default; M4 may make this configurable per project.
@@ -139,6 +146,33 @@ enum LspPending {
     Rename,
     /// `textDocument/completion` — show candidates in the completion popup.
     Completion,
+    /// `textDocument/formatting` — apply the returned text edits (M4.4).
+    /// `trigger` records whether the format came from a save (in which case
+    /// the formatted buffer must be flushed back to disk on success).
+    Formatting {
+        path: PathBuf,
+        trigger: FormatTrigger,
+    },
+}
+
+/// Why a format request was issued (M4.4). Drives post-apply behaviour: a
+/// save-triggered format flushes the formatted buffer back to disk, whereas
+/// a manual `editor.format` leaves the buffer dirty so the user can review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatTrigger {
+    Manual,
+    Save,
+}
+
+/// What confirming a [`ConfirmPrompt`] should do (M4.4 — and the seam any
+/// future yes/no prompt plugs into).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptIntent {
+    /// Append `[tasks.format]` to `mise.toml`, then retry formatting.
+    AddFormatTask {
+        snippet: String,
+        retry_trigger: FormatTrigger,
+    },
 }
 
 /// The most recently received hover result (M4.2). Cleared when a new
@@ -198,6 +232,15 @@ pub struct AppModel {
     rename_input: Option<RenameInput>,
     /// Manual LSP completion popup (M4.3b).
     completion: Option<CompletionPopup>,
+    /// Active yes/no modal prompt (M4.4). When `Some`, it captures keys
+    /// the same way the rename input does.
+    confirm: Option<ConfirmPrompt>,
+    /// What to do if the active [`confirm`](Self::confirm) prompt is accepted.
+    confirm_intent: Option<PromptIntent>,
+    /// Per-session opt-in for format-on-save (M4.4). Initialised from
+    /// `editor.format_on_save`; toggled by the palette command without
+    /// touching the config file on disk.
+    format_on_save: bool,
     /// Tracks a pending `g` in the editor pane so local `gd` can dispatch LSP
     /// definition while non-LSP Vim chords like `gg` still reach the Vim FSM.
     editor_pending_g: bool,
@@ -238,6 +281,9 @@ impl AppModel {
             hover: None,
             rename_input: None,
             completion: None,
+            confirm: None,
+            confirm_intent: None,
+            format_on_save: false,
             editor_pending_g: false,
             editor_pending_leader: 0,
             exit: false,
@@ -326,6 +372,10 @@ impl AppModel {
         self.record_key_event(&chord);
         // The palette and fuzzy finder are modal: while open they consume
         // every key.
+        if self.confirm.is_some() {
+            self.handle_confirm_key(&chord);
+            return;
+        }
         if self.rename_input.is_some() {
             self.handle_rename_key(&chord);
             return;
@@ -399,6 +449,8 @@ impl AppModel {
             LSP_RENAME => self.open_rename_input(),
             LSP_COMPLETION => self.request_completion(),
             LSP_CODE_ACTION => self.request_code_action(),
+            EDITOR_FORMAT => self.request_format(FormatTrigger::Manual),
+            EDITOR_TOGGLE_FORMAT_ON_SAVE => self.toggle_format_on_save(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -1195,7 +1247,8 @@ impl AppModel {
         }
     }
 
-    /// Write the open document to its file.
+    /// Write the open document to its file. When `format_on_save` is enabled
+    /// the formatter runs immediately after the on-disk write succeeds (M4.4).
     fn save_document(&mut self) {
         let Some(doc) = self.document.as_mut() else {
             self.status = "No document to save.".to_string();
@@ -1206,7 +1259,13 @@ impl AppModel {
                 doc.editor.mark_saved();
                 self.status = format!("Saved {}", doc.name);
             }
-            Err(err) => self.status = format!("Save failed: {err}"),
+            Err(err) => {
+                self.status = format!("Save failed: {err}");
+                return;
+            }
+        }
+        if self.format_on_save {
+            self.request_format(FormatTrigger::Save);
         }
     }
 
@@ -1515,6 +1574,9 @@ impl AppModel {
             } => self.apply_prepare_rename_result(language, path, line, col, new_name, result),
             LspPending::Rename => self.apply_rename_result(result),
             LspPending::Completion => self.apply_completion_result(result),
+            LspPending::Formatting { path, trigger } => {
+                self.apply_formatting_result(path, trigger, result)
+            }
         }
     }
 
@@ -1659,6 +1721,337 @@ impl AppModel {
         self.status = format!("Completions: {count} candidate(s), first `{first}`.");
     }
 
+    /// Format the open document — M4.4. Mise task wins; otherwise prompt to
+    /// add one when a known formatter is detectable; otherwise fall back to
+    /// LSP `textDocument/formatting`.
+    fn request_format(&mut self, trigger: FormatTrigger) {
+        let Some((path, language)) = self.document.as_ref().map(|doc| {
+            let path = doc.path.clone();
+            let language = Language::from_path(&path);
+            (path, language)
+        }) else {
+            self.status = "No document to format.".to_string();
+            return;
+        };
+        let language_id = language.and_then(|language| {
+            ServerConfig::for_language(language).map(|config| config.language_id().to_string())
+        });
+        let plan = plan_format(
+            &self.detection.mise,
+            language_id.as_deref(),
+            &FormatPathLookup,
+        );
+        match plan {
+            FormatPlan::MiseTask { name } => self.run_format_mise_task(&path, &name, trigger),
+            FormatPlan::SuggestMiseTask {
+                formatter,
+                suggested_run,
+                from_mise_tools,
+            } => self.prompt_add_format_task(formatter, suggested_run, from_mise_tools, trigger),
+            FormatPlan::LspOnly => self.request_lsp_formatting(language, path, trigger),
+        }
+    }
+
+    /// Run an existing `format` (or `format:<lang>`) mise task against the
+    /// open document. The on-disk version is the source of truth: the buffer
+    /// is already saved by the time we get here (either via [`save_document`]
+    /// or via an explicit save flushed by the manual command), so we spawn
+    /// `mise run <task> -- <path>`, wait for it, and reload the buffer.
+    fn run_format_mise_task(&mut self, path: &Path, task: &str, trigger: FormatTrigger) {
+        // Manual triggers also need the on-disk file to match the buffer
+        // before we hand it to the formatter — flush first.
+        if trigger == FormatTrigger::Manual
+            && let Some(doc) = self.document.as_ref()
+            && doc.editor.is_dirty()
+            && let Err(err) = std::fs::write(&doc.path, doc.editor.text())
+        {
+            self.status = format!("Format: pre-save failed: {err}");
+            return;
+        }
+
+        let output = match std::process::Command::new("mise")
+            .arg("run")
+            .arg(task)
+            .arg("--")
+            .arg(path)
+            .current_dir(&self.detection.root_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) => {
+                self.status = format!("Format: could not run `mise run {task}`: {err}");
+                return;
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let snippet = stderr.lines().next().unwrap_or("(no output)");
+            self.status = format!("Format: `mise run {task}` failed: {snippet}");
+            return;
+        }
+        if let Err(err) = self.reload_buffer_from_disk(path) {
+            self.status = format!("Format: reload after `{task}` failed: {err}");
+            return;
+        }
+        self.status = match trigger {
+            FormatTrigger::Manual => format!("Formatted via `mise run {task}`."),
+            FormatTrigger::Save => format!("Saved and formatted via `mise run {task}`."),
+        };
+    }
+
+    /// Surface the M4.4 "Add `format` task to `mise.toml`?" confirmation
+    /// modal. Stores the snippet to be written on confirm and the original
+    /// trigger so the format retries after the user says yes.
+    fn prompt_add_format_task(
+        &mut self,
+        formatter: KnownFormatter,
+        suggested_run: String,
+        from_mise_tools: bool,
+        trigger: FormatTrigger,
+    ) {
+        let where_from = if from_mise_tools {
+            "mise.toml [tools]"
+        } else {
+            "$PATH"
+        };
+        let title = format!(
+            "Add `format` task to mise.toml? ({} found on {where_from})",
+            formatter.binary()
+        );
+        let body = format!(
+            "Cockpit will append:\n\n[tasks.format]\nrun = \"{}\"\n\nNothing is written until you confirm.",
+            suggested_run.replace('"', "\\\"")
+        );
+        let snippet = render_format_task_snippet(&suggested_run);
+        self.confirm = Some(ConfirmPrompt::new(title, body));
+        self.confirm_intent = Some(PromptIntent::AddFormatTask {
+            snippet,
+            retry_trigger: trigger,
+        });
+        self.status =
+            "Add format task? y/Enter to confirm, n/Escape to cancel, Tab to toggle.".to_string();
+    }
+
+    /// Issue a `textDocument/formatting` request against the open document's
+    /// language server. The response is applied in [`apply_formatting_result`].
+    fn request_lsp_formatting(
+        &mut self,
+        language: Option<Language>,
+        path: PathBuf,
+        trigger: FormatTrigger,
+    ) {
+        let Some(language) = language else {
+            self.status = "No formatter and unsupported language for LSP fallback.".to_string();
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&language) else {
+            self.status =
+                "No formatter detected and the language server is not running.".to_string();
+            return;
+        };
+        let tab_size = 4_u64;
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "options": {
+                "tabSize": tab_size,
+                "insertSpaces": true,
+                "trimTrailingWhitespace": true,
+                "insertFinalNewline": true,
+            }
+        });
+        match client.request("textDocument/formatting", params) {
+            Ok(id) => {
+                self.lsp_pending
+                    .insert(id, LspPending::Formatting { path, trigger });
+                self.status = "Requested formatting from language server...".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "LSP formatting request failed to queue");
+                self.status = format!("LSP request failed: {err}");
+            }
+        }
+    }
+
+    /// Apply edits returned by `textDocument/formatting`. When the trigger
+    /// was a save, the buffer is also flushed back to disk so the on-disk
+    /// file ends up formatted (the buffer-only edit would otherwise stay
+    /// out of sync with disk until the next save).
+    fn apply_formatting_result(
+        &mut self,
+        path: PathBuf,
+        trigger: FormatTrigger,
+        result: serde_json::Value,
+    ) {
+        let Some(items) = result.as_array() else {
+            if result.is_null() {
+                self.status = "Formatter returned no edits.".to_string();
+            } else {
+                self.status = "Formatter result was not an edit array.".to_string();
+            }
+            return;
+        };
+        let mut by_path: HashMap<PathBuf, Vec<LspTextEdit>> = HashMap::new();
+        if let Err(err) = collect_lsp_text_edits(
+            &serde_json::Value::Array(items.clone()),
+            &mut by_path,
+            path.clone(),
+        ) {
+            self.status = format!("Formatter edits malformed: {err}");
+            return;
+        }
+        let Some(edits) = by_path.remove(&path) else {
+            self.status = "Formatter returned no edits.".to_string();
+            return;
+        };
+        let mut sorted = edits;
+        sorted.sort_by(|a, b| {
+            b.start_line
+                .cmp(&a.start_line)
+                .then_with(|| b.start_character.cmp(&a.start_character))
+        });
+        let Some(doc) = self.document.as_mut() else {
+            self.status = "Format: no document open.".to_string();
+            return;
+        };
+        if doc.path != path {
+            self.status = "Format: result is for a closed file.".to_string();
+            return;
+        }
+        match apply_lsp_text_edits_to_editor(&mut doc.editor, &sorted) {
+            Ok(count) => {
+                if trigger == FormatTrigger::Save {
+                    match std::fs::write(&doc.path, doc.editor.text()) {
+                        Ok(()) => {
+                            doc.editor.mark_saved();
+                            self.status = format!("Saved and formatted via LSP ({count} edit(s)).");
+                        }
+                        Err(err) => {
+                            self.status = format!("Format applied but re-save failed: {err}");
+                        }
+                    }
+                } else {
+                    self.status = format!("Formatted via LSP ({count} edit(s)).");
+                }
+            }
+            Err(err) => self.status = format!("Format: apply failed: {err}"),
+        }
+    }
+
+    /// Replace the open document's buffer with the on-disk contents of
+    /// `path`. Used after an out-of-process formatter rewrites the file.
+    fn reload_buffer_from_disk(&mut self, path: &Path) -> Result<(), String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| format!("read {}: {err}", path.display()))?;
+        let Some(doc) = self.document.as_mut() else {
+            return Err("no document open".to_string());
+        };
+        if doc.path != path {
+            return Err("open document changed during format".to_string());
+        }
+        doc.editor.replace_all(&text);
+        doc.editor.mark_saved();
+        Ok(())
+    }
+
+    /// Apply the pending [`PromptIntent`] when the user accepts the modal.
+    fn accept_confirm(&mut self) {
+        let Some(intent) = self.confirm_intent.take() else {
+            self.confirm = None;
+            return;
+        };
+        self.confirm = None;
+        match intent {
+            PromptIntent::AddFormatTask {
+                snippet,
+                retry_trigger,
+            } => self.add_format_task_and_retry(&snippet, retry_trigger),
+        }
+    }
+
+    /// Append the `[tasks.format]` snippet to `mise.toml`, refresh the
+    /// detected project, and retry the original format request so the user
+    /// sees the formatter run immediately after confirming.
+    fn add_format_task_and_retry(&mut self, snippet: &str, trigger: FormatTrigger) {
+        let mise_path = self.detection.root_path.join("mise.toml");
+        let updated = match std::fs::read_to_string(&mise_path) {
+            Ok(existing) => {
+                let mut updated = existing;
+                if !updated.ends_with('\n') {
+                    updated.push('\n');
+                }
+                updated.push_str(snippet);
+                updated
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => snippet.to_string(),
+            Err(err) => {
+                self.status = format!("Could not read mise.toml: {err}");
+                return;
+            }
+        };
+        if let Err(err) = std::fs::write(&mise_path, updated) {
+            self.status = format!("Could not write mise.toml: {err}");
+            return;
+        }
+        match cockpit_project::detect_mise_project(&self.detection.root_path) {
+            Ok(mise) => {
+                self.detection.mise = mise;
+                self.status = "Added [tasks.format] to mise.toml.".to_string();
+            }
+            Err(err) => {
+                self.status = format!("mise.toml updated but reparse failed: {err}");
+                return;
+            }
+        }
+        self.request_format(trigger);
+    }
+
+    /// Flip the per-session format-on-save preference (M4.4).
+    fn toggle_format_on_save(&mut self) {
+        self.format_on_save = !self.format_on_save;
+        self.status = if self.format_on_save {
+            "Format on save: ON.".to_string()
+        } else {
+            "Format on save: OFF.".to_string()
+        };
+    }
+
+    /// Drive the modal yes/no confirmation prompt from one key chord.
+    fn handle_confirm_key(&mut self, chord: &KeyChord) {
+        if is_chord(chord, "Escape") || is_chord(chord, "n") || is_chord(chord, "N") {
+            self.confirm = None;
+            self.confirm_intent = None;
+            self.status = "Cancelled.".to_string();
+            return;
+        }
+        if is_chord(chord, "y") || is_chord(chord, "Y") {
+            self.accept_confirm();
+            return;
+        }
+        if is_chord(chord, "Enter") {
+            // Enter accepts only when "Yes" is highlighted — defaults to No
+            // so a careless Enter is always safe (AGENTS.md rule #6).
+            if self.confirm.as_ref().is_some_and(ConfirmPrompt::selection) {
+                self.accept_confirm();
+            } else {
+                self.confirm = None;
+                self.confirm_intent = None;
+                self.status = "Cancelled.".to_string();
+            }
+            return;
+        }
+        let Some(prompt) = self.confirm.as_mut() else {
+            return;
+        };
+        if is_chord(chord, "Tab")
+            || is_chord(chord, "ArrowLeft")
+            || is_chord(chord, "ArrowRight")
+            || is_chord(chord, "h")
+            || is_chord(chord, "l")
+        {
+            prompt.toggle();
+        }
+    }
+
     /// Insert the highlighted completion text at the current cursor.
     fn accept_completion(&mut self) {
         let Some(item) = self
@@ -1775,6 +2168,9 @@ impl AppModel {
         }
         if let Some(completion) = &self.completion {
             paint_completion(&mut canvas, &self.theme, completion, width, height);
+        }
+        if let Some(prompt) = &self.confirm {
+            paint_confirm(&mut canvas, &self.theme, prompt, width, height);
         }
     }
 
@@ -2694,6 +3090,11 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(LSP_RENAME, "LSP: Rename Symbol"),
         PaletteEntry::new(LSP_COMPLETION, "LSP: Complete"),
         PaletteEntry::new(LSP_CODE_ACTION, "LSP: Code Action"),
+        PaletteEntry::new(EDITOR_FORMAT, "Editor: Format Document"),
+        PaletteEntry::new(
+            EDITOR_TOGGLE_FORMAT_ON_SAVE,
+            "Editor: Toggle Format on Save",
+        ),
         PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
         PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
@@ -2889,6 +3290,72 @@ fn paint_completion(
             FONT,
         );
     }
+}
+
+/// Paint the modal yes/no confirmation prompt (M4.4).
+fn paint_confirm(
+    canvas: &mut Canvas<'_>,
+    theme: &Theme,
+    prompt: &ConfirmPrompt,
+    view_width: f32,
+    view_height: f32,
+) {
+    canvas.rect(
+        0.0,
+        0.0,
+        view_width,
+        view_height,
+        Color::rgba(0.0, 0.0, 0.0, 0.5),
+    );
+    let panel_w = 520.0_f32.min(view_width - 2.0 * PAD);
+    let panel_x = ((view_width - panel_w) / 2.0).max(PAD);
+    let body_lines: Vec<&str> = prompt.body().lines().collect();
+    let panel_h = HEADER_H + ROW_H * (body_lines.len() as f32 + 2.0) + PAD * 2.0;
+    let panel_y = ((view_height - panel_h) / 2.0).max(TOP_BAR_H + PAD);
+
+    canvas.rect(panel_x, panel_y, panel_w, panel_h, theme.pane_background);
+    canvas.rect(panel_x, panel_y, panel_w, 2.0, theme.accent);
+    canvas.text(
+        panel_x + PAD,
+        panel_y + 6.0,
+        prompt.title().to_string(),
+        theme.text,
+        FONT,
+    );
+    for (idx, line) in body_lines.iter().enumerate() {
+        canvas.text(
+            panel_x + PAD,
+            panel_y + HEADER_H + idx as f32 * ROW_H,
+            (*line).to_string(),
+            theme.muted_text,
+            FONT,
+        );
+    }
+    let buttons_y = panel_y + HEADER_H + body_lines.len() as f32 * ROW_H + PAD;
+    let button_w = 80.0;
+    let yes_x = panel_x + panel_w - 2.0 * button_w - 2.0 * PAD;
+    let no_x = panel_x + panel_w - button_w - PAD;
+    let (yes_color, no_color) = if prompt.selection() {
+        (theme.accent, theme.pane_border)
+    } else {
+        (theme.pane_border, theme.accent)
+    };
+    canvas.rect(yes_x, buttons_y, button_w, ROW_H, yes_color);
+    canvas.rect(no_x, buttons_y, button_w, ROW_H, no_color);
+    canvas.text(
+        yes_x + PAD,
+        buttons_y + 3.0,
+        "[y] Yes".to_string(),
+        theme.text,
+        FONT,
+    );
+    canvas.text(
+        no_x + PAD,
+        buttons_y + 3.0,
+        "[n] No".to_string(),
+        theme.text,
+        FONT,
+    );
 }
 
 /// [`CockpitApp`] adapter: forwards harness callbacks to the [`AppModel`].
@@ -3986,6 +4453,172 @@ mod tests {
         assert_eq!(cache.open_files.len(), 1);
         assert_eq!(cache.left_width, Some(260));
         assert_eq!(cache.right_width, Some(480));
+    }
+
+    // ---- M4.4 — Format on save -------------------------------------------
+
+    #[test]
+    fn editor_toggle_format_on_save_flips_the_session_preference() {
+        let mut model = model();
+        assert!(!model.format_on_save);
+
+        model.run_command(EDITOR_TOGGLE_FORMAT_ON_SAVE);
+        assert!(model.format_on_save);
+        assert!(model.status.contains("ON"));
+
+        model.run_command(EDITOR_TOGGLE_FORMAT_ON_SAVE);
+        assert!(!model.format_on_save);
+        assert!(model.status.contains("OFF"));
+    }
+
+    #[test]
+    fn format_without_a_document_surfaces_a_clear_status() {
+        let mut model = model();
+        assert!(model.document.is_none());
+
+        model.run_command(EDITOR_FORMAT);
+        assert!(model.confirm.is_none());
+        assert!(
+            model.status.contains("No document to format"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn format_with_no_detectable_tool_falls_back_to_lsp_only_status() {
+        // mise-basic has neither a `format` task nor a rustfmt entry; the
+        // fixture has no .rs files so language detection drops out and the
+        // request never reaches the LSP request path.
+        let mut model = mise_model();
+        let path = fixture_path("mise-basic").join("README.md");
+        std::fs::write(&path, "# hello\n").expect("seed file");
+        model.open_document(path.clone());
+        assert!(model.document.is_some());
+
+        model.run_command(EDITOR_FORMAT);
+        // No formatter & no LSP server running for markdown → user-visible
+        // explanation, not a panic.
+        assert!(
+            !model.status.is_empty(),
+            "format should always set a status line"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn detected_formatter_in_tools_opens_the_add_format_task_prompt() {
+        // Seed a tempdir with a `mise.toml` listing rustfmt as a tool so the
+        // planner picks the "suggest mise task" branch deterministically.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[tools]\nrustfmt = \"latest\"\n",
+        )
+        .expect("seed mise.toml");
+        std::fs::write(dir.path().join("main.rs"), "fn main(){}\n").expect("seed source");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(dir.path().join("main.rs"));
+        assert!(model.document.is_some());
+
+        model.run_command(EDITOR_FORMAT);
+        let prompt = model.confirm.as_ref().expect("confirm prompt is open");
+        assert!(
+            prompt.title().contains("rustfmt"),
+            "title: {}",
+            prompt.title()
+        );
+        assert!(prompt.body().contains("[tasks.format]"));
+        assert!(!prompt.selection(), "default selection must be safe (No)");
+
+        // Cancelling via `n` clears the prompt without touching mise.toml.
+        model.dispatch(chord("n"));
+        assert!(model.confirm.is_none());
+        let mise_toml = std::fs::read_to_string(dir.path().join("mise.toml")).expect("read back");
+        assert!(
+            !mise_toml.contains("[tasks.format]"),
+            "no task should be written on cancel — got:\n{mise_toml}"
+        );
+    }
+
+    #[test]
+    fn confirming_the_prompt_appends_format_task_to_mise_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[tools]\nrustfmt = \"latest\"\n",
+        )
+        .expect("seed mise.toml");
+        std::fs::write(dir.path().join("main.rs"), "fn main(){}\n").expect("seed source");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(dir.path().join("main.rs"));
+
+        model.run_command(EDITOR_FORMAT);
+        assert!(model.confirm.is_some());
+
+        // Highlight Yes (Tab) then confirm with Enter — exercises the modal
+        // contract that Enter is a no-op until the user opts into Yes.
+        model.dispatch(chord("Tab"));
+        assert!(model.confirm.as_ref().unwrap().selection());
+        model.dispatch(chord("Enter"));
+
+        // After accepting the prompt, the file has the snippet appended …
+        let mise_toml = std::fs::read_to_string(dir.path().join("mise.toml")).expect("read back");
+        assert!(
+            mise_toml.contains("[tasks.format]"),
+            "expected [tasks.format] in:\n{mise_toml}"
+        );
+        assert!(
+            mise_toml.contains("rustfmt"),
+            "expected suggested run line in:\n{mise_toml}"
+        );
+        // … and the live MiseProject is reparsed so a follow-up format would
+        // pick the new task without restarting cockpit.
+        assert!(
+            model
+                .detection
+                .mise
+                .tasks
+                .iter()
+                .any(|task| task.name == "format"),
+            "detection should be refreshed after write"
+        );
+    }
+
+    #[test]
+    fn confirm_prompt_default_enter_cancels_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[tools]\nrustfmt = \"latest\"\n",
+        )
+        .expect("seed mise.toml");
+        std::fs::write(dir.path().join("main.rs"), "fn x(){}\n").expect("seed source");
+
+        let detection = detect_project(dir.path()).expect("detect");
+        let tree = FileTree::load(dir.path()).expect("tree");
+        let mut model = AppModel::new(detection, tree).expect("model");
+        model.open_document(dir.path().join("main.rs"));
+
+        model.run_command(EDITOR_FORMAT);
+        assert!(model.confirm.is_some());
+
+        // Plain Enter with No still highlighted (default) must NOT write —
+        // AGENTS.md rule #6.
+        model.dispatch(chord("Enter"));
+        assert!(model.confirm.is_none());
+        let mise_toml = std::fs::read_to_string(dir.path().join("mise.toml")).expect("read back");
+        assert!(
+            !mise_toml.contains("[tasks.format]"),
+            "Enter on No must cancel — got:\n{mise_toml}"
+        );
     }
 }
 

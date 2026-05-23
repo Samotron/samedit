@@ -147,6 +147,21 @@ impl Editor {
         self.refresh_highlights();
     }
 
+    /// Replace the entire buffer with `text` as one undoable edit.
+    ///
+    /// The cursor is clamped into the new buffer rather than reset to the
+    /// start, so reloads (e.g. format-on-save in M4.4) feel local instead of
+    /// snapping the viewport.
+    pub fn replace_all(&mut self, text: &str) {
+        let cursor = self.cursor.byte();
+        let len = self.buffer.len_bytes();
+        self.history.replace(&mut self.buffer, 0..len, text);
+        let new_len = self.buffer.len_bytes();
+        self.cursor.set_byte(&self.buffer, cursor.min(new_len));
+        self.dirty = true;
+        self.refresh_highlights();
+    }
+
     /// The active visual selection as an inclusive-resolved `[start, end)` byte
     /// range, or `None` when no Visual mode is active.
     pub fn selection(&self) -> Option<(usize, usize)> {

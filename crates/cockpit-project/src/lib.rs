@@ -4,8 +4,13 @@
 //! the per-project state cache (spec §7), the lazy file tree (spec §13), and
 //! the git status integration that drives file-browser badges (spec §23 v0.3).
 
+pub mod formatter;
 pub mod git;
 
+pub use formatter::{
+    BinaryLookup, FixedBinaryLookup, FormatPlan, KnownFormatter, NoBinaryLookup, PathBinaryLookup,
+    plan_format, render_format_task_snippet,
+};
 pub use git::{GitStatus, git_status, parse_porcelain_z};
 
 use std::{

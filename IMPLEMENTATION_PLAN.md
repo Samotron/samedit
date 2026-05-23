@@ -415,7 +415,7 @@ inherit the project environment (spec §19).
   on-keystroke debounce in v0.4 to avoid fighting the Vim FSM. UI is
   inline ghost text **and** a popup list with docs; view-model lives in
   `cockpit-ui`, keys in `cockpit-commands`.
-- [ ] **M4.4 — Format on save** — **mise task wins, always.** If a `format`
+- [x] **M4.4 — Format on save** — **mise task wins, always.** If a `format`
   (or `format:<lang>`) mise task exists, use it. If no task exists and a
   known formatter is detectable (`[tools]` or PATH: `rustfmt`, `prettier`,
   `ruff`, `black`, `sqlfluff`), surface a prompt: *"Add `format` task to

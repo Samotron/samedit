@@ -78,6 +78,11 @@ pub struct EditorConfig {
     pub line_numbers: bool,
     pub relative_line_numbers: bool,
     pub tab_width: u8,
+    /// Run the project's `format` mise task (or LSP `textDocument/formatting`
+    /// when no task is configured) after every successful save (M4.4).
+    /// Default off so existing projects do not change behaviour until the
+    /// user opts in.
+    pub format_on_save: bool,
 }
 
 impl Default for EditorConfig {
@@ -87,6 +92,7 @@ impl Default for EditorConfig {
             line_numbers: true,
             relative_line_numbers: true,
             tab_width: 4,
+            format_on_save: false,
         }
     }
 }
