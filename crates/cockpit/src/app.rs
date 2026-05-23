@@ -27,7 +27,10 @@ use cockpit_project::{
     project_cache_path, render_format_task_snippet, walk_project_files,
 };
 use cockpit_render::theme::Color;
-use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
+use cockpit_render::{
+    CockpitApp, MouseButton, Painter, PointerPosition, Rect as RenderRect, RedrawHandle, Theme,
+    Viewport,
+};
 use cockpit_terminal::bridge::{detect_paths_in_grid, paste_to_terminal, render_document_path};
 use cockpit_terminal::live::{LiveTerminal, WakeFn};
 use cockpit_terminal::path_detect::detect_paths;
@@ -254,7 +257,27 @@ pub struct AppModel {
     /// Tracks `<leader>c` in the editor pane so `<leader>ca` can dispatch the
     /// quick-fix command without adding a parallel command path.
     editor_pending_leader: u8,
+    /// Most recent computed layout — populated each `paint()` so mouse hit
+    /// tests can ask which pane an event landed in (M4.7).
+    last_layout: Option<ComputedLayout>,
+    /// Logical width passed to the most recent layout compute (M4.7).
+    last_view_width: f32,
+    /// Logical height passed to the most recent layout compute (M4.7).
+    last_view_height: f32,
+    /// Active pane-border drag, if any (M4.7).
+    drag: Option<DragState>,
+    /// Scroll offset (logical rows from the top) for the editor pane (M4.7).
+    editor_scroll: f32,
     exit: bool,
+}
+
+/// One in-progress pane-border drag (M4.7). Records which side is being
+/// dragged and the cursor anchor / starting width so the layout update is
+/// a pure delta from the drag origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DragState {
+    LeftBorder { start_x: f32, start_width: u32 },
+    RightBorder { start_x: f32, start_width: u32 },
 }
 
 impl AppModel {
@@ -315,6 +338,11 @@ impl AppModel {
             format_on_save: false,
             editor_pending_g: false,
             editor_pending_leader: 0,
+            last_layout: None,
+            last_view_width: 0.0,
+            last_view_height: 0.0,
+            drag: None,
+            editor_scroll: 0.0,
             exit: false,
             detection,
         })
@@ -428,6 +456,159 @@ impl AppModel {
                 self.handle_local(focused, &chord)
             }
         }
+    }
+
+    // ---- M4.7 — Mouse input -----------------------------------------------
+
+    /// Route a primary-button press at logical-pixel `position`. Routes:
+    /// click in the file browser → focus + select (double-click activates),
+    /// click in the editor or terminal pane → focus that pane, click on a
+    /// pane border → start a resize drag.
+    pub fn on_pointer_down(&mut self, button: MouseButton, position: PointerPosition) {
+        if button != MouseButton::Left {
+            return;
+        }
+        let Some(layout) = self.last_layout.clone() else {
+            return;
+        };
+
+        // Pane-border resize takes priority over pane-focus hit tests.
+        if let Some(drag) = self.detect_border_drag(&layout, position) {
+            self.drag = Some(drag);
+            return;
+        }
+
+        if let Some(rect) = layout.files
+            && pane_contains(rect, position)
+        {
+            self.layout.focus(PaneId::Files);
+            self.handle_files_click(rect, position);
+            return;
+        }
+        if pane_contains(layout.editor, position) {
+            self.layout.focus(PaneId::Editor);
+            return;
+        }
+        if let Some(rect) = layout.terminal
+            && pane_contains(rect, position)
+        {
+            self.layout.focus(PaneId::Terminal);
+            self.ensure_terminal();
+        }
+    }
+
+    /// Release any in-progress drag and forget the last anchor (M4.7).
+    pub fn on_pointer_up(&mut self, button: MouseButton, _position: PointerPosition) {
+        if button == MouseButton::Left {
+            self.drag = None;
+        }
+    }
+
+    /// Continue an in-progress drag (M4.7). Mouse moves outside a drag are
+    /// ignored — cockpit has no hover state today.
+    pub fn on_pointer_move(&mut self, position: PointerPosition) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        match drag {
+            DragState::LeftBorder {
+                start_x,
+                start_width,
+            } => {
+                let delta = position.x - start_x;
+                let new_width = (start_width as f32 + delta).clamp(120.0, 800.0);
+                self.layout.set_left_width(new_width as u32);
+            }
+            DragState::RightBorder {
+                start_x,
+                start_width,
+            } => {
+                let delta = start_x - position.x;
+                let new_width = (start_width as f32 + delta).clamp(160.0, 1000.0);
+                self.layout.set_right_width(new_width as u32);
+            }
+        }
+    }
+
+    /// Scroll wheel delta (M4.7). Positive `dy` scrolls content down — the
+    /// viewport sees rows leave the top. The terminal pane forwards the
+    /// scroll to the live PTY (Zellij owns scroll-back); the editor pane
+    /// shifts its viewport offset.
+    pub fn on_scroll(&mut self, position: PointerPosition, _dx: f32, dy: f32) {
+        let Some(layout) = self.last_layout.clone() else {
+            return;
+        };
+        if pane_contains(layout.editor, position) {
+            // 1 line per 20px of wheel travel.
+            self.editor_scroll = (self.editor_scroll - dy / 20.0).max(0.0);
+            return;
+        }
+        if let Some(rect) = layout.terminal
+            && pane_contains(rect, position)
+            && let Some(terminal) = self.terminal.as_mut()
+        {
+            // Forward the wheel as a Zellij/termwiz scroll arrow sequence
+            // by emitting CSI A/B per step. termwiz interprets these as
+            // line-up/line-down inside its scroll-back.
+            let steps = (dy.abs() / 20.0).ceil() as i32;
+            let bytes: &[u8] = if dy > 0.0 { b"\x1b[A" } else { b"\x1b[B" };
+            for _ in 0..steps {
+                let _ = terminal.send_input(bytes);
+            }
+        }
+    }
+
+    /// Pane-border drag detection (M4.7). A 6-pixel hit band around each
+    /// visible side-pane border starts a [`DragState`].
+    fn detect_border_drag(
+        &self,
+        layout: &ComputedLayout,
+        position: PointerPosition,
+    ) -> Option<DragState> {
+        let band = 6.0_f32;
+        if let Some(rect) = layout.files {
+            let border_x = (rect.x + rect.width) as f32;
+            if (position.x - border_x).abs() <= band
+                && position.y >= TOP_BAR_H
+                && position.y <= TOP_BAR_H + rect.height as f32
+            {
+                return Some(DragState::LeftBorder {
+                    start_x: position.x,
+                    start_width: rect.width,
+                });
+            }
+        }
+        if let Some(rect) = layout.terminal {
+            let border_x = rect.x as f32;
+            if (position.x - border_x).abs() <= band
+                && position.y >= TOP_BAR_H
+                && position.y <= TOP_BAR_H + rect.height as f32
+            {
+                return Some(DragState::RightBorder {
+                    start_x: position.x,
+                    start_width: rect.width,
+                });
+            }
+        }
+        None
+    }
+
+    /// Translate a click in the files pane to a row index and act on it:
+    /// single click selects, double-click is the same as Enter (open file
+    /// or expand/collapse). For v0.4 cockpit treats the same click as both
+    /// — a double-click counter would land here later if needed.
+    fn handle_files_click(&mut self, rect: UiRect, position: PointerPosition) {
+        let pane_top = rect.y as f32 + TOP_BAR_H + HEADER_H + PAD * 0.5;
+        let local_y = position.y - pane_top;
+        if local_y < 0.0 {
+            return;
+        }
+        let index = (local_y / ROW_H) as usize;
+        if index >= self.browser.rows().len() {
+            return;
+        }
+        self.browser.select_row(index);
+        self.activate_selection();
     }
 
     /// Push a chord onto the recent-key ring buffer (spec §18.13).
@@ -2192,6 +2373,11 @@ impl AppModel {
 
         let body_height = (height - TOP_BAR_H).max(0.0);
         let computed: ComputedLayout = self.layout.compute(width as u32, body_height as u32);
+        // Remember the latest layout + viewport so mouse hit tests can route
+        // events to the right pane (M4.7).
+        self.last_layout = Some(computed.clone());
+        self.last_view_width = width;
+        self.last_view_height = height;
 
         // Keep the PTY grid matched to the terminal pane before drawing it.
         if let Some(rect) = computed.terminal {
@@ -2338,7 +2524,21 @@ impl AppModel {
         let visible = ((text_height - PAD) / ROW_H).max(1.0) as usize;
 
         let (cursor_line, cursor_col) = editor.cursor().line_col(buffer);
-        let first = cursor_line.saturating_sub(visible.saturating_sub(1));
+        // The first visible line is whichever brings the cursor into view —
+        // typed cursor moves still auto-scroll. The mouse wheel can push the
+        // viewport above that line (M4.7); the user-driven offset wins as
+        // long as the cursor is still inside the visible range.
+        let cursor_anchor = cursor_line.saturating_sub(visible.saturating_sub(1));
+        let scroll_anchor = self.editor_scroll.round() as usize;
+        let max_first = buffer.len_lines().saturating_sub(1);
+        let first = if scroll_anchor <= cursor_line
+            && cursor_line < scroll_anchor + visible
+            && scroll_anchor <= max_first
+        {
+            scroll_anchor
+        } else {
+            cursor_anchor
+        };
 
         let text = buffer.text();
         let lines: Vec<&str> = text.split('\n').collect();
@@ -2769,6 +2969,17 @@ impl Canvas<'_> {
             size * self.scale,
         );
     }
+}
+
+/// True when `position` falls inside `rect`. Pane rectangles use logical
+/// pixels in body coordinates (i.e. the top bar is at `y < TOP_BAR_H` and
+/// not part of any pane); callers compensate before calling.
+fn pane_contains(rect: UiRect, position: PointerPosition) -> bool {
+    let x0 = rect.x as f32;
+    let y0 = rect.y as f32 + TOP_BAR_H;
+    let x1 = x0 + rect.width as f32;
+    let y1 = y0 + rect.height as f32;
+    position.x >= x0 && position.x < x1 && position.y >= y0 && position.y < y1
 }
 
 /// True when `chord` is a single unmodified press of `key`.
@@ -3434,6 +3645,22 @@ impl CockpitApp for AppShell {
 
     fn on_key(&mut self, chord: KeyChord) {
         self.model.dispatch(chord);
+    }
+
+    fn on_mouse_down(&mut self, button: MouseButton, position: PointerPosition) {
+        self.model.on_pointer_down(button, position);
+    }
+
+    fn on_mouse_up(&mut self, button: MouseButton, position: PointerPosition) {
+        self.model.on_pointer_up(button, position);
+    }
+
+    fn on_mouse_move(&mut self, position: PointerPosition) {
+        self.model.on_pointer_move(position);
+    }
+
+    fn on_scroll(&mut self, position: PointerPosition, dx: f32, dy: f32) {
+        self.model.on_scroll(position, dx, dy);
     }
 
     fn set_redraw_handle(&mut self, handle: RedrawHandle) {
@@ -4812,6 +5039,140 @@ mod tests {
         assert_eq!(
             model.document.as_ref().unwrap().editor.text(),
             "fn main() {}\n"
+        );
+    }
+
+    // ---- M4.7 — Mouse input ----------------------------------------------
+
+    /// Compute a layout for the model so the mouse handlers have a real
+    /// rectangle tree to hit-test against. Returns the model + the layout
+    /// for assertions.
+    fn primed_model() -> AppModel {
+        let mut model = model();
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+        model
+    }
+
+    #[test]
+    fn clicking_inside_the_files_pane_focuses_files() {
+        let mut model = primed_model();
+        // Start with the editor focused so the click is observable.
+        model.layout.focus(PaneId::Editor);
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+
+        // The files pane is the leftmost — a click at (10, 200) is safely inside.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(10.0, 200.0));
+        assert_eq!(model.layout.focused(), PaneId::Files);
+    }
+
+    #[test]
+    fn clicking_inside_the_editor_pane_focuses_editor() {
+        let mut model = primed_model();
+        model.layout.focus(PaneId::Files);
+        // Default layout: files=260, editor=460, terminal=480 over 1280px.
+        // Editor center is around x=490.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(490.0, 300.0));
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+    }
+
+    #[test]
+    fn clicking_inside_the_terminal_pane_focuses_terminal() {
+        let mut model = primed_model();
+        // Terminal sits at x >= 800 in the default 1280-wide layout.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(1000.0, 300.0));
+        assert_eq!(model.layout.focused(), PaneId::Terminal);
+    }
+
+    #[test]
+    fn right_click_does_not_change_focus() {
+        let mut model = primed_model();
+        model.layout.focus(PaneId::Editor);
+        // Right-click inside the files pane must NOT steal focus —
+        // right-button is reserved for future context menus.
+        model.on_pointer_down(MouseButton::Right, PointerPosition::new(10.0, 200.0));
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+    }
+
+    #[test]
+    fn dragging_the_left_pane_border_resizes_the_files_pane() {
+        let mut model = primed_model();
+        let initial = model.layout.preferences().left_width;
+        // Press on the left border (default files width = 260) then drag right.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(260.0, 200.0));
+        model.on_pointer_move(PointerPosition::new(320.0, 200.0));
+        model.on_pointer_up(MouseButton::Left, PointerPosition::new(320.0, 200.0));
+        assert!(
+            model.layout.preferences().left_width > initial,
+            "left width {} should exceed initial {initial}",
+            model.layout.preferences().left_width
+        );
+    }
+
+    #[test]
+    fn dragging_the_right_pane_border_resizes_the_terminal_pane() {
+        let mut model = primed_model();
+        let initial = model.layout.preferences().right_width;
+        // Right border lives at x = 800 in the default layout.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(800.0, 200.0));
+        model.on_pointer_move(PointerPosition::new(700.0, 200.0));
+        model.on_pointer_up(MouseButton::Left, PointerPosition::new(700.0, 200.0));
+        assert!(
+            model.layout.preferences().right_width > initial,
+            "right width {} should exceed initial {initial}",
+            model.layout.preferences().right_width
+        );
+    }
+
+    #[test]
+    fn scroll_in_the_editor_pane_updates_the_scroll_offset() {
+        let mut model = primed_model();
+        assert_eq!(model.editor_scroll, 0.0);
+        // Scroll up — content scrolls up so editor_scroll grows.
+        model.on_scroll(PointerPosition::new(490.0, 300.0), 0.0, -40.0);
+        assert!(model.editor_scroll > 0.0, "scroll: {}", model.editor_scroll);
+        // Scrolling back down clamps at zero, not negative.
+        model.on_scroll(PointerPosition::new(490.0, 300.0), 0.0, 200.0);
+        assert_eq!(model.editor_scroll, 0.0);
+    }
+
+    #[test]
+    fn clicking_a_file_row_selects_and_opens_it() {
+        let mut model = primed_model();
+        assert!(model.document.is_none(), "no document open at start");
+
+        // Row 2 in the file-tree fixture is README.md (rows: src, tests,
+        // README.md). Click lands at pane_top + ROW_H * 2 + a few pixels.
+        let row_y = TOP_BAR_H + HEADER_H + PAD * 0.5 + ROW_H * 2.0 + 4.0;
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(10.0, row_y));
+
+        // Opening a file leaves focus on the editor (open_document's contract).
+        assert_eq!(model.layout.focused(), PaneId::Editor);
+        let doc = model.document.as_ref().expect("a file should be open");
+        assert_eq!(doc.name, "README.md");
+    }
+
+    #[test]
+    fn clicking_a_directory_row_expands_it_and_keeps_files_focused() {
+        let mut model = primed_model();
+
+        // Row 0 is `src` — a directory in the file-tree fixture.
+        let row_y = TOP_BAR_H + HEADER_H + PAD * 0.5 + 4.0;
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(10.0, row_y));
+        // Directory toggles don't open a document and don't move focus
+        // away from the files pane.
+        assert!(model.document.is_none());
+        assert_eq!(model.layout.focused(), PaneId::Files);
+        assert!(
+            model.browser.rows().iter().any(|row| row.name == "lib.rs"),
+            "src should be expanded after the click"
         );
     }
 }

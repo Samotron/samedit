@@ -24,7 +24,11 @@ use raw_window_handle::HasWindowHandle;
 use thiserror::Error;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent as WinitKeyEvent, WindowEvent};
+use winit::dpi::PhysicalPosition;
+use winit::event::{
+    ElementState, KeyEvent as WinitKeyEvent, MouseButton as WinitMouseButton, MouseScrollDelta,
+    WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey as WinitNamedKey};
 use winit::window::{Window, WindowId};
@@ -50,6 +54,33 @@ pub struct Viewport {
     pub scale: f32,
 }
 
+/// Mouse buttons cockpit currently routes (M4.7). Right-click and middle
+/// stay unmapped today — Zellij owns the terminal mouse story, and the
+/// rest of the cockpit has no use for them yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// Logical-pixel pointer position used by every mouse callback (M4.7).
+/// Logical coordinates match the layout math in `cockpit-ui`, so callers
+/// can compare a `PointerPosition` directly against [`ComputedLayout`]
+/// rectangles without rescaling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl PointerPosition {
+    /// Construct a position.
+    pub fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
 /// The application driven by the windowing harness.
 ///
 /// Implementors hold the headless view-model and turn it into draw commands.
@@ -70,6 +101,21 @@ pub trait CockpitApp {
 
     /// Notified after the window is resized. Default: ignored.
     fn on_resize(&mut self, _viewport: Viewport) {}
+
+    /// One mouse button just went down at `position` (M4.7). Logical
+    /// coordinates. Default: ignored.
+    fn on_mouse_down(&mut self, _button: MouseButton, _position: PointerPosition) {}
+
+    /// One mouse button just went up (M4.7). Default: ignored.
+    fn on_mouse_up(&mut self, _button: MouseButton, _position: PointerPosition) {}
+
+    /// Pointer moved to `position` (M4.7). Default: ignored.
+    fn on_mouse_move(&mut self, _position: PointerPosition) {}
+
+    /// Scroll wheel delta, in logical-pixel units (M4.7). Positive `dy`
+    /// means content scrolls down (rows leave the top of the viewport).
+    /// Default: ignored.
+    fn on_scroll(&mut self, _position: PointerPosition, _dx: f32, _dy: f32) {}
 
     /// Receive a [`RedrawHandle`] once, before the event loop starts. Lets the
     /// app wake the loop for redraws driven by background threads (PTY output).
@@ -131,6 +177,7 @@ pub fn run_app<A: CockpitApp>(title: impl Into<String>, mut app: A) -> Result<()
         app,
         title: title.into(),
         modifiers: ModifiersState::empty(),
+        cursor: PointerPosition::new(0.0, 0.0),
         gl: None,
         result: Ok(()),
     };
@@ -154,6 +201,10 @@ struct Harness<A: CockpitApp> {
     app: A,
     title: String,
     modifiers: ModifiersState,
+    /// Latest cursor position in logical-pixel coordinates (M4.7). Tracked
+    /// so click events can be reported with a position — `winit` delivers
+    /// `MouseInput` without one and expects the harness to remember.
+    cursor: PointerPosition,
     gl: Option<GlState>,
     result: Result<(), AppError>,
 }
@@ -210,6 +261,19 @@ impl<A: CockpitApp> Harness<A> {
             renderer,
             planner,
         })
+    }
+
+    /// Convert a winit `PhysicalPosition<f64>` into the logical-pixel
+    /// coordinates the layout view-model uses (M4.7). Returns
+    /// `PointerPosition::new(0, 0)` before the GL state is ready — the
+    /// pre-window cursor position is meaningless.
+    fn physical_to_logical(&self, position: PhysicalPosition<f64>) -> PointerPosition {
+        let scale = self
+            .gl
+            .as_ref()
+            .map(|gl| gl.window.scale_factor() as f32)
+            .unwrap_or(1.0);
+        PointerPosition::new((position.x as f32) / scale, (position.y as f32) / scale)
     }
 
     /// Translate, then dispatch, one keyboard event to the application.
@@ -337,6 +401,35 @@ impl<A: CockpitApp> ApplicationHandler for Harness<A> {
                     gl.window.request_redraw();
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                let pos = self.physical_to_logical(position);
+                self.cursor = pos;
+                self.app.on_mouse_move(pos);
+                if let Some(gl) = self.gl.as_ref() {
+                    gl.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(button) = translate_mouse_button(button) {
+                    match state {
+                        ElementState::Pressed => self.app.on_mouse_down(button, self.cursor),
+                        ElementState::Released => self.app.on_mouse_up(button, self.cursor),
+                    }
+                    if let Some(gl) = self.gl.as_ref() {
+                        gl.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * 20.0, y * 20.0),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+                };
+                self.app.on_scroll(self.cursor, dx, dy);
+                if let Some(gl) = self.gl.as_ref() {
+                    gl.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(err) = self.redraw() {
                     self.result = Err(err);
@@ -366,6 +459,18 @@ fn pick_config(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
 }
 
 /// Translate a `winit` keyboard event into a headless [`KeyEvent`].
+/// Translate a `winit` mouse button into the headless cockpit button
+/// (M4.7). Unknown buttons fall through to `None` so back/forward etc.
+/// stay unrouted.
+fn translate_mouse_button(button: WinitMouseButton) -> Option<MouseButton> {
+    match button {
+        WinitMouseButton::Left => Some(MouseButton::Left),
+        WinitMouseButton::Right => Some(MouseButton::Right),
+        WinitMouseButton::Middle => Some(MouseButton::Middle),
+        _ => None,
+    }
+}
+
 fn translate_key(event: &WinitKeyEvent, modifiers: ModifiersState) -> Option<KeyEvent> {
     let key = match &event.logical_key {
         Key::Character(text) => {

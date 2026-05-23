@@ -16,7 +16,9 @@ pub mod text;
 pub mod text_mesh;
 pub mod theme;
 
-pub use app::{AppError, CockpitApp, RedrawHandle, Viewport, run_app};
+pub use app::{
+    AppError, CockpitApp, MouseButton, PointerPosition, RedrawHandle, Viewport, run_app,
+};
 pub use atlas::{AtlasError, AtlasRect, GlyphAllocation, GlyphAtlas};
 pub use frame::{FrameError, FramePlanner, PreparedGlyph, PreparedTextRun, RenderFrame};
 pub use geometry::{GeometryError, Mesh, Vertex, rect_mesh_from_batches, rect_mesh_from_commands};

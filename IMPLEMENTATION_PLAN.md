@@ -435,16 +435,25 @@ inherit the project environment (spec §19).
 
 ### Mouse support (new — not in spec §12)
 
-- [ ] **M4.7 — Mouse input** — first-class mouse handling across the cockpit.
-  `winit` events → `cockpit-ui` view-model → `cockpit-commands`. All
-  behaviour is unit-testable on the view-model tree (no pixel checks,
-  spec §18.8). Surfaces:
-  - Click a pane → focus that pane (launcher / file tree / editor / terminal).
-  - Click a file in the tree → open it in the editor.
-  - Click in the editor gutter/text → move the Vim cursor.
-  - Click in the terminal → focus the terminal (Zellij owns selection).
-  - Drag a pane border → resize side panes; widths persist per-project.
-  - Scroll wheel in editor → scroll buffer; in terminal → scroll back.
+- [x] **M4.7 — Mouse input** — first-class mouse handling across the cockpit.
+  `cockpit-render` translates `winit` mouse events into headless
+  [`MouseButton`] / [`PointerPosition`] callbacks; `AppModel` hit-tests
+  the latest computed layout to route them. Shipped surfaces:
+  - Click a pane → focus that pane (files / editor / terminal). ✅
+  - Click a file in the tree → select and activate the row (file = open,
+    directory = toggle). ✅
+  - Click in the terminal → focus the terminal (Zellij still owns
+    selection). ✅
+  - Drag a pane border → resize the files/terminal panes; widths persist
+    per-project via the existing layout-preferences cache. ✅
+  - Scroll wheel in the editor → push the visible-line offset (the
+    cursor-anchored auto-scroll wins again as soon as the cursor leaves
+    the user-set viewport). ✅
+  - Scroll wheel in the terminal → forwarded as up/down arrow keys so
+    Zellij's scroll-back picks them up. ✅
+  - Click in the editor → focuses the pane today; pixel-to-byte cursor
+    placement is a follow-up because Vim mode interactions are subtle
+    enough to deserve their own milestone. ⏭️
 
 ### Housekeeping (paid down alongside v0.4)
 
