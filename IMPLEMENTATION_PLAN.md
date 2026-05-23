@@ -26,7 +26,7 @@
 | Terminal workspace | shell out to the `zellij` binary                              |
 | Golden tests       | `insta`                                                       |
 | Property tests     | `proptest`                                                    |
-| Test runner        | `cargo nextest` (process isolation — good for PTY tests)      |
+| Test runner        | `cargo test` today; `cargo nextest` remains a future hardening option |
 | Task runner        | `mise` tasks — single source of truth, no `just`/`make`/`xtask` |
 | Logging            | `tracing` + `tracing-subscriber`                              |
 | Errors             | `thiserror` in libraries, `anyhow` in the binary              |
@@ -68,10 +68,12 @@
    without touching call sites, and directly satisfies the spec's §25
    "prototype/keep alternatives" risk posture.
 
-7. **All non-determinism is injected.** Filesystem, process spawning, and the
-   clock are accessed through traits. Core tests pass fakes; integration tests
-   pass the real implementations. This is what makes project detection, the mise
-   layer, and the file browser deterministically testable (spec §18.6).
+7. **All non-determinism should be injectable.** This remains the target
+   architecture: filesystem, process spawning, and the clock should be accessed
+   through traits, with core tests passing fakes and integration tests passing
+   real implementations. **Current status:** some project and app-model paths
+   still use `std::fs` / `std::process::Command` directly. Those paths are
+   tested, but trait injection is still an architecture cleanup item.
 
 8. **No global async runtime.** PTY and child-process I/O run on dedicated OS
    threads with channels. `termwiz`/`portable-pty` are blocking-I/O friendly.
@@ -159,7 +161,9 @@ text) actually work. Nothing here is throwaway — spikes graduate into real cod
 - **Done when:** `mise run build` and `mise run test` succeed locally.
 
 ### M0.2 — Test harness conventions
-- Adopt `cargo nextest`; add `insta` and `proptest` as dev-deps.
+- Current runner is `cargo test`; `insta` and `proptest` are dev-deps.
+  `cargo nextest` remains desirable for process isolation, especially PTY tests,
+  but is not currently wired into `mise.toml` or CI.
 - Integration tests gated behind a Cargo feature `integration`; UI-smoke behind
   `ui-smoke` — so `cargo test` stays fast and hermetic (spec §18.6/§18.7: slow
   tests opt-in).
@@ -196,7 +200,7 @@ text) actually work. Nothing here is throwaway — spikes graduate into real cod
 ### M0.7 — CI skeleton
 - GitHub Actions matrix: `windows-latest`, `macos-latest`, `ubuntu-latest`.
 - Jobs: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo build`,
-  `cargo nextest run`.
+  `cargo test --workspace`.
 - Linux runner installs `winit` system deps (X11 + Wayland dev libraries).
 - **Done when:** all three legs are green.
 
@@ -325,68 +329,296 @@ A + B + C. **E** (hardening) closes the version.
 - [x] Runs Zellij in the right pane.
 - [x] Detects mise tasks.
 - [x] Fast pane switching.
-- [x] `cargo nextest run` green on Windows, macOS, Linux.
+- [x] `cargo test --workspace` green locally and wired in Windows/macOS/Linux CI.
+- [ ] Optional hardening: switch CI and `mise.toml` from `cargo test` to
+      `cargo nextest run` if/when nextest is adopted.
 
 ---
 
 ## 6. v0.2 — Useful daily driver  (spec §23 v0.2)
 
-**M2.1 — Fuzzy file open** — `nucleo` matcher over the lazy tree; `Ctrl+P` UI.
-**M2.2 — Mise task picker + run in Zellij** — palette `Mise: Run Task`; send the
-chosen task into the Zellij session.
-**M2.3 — Persist project layout** — extend the project cache (pane widths, open
-files, active file, Zellij session name — spec §7).
-**M2.4 — Better Vim** — Visual / Visual-line / Replace modes; counts, more
-motions and operators; expand the §18.5 golden suite.
-**M2.5 — Syntax highlighting** — `tree-sitter` integration; token spans →
-themed render; large-file degradation (spec §15). Golden tests on token spans
-(spec §18.3).
-**M2.6 — Terminal→editor path navigation** — wire M1.7 detection to click/jump:
-open the matched file at line:col (spec §17).
-**M2.7 — Project metadata cache hardening** — make launcher startup
-cache-instant (spec §7, §24).
-**M2.8 — Editor property tests** — `proptest` invariants from spec §18.4
-(insert/delete round-trip, undo/redo, offset round-trips, rope vs reference
-string).
-**M2.9 — PTY integration tests** — spec §18.7: start shell, write, read, resize,
-terminate; behind the `integration` feature, run in CI integration leg.
-**M2.10 — mise CLI integration tests** — spec §18.6: run against a real `mise`
-when present; must never trigger `mise install` (spec §18.6 hard rule).
+Status: mostly implemented.
+
+- [x] **M2.1 — Fuzzy file open** — `nucleo` matcher over the lazy tree; `Ctrl+P` UI.
+- [x] **M2.2 — Mise task picker + run in Zellij** — palette `Mise: Run Task`; send the
+  chosen task into the Zellij session.
+- [x] **M2.3 — Persist project layout** — project cache persists pane widths and
+  active/open file state. Zellij session-name persistence is still optional
+  hardening.
+- [x] **M2.4 — Better Vim** — Visual / Visual-line / Replace modes; counts, more
+  motions and operators; expanded §18.5 golden suite.
+- [x] **M2.5 — Syntax highlighting** — `tree-sitter` integration; token spans →
+  themed render; large-file degradation (spec §15). Golden tests on token spans
+  (spec §18.3).
+- [x] **M2.6 — Terminal→editor path navigation** — wire M1.7 detection to jump:
+  open the matched file at line:col (spec §17). Mouse click affordances can be
+  refined later.
+- [x] **M2.7 — Project metadata cache hardening** — launcher uses a recent-projects
+  cache so startup does not re-detect every project.
+- [x] **M2.8 — Editor property tests** — `proptest` invariants from spec §18.4
+  (insert/delete round-trip, undo/redo, offset round-trips, rope vs reference
+  string).
+- [x] **M2.9 — PTY integration tests** — spec §18.7: start shell, write, read,
+  resize, terminate; behind the `integration` feature, run in CI integration leg.
+- [x] **M2.10 — mise CLI integration tests** — spec §18.6: run against a real `mise`
+  when present; must never trigger `mise install` (spec §18.6 hard rule).
 
 ---
 
 ## 7. v0.3 — Strong workflow integration  (spec §23 v0.3)
 
-**M3.1 — Zellij layout support** — parse layout KDL with the `kdl` crate; open
-the configured per-project layout (spec §9 `[metadata.cockpit]`, §10 v0.3).
-**M3.2 — Editor↔terminal bridge** — send selection / current file path to the
-terminal; the full spec §17 bridge surface.
-**M3.3 — Run current file / run nearest test** — palette `Test: Run All / Run
-Current File / Run Nearest` (spec §16); resolve commands via mise tasks.
-**M3.4 — Git status badges** — file-browser badges via `git status --porcelain`
-(shell-out first; `gix` as a later pure-Rust upgrade).
-**M3.5 — LSP foundation** — JSON-RPC client over stdio on a thread; `lsp-types`;
-lazy start (spec §19: not on launch, not until a relevant file opens, never
-blocking, never for huge files); servers launched via `mise exec` (spec §19).
-**M3.6 — UI smoke tests** — spec §18.8: assert on the `cockpit-ui` view-model
-tree (app starts, launcher renders, project opens, three panes, file opens,
-terminal pane created, keybindings, clean exit). Behind the `ui-smoke` feature;
-offscreen GL on CI.
-**M3.7 — Debug surfaces** — spec §18.13 commands: Show Key Events / Command Log
-/ Pane Tree / Project State / Reload Config.
+Status: mostly implemented.
+
+- [x] **M3.1 — Zellij layout support** — parse layout KDL with the `kdl` crate;
+  open the configured per-project layout (spec §9 `[metadata.cockpit]`, §10 v0.3).
+- [x] **M3.2 — Editor↔terminal bridge** — send selection / current file path to
+  the terminal; the main spec §17 bridge surface.
+- [x] **M3.3 — Run current file / run nearest test** — palette `Test: Run All /
+  Run Current File / Run Nearest` (spec §16); resolve commands via mise tasks.
+- [x] **M3.4 — Git status badges** — file-browser badges via
+  `git status --porcelain` (shell-out first; `gix` as a later pure-Rust upgrade).
+- [x] **M3.5 — LSP foundation** — JSON-RPC client over stdio on a thread;
+  `lsp-types`; lazy start (spec §19: not on launch, not until a relevant file
+  opens, never blocking, never for huge files); servers launched via `mise exec`
+  (spec §19).
+- [x] **M3.6 — UI smoke tests** — spec §18.8: assert on the `cockpit-ui`
+  view-model tree (app starts, launcher renders, project opens, three panes,
+  file opens, terminal pane created, keybindings, clean exit). Behind the
+  `ui-smoke` feature with a dedicated CI leg.
+- [x] **M3.7 — Debug surfaces** — spec §18.13 commands: Show Key Events /
+  Command Log / Pane Tree / Project State / Reload Config.
 
 ---
 
-## 8. v0.4 — Coding intelligence  (spec §23 v0.4)
+## 8. v0.4 — Coding intelligence + mouse  (spec §23 v0.4, extended)
 
-**M4.1 — Diagnostics** — render LSP diagnostics in the editor gutter/inline.
-**M4.2 — Navigation** — go-to-definition, hover.
-**M4.3 — Edits** — rename symbol, completion.
-**M4.4 — Format on save** — via LSP formatting or a mise task.
-**M4.5 — LSP uses mise env** — every server inherits the project environment
-(spec §19 examples).
-**M4.6 — Editor conformance tests** — broaden the Vim/editor golden suite (spec
-§23 v0.4 "more editor conformance tests").
+Goal: LSP coding-intelligence breadth across **rust-analyzer,
+typescript-language-server, basedpyright, sqls**, plus first-class mouse
+support and the spec/architecture housekeeping debt. Single milestone — full
+LSP feature set ships together (user decision: breadth over polish).
+
+LSP servers are launched via `mise exec` (M4.0, already shipped) so they
+inherit the project environment (spec §19).
+
+### LSP coding intelligence
+
+- [x] **M4.1 — Diagnostics** — ingest `publishDiagnostics` and render LSP
+  diagnostics in the editor gutter/inline.
+- [ ] **M4.2 — Navigation** — `textDocument/definition` + `hover`. New
+  commands: `Go to Definition` (default `gd`), `Show Hover` (default `K`).
+  Reuses the existing path-jump plumbing from
+  `cockpit-terminal`/`bridge.rs` to open the target file at line:col.
+- [ ] **M4.3a — Rename** — `prepareRename` + `rename`; **inline edit at
+  cursor** (LazyVim/VSCode style), then apply the returned `WorkspaceEdit`.
+- [ ] **M4.3b — Completion** — `textDocument/completion` (+ `resolve` for
+  detail/docs). **Manual trigger only (`Ctrl+Space`)** — no
+  on-keystroke debounce in v0.4 to avoid fighting the Vim FSM. UI is
+  inline ghost text **and** a popup list with docs; view-model lives in
+  `cockpit-ui`, keys in `cockpit-commands`.
+- [ ] **M4.4 — Format on save** — **mise task wins, always.** If a `format`
+  (or `format:<lang>`) mise task exists, use it. If no task exists and a
+  known formatter is detectable (`[tools]` or PATH: `rustfmt`, `prettier`,
+  `ruff`, `black`, `sqlfluff`), surface a prompt: *"Add `format` task to
+  `mise.toml`? [Y/n]"* — write only on user confirm (AGENTS.md hard rule
+  #6: "Detect, surface, prompt — never silently modify"). LSP `formatting`
+  is used **only** when no formatter is detectable and the server
+  advertises the capability.
+- [ ] **M4.5 — Code actions / quick-fix** — `textDocument/codeAction` wired
+  to current diagnostic; palette command + keybinding (default `<leader>ca`).
+- [ ] **M4.6 — Vim/editor conformance** — extend the golden suite for the
+  new motions and operators introduced by navigation/rename (`gd`, `K`,
+  rename interactions). Property tests gain a rename-round-trip case.
+- [ ] **M4.8 — SQL LSP** — `sqls` (most mature, cross-DB). `postgrestools`
+  deferred to a later milestone. Registry entry in `cockpit-lsp`.
+
+### Mouse support (new — not in spec §12)
+
+- [ ] **M4.7 — Mouse input** — first-class mouse handling across the cockpit.
+  `winit` events → `cockpit-ui` view-model → `cockpit-commands`. All
+  behaviour is unit-testable on the view-model tree (no pixel checks,
+  spec §18.8). Surfaces:
+  - Click a pane → focus that pane (launcher / file tree / editor / terminal).
+  - Click a file in the tree → open it in the editor.
+  - Click in the editor gutter/text → move the Vim cursor.
+  - Click in the terminal → focus the terminal (Zellij owns selection).
+  - Drag a pane border → resize side panes; widths persist per-project.
+  - Scroll wheel in editor → scroll buffer; in terminal → scroll back.
+
+### Housekeeping (paid down alongside v0.4)
+
+- [ ] **M4.9 — Spec rewrite Zig → Rust** — update `spec.md` §5, §21, §22,
+  `build.zig` references, and code samples so spec and plan stop diverging
+  (AGENTS.md hard rule #8).
+- [ ] **M4.10 — Trait injection cleanup** (architecture item from §1.7) —
+  replace direct `std::fs` / `std::process::Command` use in `cockpit-project`
+  and the app-model paths with the `cockpit-testkit` traits. Needed anyway
+  for hermetic format-on-save and LSP tests.
+
+---
+
+## 8a. v0.5 — SQL notebooks + dbt-lite analytics  (NEW — post-spec)
+
+Goal: turn the cockpit into a first-class local analytics environment on
+top of **DuckDB**, with executable notebooks and Quarto documents. Three
+composed features:
+
+- **Notebook mode (B)** — cell-based SQL/ggsql execution with **inline**
+  table and chart results in the same view as the source.
+- **Quarto mode** — `.qmd` files (Markdown with `{sql}` / `{ggsql}` code
+  chunks) treated as a peer of the Jupytext notebook format. Chunks
+  execute in-place, outputs render inline, exported via `quarto render`.
+- **dbt-lite project mode (C)** — a project type for `models/*.sql` with
+  `{{ ref(...) }}` / `{{ source(...) }}` templating, materialisations,
+  and a DAG view. Minus the warehouse, minus the Python.
+
+`sqls` (from v0.4 M4.8) continues to provide schema completion/hover
+inside all three modes — they're orthogonal layers.
+
+### Engine integration
+
+- [ ] **M5.1 — DuckDB via shell-out + mise** — execute plain SQL cells by
+  spawning `mise exec -- duckdb`. No embedded `duckdb` crate (keeps the
+  binary small and protects the future instant-load target). If `duckdb`
+  is not in `[tools]`, surface the standard prompt: *"Add `duckdb` to
+  `mise.toml` `[tools]`? [Y/n]"* — never auto-install (AGENTS.md rule
+  #6, spec §8). Long-running session per project: spawn one `duckdb`
+  subprocess on first execution, feed statements over stdin, parse JSON
+  over stdout. Lives in a new crate **`cockpit-sql`** (headless-testable
+  — the DuckDB transport is behind a `SqlEngine` trait with a fake impl
+  in `cockpit-testkit`, mirroring the `TerminalEngine` pattern).
+- [ ] **M5.1a — ggsql via shell-out + mise** — visualisation cells go
+  through `mise exec -- ggsql exec --reader duckdb://memory --writer
+  vegalite`, returning Vega-Lite v6 JSON. ggsql is a Posit project
+  (alpha, Rust, `cargo install ggsql-cli` or via `mise use cargo:ggsql-cli`)
+  that wraps DuckDB internally and emits Vega-Lite specs. Same prompt
+  pattern as M5.1 when absent. Same `SqlEngine` trait — a second
+  `GgsqlEngine` impl, swappable in tests.
+
+### Notebook mode
+
+- [ ] **M5.2 — Notebook file format** — Jupytext-style: **plain `.sql` or
+  `.ggsql` files with `-- %% cell` separators**, opened in a
+  `cockpit-notebook` view-model when the marker is detected. Rationale:
+  diffs cleanly in git, opens as plain SQL/ggsql in any editor, no JSON
+  envelope. A cell is routed to ggsql if its body contains a `VISUALISE`
+  (or `VISUALIZE`) clause, otherwise to DuckDB. Per-cell metadata
+  (title, options) goes in trailing `-- %% meta: { ... }` KDL lines.
+  Cell results are *not* persisted in the file — they live in a sibling
+  `.cockpit/results/<file>.json` cache so they survive reopens without
+  polluting source.
+- [ ] **M5.3 — Notebook view-model** — new crate `cockpit-notebook`. State
+  tree: `Notebook { cells: Vec<Cell { source, kind, status, result } }`,
+  where `kind ∈ { Sql, Ggsql }`. Pure data, fully unit-testable. Vim FSM
+  works inside an active cell; global keys move between cells.
+- [ ] **M5.4 — Inline tabular result rendering** — virtualised scrollable
+  grid for DuckDB results (no full-load), rendered **inline beneath the
+  source cell** — no separate pane, no popout. JSON pretty for
+  non-tabular; error pane for failures. Lives in `cockpit-ui`; renderer
+  in `cockpit-render`.
+- [ ] **M5.5 — Inline chart rendering via ggsql + vl-convert** — ggsql
+  cells emit Vega-Lite v6 JSON; we render that JSON to PNG via
+  `mise exec -- vl-convert vl2png` (or `vl2svg`). vl-convert is Vega's
+  official converter (Rust crate `vl-convert-rs` exists but pulls a
+  bundled Deno runtime, so we shell out instead to stay small and honour
+  the future instant-load budget). PNG bytes feed the existing texture
+  path in `cockpit-render` and display **inline directly below the
+  cell's source** — same single-document flow as tables, never in a
+  side pane. Same detect-and-prompt flow for the `vl-convert` tool as
+  for `duckdb` / `ggsql`. No bespoke chart DSL — ggsql's grammar of
+  graphics (`VISUALISE … DRAW point/line/bar/histogram/boxplot … SCALE …
+  LABEL`) is the chart API.
+- [ ] **M5.5a — ggsql syntax highlighting** — adopt the upstream
+  `tree-sitter-ggsql` grammar so `.ggsql` files and ggsql cells get
+  proper highlighting via the existing tree-sitter pipeline in
+  `cockpit-editor`. Zero new render work — it's just another grammar
+  registration.
+
+### Quarto mode
+
+- [ ] **M5.Q1 — Quarto file parser** — `.qmd` parses into the same
+  `Notebook` view-model as M5.3, but with a third cell kind
+  `Markdown`. Code chunks bounded by ```` ```{sql} ```` / ```` ```{ggsql} ````
+  (plus chunk options like `#| label:`, `#| echo: false`) feed the same
+  DuckDB/ggsql execution path. Non-SQL chunk languages (e.g. `{python}`,
+  `{r}`) are parsed and shown but **not executed in v0.5** — they get a
+  "language unsupported" status banner; full multi-kernel support is a
+  v0.6+ decision.
+- [ ] **M5.Q2 — Inline Markdown rendering** — render Markdown cells
+  inline (between code chunks, in the same document view) via
+  `pulldown-cmark` → styled text runs in `cockpit-render`. Headings,
+  emphasis, lists, code spans, links, and images covered in v0.5; tables
+  and footnotes deferred. Lives in a small new module in `cockpit-ui`
+  (`notebook::markdown`) reused by both `.qmd` and any future
+  Markdown-aware view.
+- [ ] **M5.Q3 — Quarto render/export** — palette command
+  `Quarto: Render` shells out to `mise exec -- quarto render <file>`
+  to produce HTML/PDF/etc. Output path is reported in a status toast and
+  opened via the OS handler — **no embedded WebView** (would add CEF/GTK
+  deps and break the v0.6 instant-load target). Live preview is
+  explicitly out of scope for v0.5; the in-editor inline rendering *is*
+  the preview.
+
+### dbt-lite project mode
+
+- [ ] **M5.6 — Project detection** — a `models/` directory with `.sql`
+  files and a `cockpit-analytics.toml` (or `[metadata.cockpit.analytics]`
+  in `mise.toml`) marks an analytics project. Adds a new "Models" pane.
+- [ ] **M5.7 — Templating** — minimal Jinja-subset for `{{ ref('name') }}`
+  and `{{ source('schema', 'table') }}` only. Hand-rolled parser — no
+  full Jinja dep. Resolution produces a CTE-wrapped final query.
+- [ ] **M5.8 — Materialisations** — `view`, `table`, `ephemeral`
+  (CTE-inlined). Configured via in-file `-- %% config: { materialized:
+  table }`. Build command: `Models: Build All` / `Build Selected`.
+- [ ] **M5.9 — DAG view** — read-time DAG (re-parsed on save, no
+  background indexer — respects spec §3.9/§24). Renders model
+  dependencies in the right pane; clicking a node opens the model.
+
+### Sequencing note
+
+M4.10 (trait injection) is a hard prerequisite for M5.1's `SqlEngine`
+trait pattern. Notebook and dbt-lite can ship in either order after M5.1;
+notebook is the smaller lift and proves the DuckDB transport.
+
+---
+
+## 8b. v0.6 — Instant load  (NEW — post-spec, displaced from v0.5)
+
+Goal: cockpit feels native and instant on a **low-end Linux laptop**.
+Hard targets:
+
+| Metric                                    | Target  |
+|-------------------------------------------|---------|
+| Cold start → interactive window           | ≤ 100ms |
+| Project open → three panes visible        | ≤ 100ms |
+| First keystroke responsive                | ≤ 100ms |
+
+These targets supersede the looser spec §24 numbers (which only required
+"<2s cold start"). Spec §24 should be updated to match (folded into M4.9).
+
+**Architectural note / risk:** 100ms cold start is aggressive — `winit` +
+GL context creation alone can run 30–60ms on cold Mesa. The plan assumes a
+*splash-then-hydrate* pattern: paint a shell at frame 1, finish init
+behind it. If this proves unachievable on the slowest target hardware, we
+will negotiate the budget rather than ship a synthetic green. Note that
+v0.5's DuckDB integration is shell-out specifically to protect this
+budget — the binary stays small, and the first query pays the spawn cost.
+
+- [ ] **M6.1 — Cold-start benchmark harness** — `criterion` benches in
+  `cockpit-testkit` + a CI-gated "cold start" integration test that fails
+  on regression. Establishes the baseline number before any optimisation.
+- [ ] **M6.2 — Splash-then-hydrate frame** — paint the empty three-pane
+  shell on frame 1; defer project detection, tree-sitter grammar load,
+  glyph atlas warm-up, and config parse to subsequent frames.
+- [ ] **M6.3 — Lazy tree-sitter grammars** — grammars load on first file of
+  that language, not at startup (currently eager).
+- [ ] **M6.4 — Glyph atlas disk cache** — persist the warmed atlas to the
+  OS cache dir; rebuild only on theme/font change.
+- [ ] **M6.5 — Deferred LSP spawn** — verify spec §19 is honoured end to
+  end (LSP starts on first relevant keystroke, never on launch).
+- [ ] **M6.6 — Project-cache fast path** — recent-project open reuses the
+  cached file-tree snapshot before re-walking the filesystem.
+- [ ] **M6.7 — Startup tracing** — `tracing` spans tagged `startup.*`;
+  debug command "Show Startup Trace" surfaces the breakdown.
 
 ---
 
@@ -395,7 +627,7 @@ offscreen GL on CI.
 | Spec §        | Realisation                                                       |
 |---------------|-------------------------------------------------------------------|
 | §18.1 pyramid | Many unit + golden; some integration + PTY; few smoke; few e2e.   |
-| §18.2 unit    | `#[test]` colocated in every core crate; `cargo nextest`.         |
+| §18.2 unit    | `#[test]` colocated in every core crate; currently `cargo test`.  |
 | §18.3 golden  | `insta` snapshots; `tests/golden/` per spec layout.               |
 | §18.4 property| `proptest` on the editor buffer (rope vs reference string).       |
 | §18.5 vim FSM | Pure `(buffer,cursor,keys)→(buffer,cursor,mode,registers)` goldens.|
@@ -408,15 +640,16 @@ offscreen GL on CI.
 | §18.12 manual | `cargo run -- --fixture <name>`.                                  |
 | §18.13 logs   | `tracing` + the M3.7 debug surfaces.                              |
 
-**Hermetic by default:** `cargo nextest run` runs only fast, deterministic
-tests. Integration and UI-smoke tests are Cargo-feature-gated and opt-in (spec
-§25: slow/platform tests opt-in or nightly).
+**Hermetic by default:** `cargo test --workspace` runs only fast,
+deterministic tests. Integration and UI-smoke tests are Cargo-feature-gated and
+opt-in (spec §25: slow/platform tests opt-in or nightly). `cargo nextest`
+remains an optional future replacement for the default runner.
 
 ---
 
 ## 10. CI evolution
 
-- **Phase 0 / v0.1:** fmt · clippy · build · `nextest` on the 3-OS matrix.
+- **Phase 0 / v0.1:** fmt · clippy · build · `cargo test` on the 3-OS matrix.
 - **v0.2:** add an integration leg (`--features integration`) — PTY + real mise.
 - **v0.3:** add a UI-smoke leg (`--features ui-smoke`, offscreen GL); split fast
   integration (every PR) vs slow/platform (nightly) per spec §18.9.

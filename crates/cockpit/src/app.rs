@@ -17,7 +17,8 @@ use cockpit_editor::{
     Editor, EditorSignal, HighlightKind, HighlightSpan, Language, nearest_test_name,
 };
 use cockpit_lsp::{
-    Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, ServerConfig,
+    Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, Response,
+    ServerConfig,
 };
 use cockpit_project::{
     FileNodeKind, FileTree, ProjectCache, ProjectDetection, mise_exec_command, project_cache_path,
@@ -73,6 +74,10 @@ const DEBUG_SHOW_PANE_TREE: &str = "debug.show_pane_tree";
 const DEBUG_SHOW_PROJECT_STATE: &str = "debug.show_project_state";
 /// Command id for "reload the user config" (spec §18.13).
 const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
+/// Command id for "go to the symbol's definition under the cursor" (M4.2).
+const LSP_GOTO_DEFINITION: &str = "lsp.goto_definition";
+/// Command id for "show hover information for the symbol under the cursor" (M4.2).
+const LSP_SHOW_HOVER: &str = "lsp.show_hover";
 
 /// Name of the mise task cockpit invokes for the Test: * palette entries.
 /// Conventional default; M4 may make this configurable per project.
@@ -105,6 +110,27 @@ struct OpenDocument {
     name: String,
 }
 
+/// What an in-flight LSP request was asking for, so its [`Response`] can be
+/// routed to the right model update (M4.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LspPending {
+    /// `textDocument/definition` — jump to the result Location/LocationLink.
+    GotoDefinition,
+    /// `textDocument/hover` — show the result in [`AppModel::hover`].
+    Hover { path: PathBuf },
+}
+
+/// The most recently received hover result (M4.2). Cleared when a new
+/// request comes back empty or when the document closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoverInfo {
+    /// Document the hover was requested for; lets the painter ignore stale
+    /// hovers after the user jumps to a different file.
+    path: PathBuf,
+    /// Rendered text content (Markdown stripped to plain runs for now).
+    contents: String,
+}
+
 /// Headless application state for the v0.1 cockpit shell.
 pub struct AppModel {
     detection: ProjectDetection,
@@ -132,6 +158,12 @@ pub struct AppModel {
     lsp_initialized: HashSet<Language>,
     /// Latest `publishDiagnostics` payload per file (spec §23 v0.4 / M4.1).
     diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    /// In-flight LSP requests keyed by request id, so [`Response`]s route
+    /// to the right model update (M4.2: definition / hover).
+    lsp_pending: HashMap<i64, LspPending>,
+    /// Latest hover result, if any. Shown in the mode line / status bar
+    /// until cleared (M4.2).
+    hover: Option<HoverInfo>,
     exit: bool,
 }
 
@@ -162,6 +194,8 @@ impl AppModel {
             lsp_clients: HashMap::new(),
             lsp_initialized: HashSet::new(),
             diagnostics: HashMap::new(),
+            lsp_pending: HashMap::new(),
+            hover: None,
             exit: false,
             detection,
         })
@@ -308,6 +342,8 @@ impl AppModel {
             DEBUG_SHOW_PANE_TREE => self.debug_show_pane_tree(),
             DEBUG_SHOW_PROJECT_STATE => self.debug_show_project_state(),
             DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
+            LSP_GOTO_DEFINITION => self.request_goto_definition(),
+            LSP_SHOW_HOVER => self.request_show_hover(),
             APP_QUIT => self.exit = true,
             other => self.status = format!("Unhandled command `{other}`."),
         }
@@ -1047,6 +1083,15 @@ impl AppModel {
                 tracing::trace!(method = %method, "LSP notification");
             }
             RecvMessage::Response(response) => {
+                // Route responses to whichever request kicked them off
+                // (M4.2). Unmatched responses fall through to the existing
+                // diagnostic logging.
+                if let Some(id) = response.id
+                    && let Some(pending) = self.lsp_pending.remove(&id)
+                {
+                    self.apply_lsp_response(pending, response);
+                    return;
+                }
                 if let Some(error) = &response.error {
                     tracing::warn!(?response.id, code = error.code, message = %error.message, "LSP error response");
                 } else {
@@ -1079,6 +1124,127 @@ impl AppModel {
     /// Diagnostics currently attached to `path`, in document order.
     fn diagnostics_for(&self, path: &Path) -> &[Diagnostic] {
         self.diagnostics.get(path).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Issue a `textDocument/definition` request for the symbol under the
+    /// cursor in the open document (M4.2). The response is matched back to
+    /// this request via [`AppModel::lsp_pending`] and handled by
+    /// [`apply_goto_definition_result`].
+    fn request_goto_definition(&mut self) {
+        let Some((language, path, line, col)) = self.cursor_for_lsp_request() else {
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&language) else {
+            self.status = "Language server is not running for this file.".to_string();
+            return;
+        };
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "position": { "line": line as u64, "character": col as u64 },
+        });
+        match client.request("textDocument/definition", params) {
+            Ok(id) => {
+                self.lsp_pending.insert(id, LspPending::GotoDefinition);
+                self.status = "Looking up definition…".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "LSP definition request failed to queue");
+                self.status = format!("LSP request failed: {err}");
+            }
+        }
+    }
+
+    /// Issue a `textDocument/hover` request for the symbol under the cursor
+    /// (M4.2). The response is handled by [`apply_hover_result`].
+    fn request_show_hover(&mut self) {
+        let Some((language, path, line, col)) = self.cursor_for_lsp_request() else {
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&language) else {
+            self.status = "Language server is not running for this file.".to_string();
+            return;
+        };
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "position": { "line": line as u64, "character": col as u64 },
+        });
+        match client.request("textDocument/hover", params) {
+            Ok(id) => {
+                self.lsp_pending
+                    .insert(id, LspPending::Hover { path: path.clone() });
+                self.status = "Looking up hover…".to_string();
+            }
+            Err(err) => {
+                tracing::warn!(?err, "LSP hover request failed to queue");
+                self.status = format!("LSP request failed: {err}");
+            }
+        }
+    }
+
+    /// Common preflight for the two M4.2 request commands: returns the
+    /// `(language, path, line, col)` needed to build a `TextDocumentPositionParams`
+    /// payload, or sets `status` and yields `None` when the request cannot
+    /// be made.
+    fn cursor_for_lsp_request(&mut self) -> Option<(Language, PathBuf, usize, usize)> {
+        let Some(doc) = self.document.as_ref() else {
+            self.status = "No document open.".to_string();
+            return None;
+        };
+        let Some(language) = Language::from_path(&doc.path) else {
+            self.status = "Unsupported language for LSP request.".to_string();
+            return None;
+        };
+        let (line, col) = doc.editor.cursor().line_col(doc.editor.buffer());
+        Some((language, doc.path.clone(), line, col))
+    }
+
+    /// Apply a `Response` that matched a pending [`LspPending`] entry. Splits
+    /// out so the dispatch in [`handle_lsp_message`] stays small.
+    fn apply_lsp_response(&mut self, pending: LspPending, response: Response) {
+        if let Some(error) = &response.error {
+            self.status = format!("LSP error: {}", error.message);
+            return;
+        }
+        let result = response.result.unwrap_or(serde_json::Value::Null);
+        match pending {
+            LspPending::GotoDefinition => self.apply_goto_definition_result(result),
+            LspPending::Hover { path } => self.apply_hover_result(path, result),
+        }
+    }
+
+    /// Open the file at the first usable Location/LocationLink returned by
+    /// `textDocument/definition`, or surface "no definition" otherwise.
+    fn apply_goto_definition_result(&mut self, result: serde_json::Value) {
+        let Some((target_uri, line, character)) = parse_first_location(&result) else {
+            self.status = "No definition found.".to_string();
+            return;
+        };
+        let Some(path) = path_from_file_uri(&target_uri) else {
+            self.status = format!("Definition URI was not a file://: {target_uri}");
+            return;
+        };
+        // LSP positions are 0-based; `open_document_at` expects 1-based.
+        self.open_document_at(path, Some(line + 1), Some(character + 1));
+    }
+
+    /// Store the rendered hover text (if any) for the requesting document
+    /// and reflect it in the status bar.
+    fn apply_hover_result(&mut self, from_path: PathBuf, result: serde_json::Value) {
+        let Some(contents) = extract_hover_contents(&result) else {
+            self.hover = None;
+            self.status = "No hover information.".to_string();
+            return;
+        };
+        let first_line = contents.lines().next().unwrap_or("").to_string();
+        self.hover = Some(HoverInfo {
+            path: from_path,
+            contents,
+        });
+        self.status = if first_line.is_empty() {
+            "Hover received.".to_string()
+        } else {
+            format!("Hover: {first_line}")
+        };
     }
 
     /// Paint the whole window for one frame.
@@ -1813,6 +1979,65 @@ fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
     }
 }
 
+/// Extract the first usable target from a `textDocument/definition` result,
+/// which the LSP spec lets be `null`, a single `Location`, an array of
+/// `Location`, or an array of `LocationLink`. Returns `(uri, line, character)`
+/// in 0-based LSP coordinates.
+fn parse_first_location(result: &serde_json::Value) -> Option<(String, u32, u32)> {
+    if result.is_null() {
+        return None;
+    }
+    if let Some(arr) = result.as_array() {
+        return arr.iter().find_map(parse_first_location);
+    }
+    // Location: { uri, range }. LocationLink: { targetUri,
+    // targetSelectionRange | targetRange }.
+    let uri = result
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| result.get("targetUri").and_then(|v| v.as_str()))?;
+    let range = result
+        .get("range")
+        .or_else(|| result.get("targetSelectionRange"))
+        .or_else(|| result.get("targetRange"))?;
+    let start = range.get("start")?;
+    let line = start.get("line")?.as_u64()?;
+    let character = start.get("character")?.as_u64()?;
+    Some((uri.to_string(), line as u32, character as u32))
+}
+
+/// Extract a single plain-text string from a `textDocument/hover` result,
+/// which can be `null`, or `{ contents: <MarkupContent | MarkedString |
+/// MarkedString[]> }`. Markdown formatting is preserved as-is for now;
+/// richer rendering is a later milestone.
+fn extract_hover_contents(result: &serde_json::Value) -> Option<String> {
+    if result.is_null() {
+        return None;
+    }
+    let contents = result.get("contents")?;
+    extract_marked_string(contents)
+}
+
+fn extract_marked_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::String(_) => None,
+        serde_json::Value::Object(map) => {
+            // MarkupContent { kind, value } or MarkedString { language, value }.
+            map.get("value")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }
+        serde_json::Value::Array(arr) => {
+            let joined: Vec<String> = arr.iter().filter_map(extract_marked_string).collect();
+            (!joined.is_empty()).then(|| joined.join("\n\n"))
+        }
+        _ => None,
+    }
+}
+
 /// The command palette's v0.1 command set (spec §16).
 fn palette_entries() -> Vec<PaletteEntry> {
     vec![
@@ -1830,6 +2055,8 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(TEST_RUN_ALL, "Test: Run All"),
         PaletteEntry::new(TEST_RUN_CURRENT_FILE, "Test: Run Current File"),
         PaletteEntry::new(TEST_RUN_NEAREST, "Test: Run Nearest"),
+        PaletteEntry::new(LSP_GOTO_DEFINITION, "LSP: Go to Definition"),
+        PaletteEntry::new(LSP_SHOW_HOVER, "LSP: Show Hover"),
         PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
         PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
@@ -2296,6 +2523,146 @@ mod tests {
         .unwrap();
         model.apply_publish_diagnostics(cleared);
         assert!(model.diagnostics_for(&expected).is_empty());
+    }
+
+    #[test]
+    fn parse_first_location_reads_a_single_location() {
+        let v = serde_json::json!({
+            "uri": "file:///code/main.rs",
+            "range": {
+                "start": {"line": 12, "character": 4},
+                "end":   {"line": 12, "character": 9},
+            }
+        });
+        let (uri, line, col) = parse_first_location(&v).expect("single Location parses");
+        assert_eq!(uri, "file:///code/main.rs");
+        assert_eq!((line, col), (12, 4));
+    }
+
+    #[test]
+    fn parse_first_location_reads_a_location_link() {
+        let v = serde_json::json!([{
+            "targetUri": "file:///code/lib.rs",
+            "targetSelectionRange": {
+                "start": {"line": 7, "character": 0},
+                "end":   {"line": 7, "character": 3},
+            },
+            "targetRange": {
+                "start": {"line": 5, "character": 0},
+                "end":   {"line": 9, "character": 0},
+            }
+        }]);
+        let (uri, line, col) = parse_first_location(&v).expect("LocationLink array parses");
+        assert_eq!(uri, "file:///code/lib.rs");
+        // targetSelectionRange wins over targetRange (more precise).
+        assert_eq!((line, col), (7, 0));
+    }
+
+    #[test]
+    fn parse_first_location_skips_an_empty_array() {
+        assert!(parse_first_location(&serde_json::json!([])).is_none());
+        assert!(parse_first_location(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn extract_hover_contents_handles_markup_content() {
+        let v = serde_json::json!({
+            "contents": {"kind": "markdown", "value": "**fn foo()**\n\nDoes a thing."}
+        });
+        assert_eq!(
+            extract_hover_contents(&v).as_deref(),
+            Some("**fn foo()**\n\nDoes a thing."),
+        );
+    }
+
+    #[test]
+    fn extract_hover_contents_handles_marked_string_array() {
+        let v = serde_json::json!({
+            "contents": [
+                {"language": "rust", "value": "fn foo()"},
+                "Bare line",
+            ]
+        });
+        assert_eq!(
+            extract_hover_contents(&v).as_deref(),
+            Some("fn foo()\n\nBare line"),
+        );
+    }
+
+    #[test]
+    fn extract_hover_contents_returns_none_for_empty() {
+        assert!(extract_hover_contents(&serde_json::Value::Null).is_none());
+        assert!(
+            extract_hover_contents(&serde_json::json!({"contents": ""})).is_none(),
+            "empty string hover yields no info",
+        );
+    }
+
+    #[test]
+    fn apply_goto_definition_result_opens_the_target_file_at_line_and_column() {
+        let mut model = rust_model();
+        let target = model.detection.root_path.join("src").join("main.rs");
+        let uri = file_uri(&target);
+        let result = serde_json::json!({
+            "uri": uri,
+            "range": {
+                "start": {"line": 1, "character": 4},
+                "end":   {"line": 1, "character": 7},
+            }
+        });
+
+        model.apply_goto_definition_result(result);
+
+        let doc = model.document.as_ref().expect("document opened");
+        assert_eq!(doc.name, "main.rs");
+        // LSP 0-based (1,4) → editor's 0-based (1,4) once the +1/−1
+        // round-trip through `open_document_at` settles.
+        assert_eq!(doc.editor.cursor().line_col(doc.editor.buffer()), (1, 4));
+    }
+
+    #[test]
+    fn apply_goto_definition_result_reports_when_no_definition() {
+        let mut model = rust_model();
+        model.apply_goto_definition_result(serde_json::Value::Null);
+        assert_eq!(model.status, "No definition found.");
+        assert!(model.document.is_none());
+    }
+
+    #[test]
+    fn apply_hover_result_stores_contents_and_updates_status() {
+        let mut model = rust_model();
+        let path = model.detection.root_path.join("src").join("main.rs");
+        let result = serde_json::json!({
+            "contents": {"kind": "markdown", "value": "fn main()\n\nEntry point."}
+        });
+
+        model.apply_hover_result(path.clone(), result);
+
+        let hover = model.hover.as_ref().expect("hover stored");
+        assert_eq!(hover.path, path);
+        assert!(hover.contents.starts_with("fn main()"));
+        assert_eq!(model.status, "Hover: fn main()");
+    }
+
+    #[test]
+    fn apply_hover_result_clears_hover_on_empty_response() {
+        let mut model = rust_model();
+        // Seed an old hover so we can prove it gets cleared.
+        model.hover = Some(HoverInfo {
+            path: PathBuf::from("/tmp/x.rs"),
+            contents: "stale".to_string(),
+        });
+        model.apply_hover_result(PathBuf::from("/tmp/x.rs"), serde_json::Value::Null);
+        assert!(model.hover.is_none());
+        assert_eq!(model.status, "No hover information.");
+    }
+
+    #[test]
+    fn request_goto_definition_without_a_document_reports_it() {
+        let mut model = rust_model();
+        model.request_goto_definition();
+        assert_eq!(model.status, "No document open.");
+        assert!(model.lsp_pending.is_empty());
     }
 
     #[test]
