@@ -7,8 +7,8 @@
 //! adapter the windowing harness drives — all real logic lives in [`AppModel`],
 //! so it stays testable without a window (AGENTS §2).
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::{GlobalKeys, ZellijLayout};
@@ -16,6 +16,7 @@ use cockpit_editor::vim::{Key as VimKey, Mode};
 use cockpit_editor::{
     Editor, EditorSignal, HighlightKind, HighlightSpan, Language, nearest_test_name,
 };
+use cockpit_lsp::{LspClient, ServerConfig};
 use cockpit_project::{
     FileNodeKind, FileTree, ProjectCache, ProjectDetection, project_cache_path, walk_project_files,
 };
@@ -77,6 +78,10 @@ const TEST_TASK: &str = "test";
 const TEST_TASK_MISSING: &str = "No `test` mise task — add one to your mise.toml.";
 /// Cap on the diagnostics ring buffers (recent keys, recent commands).
 const DEBUG_LOG_SIZE: usize = 32;
+/// Hard cap on file size before cockpit will start a language server for it
+/// (spec §19 — never for huge files). 1 MiB matches the spec's "huge files"
+/// posture; anything bigger keeps the LSP path cold.
+const LSP_MAX_BYTES: usize = 1_048_576;
 
 /// What activating a palette entry does — the palette is reused as both the
 /// command palette and the mise-task picker.
@@ -117,6 +122,11 @@ pub struct AppModel {
     key_log: VecDeque<String>,
     /// Most recent command ids, oldest first (spec §18.13 command log).
     command_log: VecDeque<String>,
+    /// Lazy per-language LSP clients (spec §19 / M3.5). Spawned on first
+    /// open of a relevant file; never started on app launch.
+    lsp_clients: HashMap<Language, LspClient>,
+    /// Languages whose servers have already received `initialize`/`initialized`.
+    lsp_initialized: HashSet<Language>,
     exit: bool,
 }
 
@@ -144,6 +154,8 @@ impl AppModel {
             cache_path: None,
             key_log: VecDeque::with_capacity(DEBUG_LOG_SIZE),
             command_log: VecDeque::with_capacity(DEBUG_LOG_SIZE),
+            lsp_clients: HashMap::new(),
+            lsp_initialized: HashSet::new(),
             exit: false,
             detection,
         })
@@ -888,8 +900,90 @@ impl AppModel {
                 editor.set_language(Language::from_path(&path));
                 self.document = Some(OpenDocument { editor, path, name });
                 self.layout.focus(PaneId::Editor);
+                self.start_lsp_for_document();
             }
             Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
+        }
+    }
+
+    /// Lazily spawn (and `initialize` / `didOpen`) the LSP client for the
+    /// document just opened. Spec §19 hard rules apply: never on launch, only
+    /// when a relevant file opens, never blocking, never for huge files,
+    /// servers launched via `mise exec` so we never bypass the project env.
+    fn start_lsp_for_document(&mut self) {
+        let (path, language, text) = {
+            let Some(doc) = self.document.as_ref() else {
+                return;
+            };
+            let Some(language) = Language::from_path(&doc.path) else {
+                return;
+            };
+            let size = doc.editor.buffer().len_bytes();
+            if size > LSP_MAX_BYTES {
+                tracing::info!(
+                    ?language,
+                    size,
+                    "LSP skipped: file exceeds size cap (spec §19)",
+                );
+                return;
+            }
+            (doc.path.clone(), language, doc.editor.buffer().text())
+        };
+        let Some(config) = ServerConfig::for_language(language) else {
+            return;
+        };
+
+        if !self.lsp_clients.contains_key(&language) {
+            let mut argv = vec!["exec".to_string(), "--".to_string(), config.command.clone()];
+            argv.extend(config.args.iter().cloned());
+            match LspClient::spawn("mise", &argv, Some(&self.detection.root_path)) {
+                Ok(client) => {
+                    tracing::info!(?language, command = %config.command, "LSP client spawned");
+                    self.lsp_clients.insert(language, client);
+                }
+                Err(err) => {
+                    tracing::warn!(?err, ?language, "LSP spawn failed — continuing without it");
+                    return;
+                }
+            }
+        }
+        let client = self
+            .lsp_clients
+            .get(&language)
+            .expect("client inserted above");
+
+        if !self.lsp_initialized.contains(&language) {
+            let root_uri = file_uri(&self.detection.root_path);
+            let init_params = serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "cockpit",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            });
+            if let Err(err) = client.request("initialize", init_params) {
+                tracing::warn!(?err, "LSP initialize request failed to queue");
+                return;
+            }
+            if let Err(err) = client.notify("initialized", serde_json::json!({})) {
+                tracing::warn!(?err, "LSP initialized notification failed to queue");
+                return;
+            }
+            self.lsp_initialized.insert(language);
+        }
+
+        let didopen_params = serde_json::json!({
+            "textDocument": {
+                "uri": file_uri(&path),
+                "languageId": config.language_id(),
+                "version": 1,
+                "text": text,
+            }
+        });
+        if let Err(err) = client.notify("textDocument/didOpen", didopen_params) {
+            tracing::warn!(?err, "LSP textDocument/didOpen failed to queue");
         }
     }
 
@@ -1554,6 +1648,22 @@ fn chord_to_terminal_bytes(chord: &KeyChord) -> Option<Vec<u8>> {
                 Some(c.to_string().into_bytes())
             }
         }
+    }
+}
+
+/// Format `path` as an LSP `file://` URI. The path is treated as absolute;
+/// callers above resolve project-relative paths against the project root.
+fn file_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if cfg!(windows) {
+        let normalised = raw.replace('\\', "/");
+        if normalised.starts_with('/') {
+            format!("file://{normalised}")
+        } else {
+            format!("file:///{normalised}")
+        }
+    } else {
+        format!("file://{raw}")
     }
 }
 

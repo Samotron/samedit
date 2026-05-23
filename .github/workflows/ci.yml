@@ -86,11 +86,17 @@ jobs:
       - name: Clippy — cockpit-project (integration)
         run: cargo clippy -p cockpit-project --all-targets --features integration -- -D warnings
 
+      - name: Clippy — cockpit-lsp (integration)
+        run: cargo clippy -p cockpit-lsp --all-targets --features integration -- -D warnings
+
       - name: PTY integration tests
         run: cargo test -p cockpit-terminal --features integration
 
       - name: mise CLI integration tests
         run: cargo test -p cockpit-project --features integration
+
+      - name: LSP transport integration tests
+        run: cargo test -p cockpit-lsp --features integration
 
   ui-smoke:
     name: ui-smoke (${{ matrix.os }})

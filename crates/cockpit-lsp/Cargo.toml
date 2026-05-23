@@ -1,0 +1,19 @@
+[package]
+name = "cockpit-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LSP client foundation for Coding Cockpit — JSON-RPC over stdio on dedicated OS threads."
+
+[features]
+default = []
+integration = []
+
+[dependencies]
+cockpit-editor.workspace = true
+lsp-types = "0.97"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.18"
+tracing = "0.1.41"

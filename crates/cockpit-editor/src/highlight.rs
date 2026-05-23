@@ -37,7 +37,7 @@ pub struct HighlightSpan {
 }
 
 /// A source language with tree-sitter support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
 }
