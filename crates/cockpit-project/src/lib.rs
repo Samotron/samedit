@@ -1,7 +1,12 @@
 //! `cockpit-project` — projects, `mise` integration, and the file tree.
 //!
 //! Project detection (spec §6), the `mise` environment provider (spec §8),
-//! the per-project state cache (spec §7), and the lazy file tree (spec §13).
+//! the per-project state cache (spec §7), the lazy file tree (spec §13), and
+//! the git status integration that drives file-browser badges (spec §23 v0.3).
+
+pub mod git;
+
+pub use git::{GitStatus, git_status, parse_porcelain_z};
 
 use std::{
     collections::BTreeMap,
@@ -994,5 +999,113 @@ zellij_layout = ".config/zellij/dev.kdl"
             .parent()
             .unwrap()
             .to_path_buf()
+    }
+}
+
+/// CLI integration tests for the `mise` layer (spec §18.6).
+///
+/// These run against a real `mise` binary when one is on `PATH`, and skip
+/// cleanly otherwise so the suite stays hermetic on machines without it. Per
+/// spec §18.6 they must never trigger `mise install`: the `mise exec` check
+/// runs in a config-isolated temp directory that has no tools to install.
+#[cfg(all(test, feature = "integration"))]
+mod integration_tests {
+    use super::*;
+
+    /// Returns `true` (and logs) when `mise` is absent, so a test can early-out.
+    fn skip_without_mise() -> bool {
+        if mise_available() {
+            return false;
+        }
+        eprintln!("skipping mise CLI integration test: `mise` is not on PATH");
+        true
+    }
+
+    fn task_names(project: &MiseProject) -> Vec<&str> {
+        project
+            .tasks
+            .iter()
+            .map(|task| task.name.as_str())
+            .collect()
+    }
+
+    fn tool_names(project: &MiseProject) -> Vec<&str> {
+        project
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn detects_fixture_tasks_and_tools() {
+        let project = detect_mise_project(cockpit_testkit::fixture_path("mise-basic")).unwrap();
+
+        assert!(project.detected);
+        assert_eq!(task_names(&project), ["lint", "test"]);
+        assert_eq!(tool_names(&project), ["rust"]);
+        // The `available` flag must agree with whether the real binary answered.
+        assert_eq!(project.available, mise_available());
+    }
+
+    #[test]
+    fn mise_binary_is_detected_when_installed() {
+        if skip_without_mise() {
+            return;
+        }
+
+        assert!(mise_available());
+        let project = detect_mise_project(cockpit_testkit::fixture_path("mise-basic")).unwrap();
+        assert!(
+            project.available,
+            "mise is on PATH but the project reports it unavailable",
+        );
+    }
+
+    #[test]
+    fn mise_exec_command_runs_against_real_mise() {
+        if skip_without_mise() {
+            return;
+        }
+
+        // Isolate mise from every config source so `mise exec` sees no tools —
+        // spec §18.6 hard rule: integration tests must not run `mise install`.
+        let dir = tempfile::tempdir().unwrap();
+        let argv = mise_exec_command(&["echo", "cockpit-mise-exec"]);
+
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(dir.path())
+            .env(
+                "MISE_GLOBAL_CONFIG_FILE",
+                dir.path().join("no-global-config.toml"),
+            )
+            .env("MISE_CONFIG_DIR", dir.path().join("mise-config"))
+            .env("MISE_DATA_DIR", dir.path().join("mise-data"))
+            .env("MISE_CACHE_DIR", dir.path().join("mise-cache"))
+            .output()
+            .expect("mise exec should spawn");
+
+        assert!(
+            output.status.success(),
+            "mise exec failed: status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("cockpit-mise-exec"),
+            "missing marker in mise exec stdout: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+
+        // Prove the hard rule held: nothing was installed under the data dir.
+        let installs = dir.path().join("mise-data").join("installs");
+        let installed_anything = std::fs::read_dir(&installs)
+            .map(|entries| entries.count() > 0)
+            .unwrap_or(false);
+        assert!(
+            !installed_anything,
+            "mise exec must not install tools (spec §18.6)",
+        );
     }
 }

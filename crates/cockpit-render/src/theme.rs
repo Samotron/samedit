@@ -70,6 +70,10 @@ pub struct Theme {
     pub selection: Color,
     pub cursor: Color,
     pub syntax: SyntaxTheme,
+    pub diagnostic_error: Color,
+    pub diagnostic_warning: Color,
+    pub diagnostic_info: Color,
+    pub diagnostic_hint: Color,
 }
 
 impl Default for Theme {
@@ -84,6 +88,10 @@ impl Default for Theme {
             selection: Color::rgba(0.270, 0.520, 0.900, 0.35),
             cursor: Color::rgb(0.960, 0.960, 0.900),
             syntax: SyntaxTheme::default(),
+            diagnostic_error: Color::rgb(0.920, 0.380, 0.380),
+            diagnostic_warning: Color::rgb(0.950, 0.760, 0.380),
+            diagnostic_info: Color::rgb(0.470, 0.700, 0.940),
+            diagnostic_hint: Color::rgb(0.560, 0.600, 0.650),
         }
     }
 }
