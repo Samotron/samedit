@@ -6,7 +6,8 @@
 //! file browser. The parser is pure and headless-testable.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use crate::env::{ProcessRunner, ProcessSpec, StdProcessRunner};
 
 /// Per-file git status the UI badges with. Distilled from the two-character
 /// porcelain code into the categories the file browser actually cares about.
@@ -39,16 +40,27 @@ impl GitStatus {
 /// Run `git status --porcelain=v1 -z` in `project_root` and return per-path
 /// statuses. Returns an empty list when `git` is missing, this is not a git
 /// working tree, or the command fails — badges are advisory, never fatal.
+///
+/// Production wrapper around [`git_status_with`] using the std-backed
+/// process runner (M4.10). Tests can call `git_status_with` and pass a
+/// fake to avoid actually spawning `git`.
 pub fn git_status(project_root: &Path) -> Vec<(PathBuf, GitStatus)> {
-    let output = match Command::new("git")
+    git_status_with(project_root, &StdProcessRunner)
+}
+
+/// Trait-injected variant of [`git_status`] — same semantics, but the
+/// process spawn goes through `runner` so tests can stub it out (M4.10).
+pub fn git_status_with(
+    project_root: &Path,
+    runner: &dyn ProcessRunner,
+) -> Vec<(PathBuf, GitStatus)> {
+    let spec = ProcessSpec::new("git")
         .args(["status", "--porcelain=v1", "-z"])
-        .current_dir(project_root)
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return Vec::new(),
-    };
-    parse_porcelain_z(&output.stdout)
+        .current_dir(project_root);
+    match runner.run(&spec) {
+        Ok(output) if output.success => parse_porcelain_z(&output.stdout),
+        _ => Vec::new(),
+    }
 }
 
 /// Parse a `git status --porcelain=v1 -z` payload. Entries are NUL-terminated:

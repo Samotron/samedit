@@ -68,12 +68,14 @@
    without touching call sites, and directly satisfies the spec's §25
    "prototype/keep alternatives" risk posture.
 
-7. **All non-determinism should be injectable.** This remains the target
-   architecture: filesystem, process spawning, and the clock should be accessed
-   through traits, with core tests passing fakes and integration tests passing
-   real implementations. **Current status:** some project and app-model paths
-   still use `std::fs` / `std::process::Command` directly. Those paths are
-   tested, but trait injection is still an architecture cleanup item.
+7. **All non-determinism is injectable.** Filesystem, process spawning, and
+   the clock are accessed through the `FileSystem`, `ProcessRunner`, and
+   `Clock` traits in `cockpit-project::env` (M4.10). Production callers pass
+   `Std*` impls; tests pass `Fake*` impls from the same module. Remaining
+   direct `std::fs` use in `cockpit-project` is limited to the file-tree
+   walk and lazy children load — those still touch real directories because
+   they walk arbitrary trees; an in-memory fs trait abstraction over
+   `read_dir` is a future cleanup.
 
 8. **No global async runtime.** PTY and child-process I/O run on dedicated OS
    threads with channels. `termwiz`/`portable-pty` are blocking-I/O friendly.
@@ -449,10 +451,15 @@ inherit the project environment (spec §19).
 - [ ] **M4.9 — Spec rewrite Zig → Rust** — update `spec.md` §5, §21, §22,
   `build.zig` references, and code samples so spec and plan stop diverging
   (AGENTS.md hard rule #8).
-- [ ] **M4.10 — Trait injection cleanup** (architecture item from §1.7) —
-  replace direct `std::fs` / `std::process::Command` use in `cockpit-project`
-  and the app-model paths with the `cockpit-testkit` traits. Needed anyway
-  for hermetic format-on-save and LSP tests.
+- [x] **M4.10 — Trait injection cleanup** (architecture item from §1.7) —
+  `cockpit-project::env` now hosts `FileSystem`, `ProcessRunner`, and `Clock`
+  traits with `Std*` production impls and `Fake*` in-memory test impls.
+  `detect_mise_project`, `git_status`, `ProjectCache::load/store`, and
+  `RecentProjects::load/store` all gained `_with` variants that take the
+  trait objects (the unadorned wrappers keep the existing call sites
+  unchanged). `AppModel::with_env` lets the app inject the seam end to
+  end; the format-on-save flow now has a hermetic test that scripts every
+  spawn and snapshots every write without touching real disk.
 
 ---
 

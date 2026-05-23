@@ -21,9 +21,10 @@ use cockpit_lsp::{
     ServerConfig,
 };
 use cockpit_project::{
-    FileNodeKind, FileTree, FormatPlan, KnownFormatter, PathBinaryLookup as FormatPathLookup,
-    ProjectCache, ProjectDetection, mise_exec_command, plan_format, project_cache_path,
-    render_format_task_snippet, walk_project_files,
+    FileNodeKind, FileSystem, FileTree, FormatPlan, KnownFormatter,
+    PathBinaryLookup as FormatPathLookup, ProcessRunner, ProcessSpec, ProjectCache,
+    ProjectDetection, StdFileSystem, StdProcessRunner, mise_exec_command, plan_format,
+    project_cache_path, render_format_task_snippet, walk_project_files,
 };
 use cockpit_render::theme::Color;
 use cockpit_render::{CockpitApp, Painter, Rect as RenderRect, RedrawHandle, Theme, Viewport};
@@ -198,6 +199,12 @@ struct RenameInput {
 /// Headless application state for the v0.1 cockpit shell.
 pub struct AppModel {
     detection: ProjectDetection,
+    /// Filesystem seam (M4.10). Production uses [`StdFileSystem`]; tests
+    /// inject a [`cockpit_project::FakeFileSystem`] via [`AppModel::with_env`].
+    fs: Box<dyn FileSystem>,
+    /// Process-spawn seam (M4.10). Production uses [`StdProcessRunner`];
+    /// tests inject a [`cockpit_project::FakeProcessRunner`].
+    process: Box<dyn ProcessRunner>,
     browser: FileBrowser,
     layout: WorkspaceLayout,
     router: InputRouter,
@@ -254,11 +261,33 @@ impl AppModel {
     /// Build the model for a detected project and its loaded file tree.
     ///
     /// This is pure — call [`restore_cached_state`](Self::restore_cached_state)
-    /// afterwards to load persisted per-project state from disk.
+    /// afterwards to load persisted per-project state from disk. The
+    /// std-backed fs and process runner are used; for hermetic tests call
+    /// [`AppModel::with_env`] to inject fakes (M4.10).
     pub fn new(detection: ProjectDetection, tree: FileTree) -> Result<Self, String> {
+        Self::with_env(
+            detection,
+            tree,
+            Box::new(StdFileSystem),
+            Box::new(StdProcessRunner),
+        )
+    }
+
+    /// Build the model with caller-supplied env seams (M4.10). Used by
+    /// hermetic tests to scrub real filesystem / subprocess access from
+    /// the model — the v0.5 SqlEngine work depends on this pattern being
+    /// in place.
+    pub fn with_env(
+        detection: ProjectDetection,
+        tree: FileTree,
+        fs: Box<dyn FileSystem>,
+        process: Box<dyn ProcessRunner>,
+    ) -> Result<Self, String> {
         let router = InputRouter::from_global_keys(&GlobalKeys::default())
             .map_err(|err| format!("input router setup failed: {err:?}"))?;
         Ok(Self {
+            fs,
+            process,
             browser: FileBrowser::new(tree),
             layout: WorkspaceLayout::new(),
             router,
@@ -1145,9 +1174,10 @@ impl AppModel {
         }
     }
 
-    /// Load a file into the editor pane.
+    /// Load a file into the editor pane. Disk read goes through
+    /// [`Self::fs`] so the path is testable with fakes (M4.10).
     fn open_document(&mut self, path: PathBuf) {
-        match std::fs::read_to_string(&path) {
+        match self.fs.read_to_string(&path) {
             Ok(content) => {
                 let name = path
                     .file_name()
@@ -1249,12 +1279,13 @@ impl AppModel {
 
     /// Write the open document to its file. When `format_on_save` is enabled
     /// the formatter runs immediately after the on-disk write succeeds (M4.4).
+    /// Disk write goes through [`Self::fs`] (M4.10).
     fn save_document(&mut self) {
         let Some(doc) = self.document.as_mut() else {
             self.status = "No document to save.".to_string();
             return;
         };
-        match std::fs::write(&doc.path, doc.editor.text()) {
+        match self.fs.write(&doc.path, doc.editor.text().as_bytes()) {
             Ok(()) => {
                 doc.editor.mark_saved();
                 self.status = format!("Saved {}", doc.name);
@@ -1756,36 +1787,40 @@ impl AppModel {
     /// open document. The on-disk version is the source of truth: the buffer
     /// is already saved by the time we get here (either via [`save_document`]
     /// or via an explicit save flushed by the manual command), so we spawn
-    /// `mise run <task> -- <path>`, wait for it, and reload the buffer.
+    /// `mise run <task> -- <path>` through [`Self::process`], wait for it,
+    /// and reload the buffer through [`Self::fs`] (M4.10).
     fn run_format_mise_task(&mut self, path: &Path, task: &str, trigger: FormatTrigger) {
         // Manual triggers also need the on-disk file to match the buffer
         // before we hand it to the formatter — flush first.
         if trigger == FormatTrigger::Manual
             && let Some(doc) = self.document.as_ref()
             && doc.editor.is_dirty()
-            && let Err(err) = std::fs::write(&doc.path, doc.editor.text())
+            && let Err(err) = self.fs.write(&doc.path, doc.editor.text().as_bytes())
         {
             self.status = format!("Format: pre-save failed: {err}");
             return;
         }
 
-        let output = match std::process::Command::new("mise")
+        let spec = ProcessSpec::new("mise")
             .arg("run")
             .arg(task)
             .arg("--")
-            .arg(path)
-            .current_dir(&self.detection.root_path)
-            .output()
-        {
+            .arg(path.as_os_str())
+            .current_dir(&self.detection.root_path);
+        let output = match self.process.run(&spec) {
             Ok(output) => output,
             Err(err) => {
                 self.status = format!("Format: could not run `mise run {task}`: {err}");
                 return;
             }
         };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let snippet = stderr.lines().next().unwrap_or("(no output)");
+        if !output.success {
+            let snippet = output
+                .stderr_string()
+                .lines()
+                .next()
+                .unwrap_or("(no output)")
+                .to_string();
             self.status = format!("Format: `mise run {task}` failed: {snippet}");
             return;
         }
@@ -1917,30 +1952,39 @@ impl AppModel {
             self.status = "Format: result is for a closed file.".to_string();
             return;
         }
-        match apply_lsp_text_edits_to_editor(&mut doc.editor, &sorted) {
-            Ok(count) => {
-                if trigger == FormatTrigger::Save {
-                    match std::fs::write(&doc.path, doc.editor.text()) {
-                        Ok(()) => {
-                            doc.editor.mark_saved();
-                            self.status = format!("Saved and formatted via LSP ({count} edit(s)).");
-                        }
-                        Err(err) => {
-                            self.status = format!("Format applied but re-save failed: {err}");
-                        }
+        let result = apply_lsp_text_edits_to_editor(&mut doc.editor, &sorted);
+        let (text_to_persist, count) = match result {
+            Ok(count) => (doc.editor.text(), count),
+            Err(err) => {
+                self.status = format!("Format: apply failed: {err}");
+                return;
+            }
+        };
+        if trigger == FormatTrigger::Save {
+            // Re-flush the now-formatted buffer through the env seam (M4.10).
+            match self.fs.write(&path, text_to_persist.as_bytes()) {
+                Ok(()) => {
+                    if let Some(doc) = self.document.as_mut() {
+                        doc.editor.mark_saved();
                     }
-                } else {
-                    self.status = format!("Formatted via LSP ({count} edit(s)).");
+                    self.status = format!("Saved and formatted via LSP ({count} edit(s)).");
+                }
+                Err(err) => {
+                    self.status = format!("Format applied but re-save failed: {err}");
                 }
             }
-            Err(err) => self.status = format!("Format: apply failed: {err}"),
+        } else {
+            self.status = format!("Formatted via LSP ({count} edit(s)).");
         }
     }
 
     /// Replace the open document's buffer with the on-disk contents of
     /// `path`. Used after an out-of-process formatter rewrites the file.
+    /// Disk read goes through [`Self::fs`] (M4.10).
     fn reload_buffer_from_disk(&mut self, path: &Path) -> Result<(), String> {
-        let text = std::fs::read_to_string(path)
+        let text = self
+            .fs
+            .read_to_string(path)
             .map_err(|err| format!("read {}: {err}", path.display()))?;
         let Some(doc) = self.document.as_mut() else {
             return Err("no document open".to_string());
@@ -1970,10 +2014,11 @@ impl AppModel {
 
     /// Append the `[tasks.format]` snippet to `mise.toml`, refresh the
     /// detected project, and retry the original format request so the user
-    /// sees the formatter run immediately after confirming.
+    /// sees the formatter run immediately after confirming. All disk I/O
+    /// goes through [`Self::fs`] (M4.10).
     fn add_format_task_and_retry(&mut self, snippet: &str, trigger: FormatTrigger) {
         let mise_path = self.detection.root_path.join("mise.toml");
-        let updated = match std::fs::read_to_string(&mise_path) {
+        let updated = match self.fs.read_to_string(&mise_path) {
             Ok(existing) => {
                 let mut updated = existing;
                 if !updated.ends_with('\n') {
@@ -1988,11 +2033,15 @@ impl AppModel {
                 return;
             }
         };
-        if let Err(err) = std::fs::write(&mise_path, updated) {
+        if let Err(err) = self.fs.write(&mise_path, updated.as_bytes()) {
             self.status = format!("Could not write mise.toml: {err}");
             return;
         }
-        match cockpit_project::detect_mise_project(&self.detection.root_path) {
+        match cockpit_project::detect_mise_project_with(
+            &self.detection.root_path,
+            self.fs.as_ref(),
+            self.process.as_ref(),
+        ) {
             Ok(mise) => {
                 self.detection.mise = mise;
                 self.status = "Added [tasks.format] to mise.toml.".to_string();
@@ -2120,11 +2169,15 @@ impl AppModel {
                 applied += apply_lsp_text_edits_to_editor(&mut doc.editor, &edits)?;
                 continue;
             }
-            let text = std::fs::read_to_string(&path)
+            // Off-buffer edits go through the env seam (M4.10).
+            let text = self
+                .fs
+                .read_to_string(&path)
                 .map_err(|err| format!("read {}: {err}", path.display()))?;
             let mut editor = Editor::new(&text);
             applied += apply_lsp_text_edits_to_editor(&mut editor, &edits)?;
-            std::fs::write(&path, editor.text())
+            self.fs
+                .write(&path, editor.text().as_bytes())
                 .map_err(|err| format!("write {}: {err}", path.display()))?;
         }
         Ok(applied)
@@ -4618,6 +4671,147 @@ mod tests {
         assert!(
             !mise_toml.contains("[tasks.format]"),
             "Enter on No must cancel — got:\n{mise_toml}"
+        );
+    }
+
+    // ---- M4.10 — Hermetic format flow over the injected env seam ---------
+
+    /// `Arc`-shared `FileSystem` so the test and the [`AppModel`] both
+    /// observe the same in-memory state.
+    #[derive(Clone)]
+    struct SharedFs(std::sync::Arc<cockpit_project::FakeFileSystem>);
+
+    impl FileSystem for SharedFs {
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            self.0.read_to_string(path)
+        }
+        fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            self.0.write(path, contents)
+        }
+        fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.0.create_dir_all(path)
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            self.0.is_file(path)
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            self.0.is_dir(path)
+        }
+    }
+
+    /// `Arc`-shared `ProcessRunner` so the test can script responses and
+    /// inspect the spawn log after the model has run.
+    #[derive(Clone)]
+    struct SharedProcess(std::sync::Arc<cockpit_project::FakeProcessRunner>);
+
+    impl ProcessRunner for SharedProcess {
+        fn run(&self, spec: &ProcessSpec) -> std::io::Result<cockpit_project::ProcessOutput> {
+            self.0.run(spec)
+        }
+    }
+
+    #[test]
+    fn format_via_mise_task_runs_through_the_injected_process_runner() {
+        use cockpit_project::ProcessOutput;
+
+        let root = PathBuf::from("/proj");
+        let main_rs = root.join("main.rs");
+
+        // Seed an in-memory project: a mise.toml with a `format` task, and
+        // the open document the formatter should rewrite. No real I/O.
+        let fs = SharedFs(std::sync::Arc::new(cockpit_project::FakeFileSystem::new()));
+        fs.0.insert_dir(&root);
+        fs.0.insert_file(
+            root.join("mise.toml"),
+            "[tasks.format]\nrun = \"rustfmt $1\"\n",
+        );
+        fs.0.insert_file(&main_rs, "fn  main(){}\n");
+
+        let process = SharedProcess(std::sync::Arc::new(
+            cockpit_project::FakeProcessRunner::new(),
+        ));
+        // mise --version probe runs whenever we ask for project detection;
+        // the format spawn arrives once the model dispatches `editor.format`.
+        process.0.expect(
+            "mise",
+            ["--version"],
+            ProcessOutput {
+                success: true,
+                stdout: b"mise 2026.0.0\n".to_vec(),
+                stderr: Vec::new(),
+            },
+        );
+        process.0.expect::<&str, _, std::ffi::OsString>(
+            "mise",
+            [
+                std::ffi::OsString::from("run"),
+                std::ffi::OsString::from("format"),
+                std::ffi::OsString::from("--"),
+                main_rs.clone().into_os_string(),
+            ],
+            ProcessOutput {
+                success: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+
+        // Detection is a pure function over the seeded fake project.
+        let mise = cockpit_project::detect_mise_project_with(
+            &root,
+            &fs as &dyn FileSystem,
+            &process as &dyn ProcessRunner,
+        )
+        .expect("hermetic mise detection");
+        assert!(mise.tasks.iter().any(|t| t.name == "format"));
+
+        let detection = ProjectDetection {
+            root_path: root.clone(),
+            display_name: "proj".to_string(),
+            signals: Vec::new(),
+            strongest_signal: None,
+            mise,
+        };
+        // The file tree itself is not under test here; load it from a
+        // bundled fixture so the model has something to populate the
+        // browser pane with. The browser is irrelevant to the format flow.
+        let tree =
+            FileTree::load(fixture_path("file-tree")).expect("load file-tree fixture for shell");
+        let mut model = AppModel::with_env(
+            detection,
+            tree,
+            Box::new(fs.clone()),
+            Box::new(process.clone()),
+        )
+        .expect("hermetic model");
+
+        // Open the in-memory file through the model's own document path.
+        model.open_document(main_rs.clone());
+        assert!(model.document.is_some(), "document should open via fake fs");
+
+        // Simulate the formatter rewriting the file on disk so the reload
+        // observes a change.
+        fs.0.insert_file(&main_rs, "fn main() {}\n");
+
+        model.run_command(EDITOR_FORMAT);
+        assert!(
+            model.status.contains("Formatted via"),
+            "status: {}",
+            model.status
+        );
+        // The injected process runner saw both scripted spawns:
+        // `mise --version` during detection above, then `mise run format`
+        // — proving the model never touches `std::process::Command` and
+        // every spawn is observable from the test (M4.10 payoff).
+        let log = process.0.spawns();
+        assert_eq!(log.len(), 2, "spawn count, log: {log:?}");
+        assert_eq!(log[0].args, vec!["--version"]);
+        assert_eq!(log[1].args[0], "run");
+        assert_eq!(log[1].args[1], "format");
+        // And the buffer reloaded from the fake fs, not from real disk.
+        assert_eq!(
+            model.document.as_ref().unwrap().editor.text(),
+            "fn main() {}\n"
         );
     }
 }
