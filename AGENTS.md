@@ -121,10 +121,14 @@ should never gain a window/GPU dependency.
 | A new command ID or keybinding           | `cockpit-commands`       |
 | Config schema, TOML/KDL parsing          | `cockpit-config`         |
 | View-model state (panes, palette, tree)  | `cockpit-ui`             |
+| Splash / hydration progress state        | `cockpit-ui::hydration`  |
 | Anything calling `winit` or `glow`       | `cockpit-render`         |
+| Per-frame state advance (M6.2 `tick`)    | `cockpit-render::CockpitApp` |
 | DuckDB / ggsql / new SQL backend         | `cockpit-sql`            |
 | Notebook cell parser / view-model        | `cockpit-notebook`       |
 | dbt-lite analytics (detect / DAG / build)| `cockpit-analytics`      |
+| Cold-start phase work (detect/tree/...)  | `cockpit::hydration`     |
+| Splash painter (uses Painter+Theme)      | `cockpit::splash`        |
 | Wiring crates together, CLI flags        | `cockpit` (binary)       |
 | Fixtures, fakes, bench helpers           | `cockpit-testkit`        |
 
