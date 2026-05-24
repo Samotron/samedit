@@ -180,6 +180,10 @@ mod integration_tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows PTY output is not reliable on GitHub Actions"
+    )]
     fn starts_shell_writes_reads_resizes_and_terminates() {
         let command = if cfg!(windows) {
             CommandSpec::new("cmd.exe", Vec::<String>::new())

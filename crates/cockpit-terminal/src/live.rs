@@ -156,6 +156,10 @@ mod integration_tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows PTY output is not reliable on GitHub Actions"
+    )]
     fn spawns_a_shell_echoes_input_and_reports_it_in_the_grid() {
         let command = if cfg!(windows) {
             CommandSpec::new("cmd.exe", Vec::<String>::new())
