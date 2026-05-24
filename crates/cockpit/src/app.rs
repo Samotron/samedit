@@ -25,7 +25,7 @@ use cockpit_lsp::{
     ServerConfig,
 };
 use cockpit_mux::{
-    PrefixDispatcher, Rect as MuxRect, Session as MuxSession, SplitDirection,
+    PaneMode, PrefixDispatcher, Rect as MuxRect, Session as MuxSession, SplitDirection,
     command_ids as mux_command_ids,
 };
 use cockpit_notebook::{
@@ -542,6 +542,9 @@ impl AppModel {
             return;
         }
         let focused = self.layout.focused();
+        if focused == PaneId::Terminal && self.handle_mux_copy_mode_key(&chord) {
+            return;
+        }
         if focused == PaneId::Terminal && self.handle_mux_prefix(&chord) {
             return;
         }
@@ -937,9 +940,7 @@ impl AppModel {
                     .to_string();
             }
             mux_command_ids::ZOOM_PANE => self.mux_toggle_zoom(),
-            mux_command_ids::COPY_MODE => {
-                self.status = "Mux: copy mode lands in M7.6.".to_string();
-            }
+            mux_command_ids::COPY_MODE => self.mux_enter_copy_mode(),
             mux_command_ids::PASTE => {
                 self.status = "Mux: paste uses copy-mode buffer in M7.6.".to_string();
             }
@@ -1019,6 +1020,11 @@ impl AppModel {
             Some(pane) => self.status = format!("Mux: zoomed {pane}."),
             None => self.status = "Mux: unzoomed pane.".to_string(),
         }
+    }
+
+    fn mux_enter_copy_mode(&mut self) {
+        let pane = self.mux_session.enter_copy_mode();
+        self.status = format!("Mux: copy mode entered for {pane}.");
     }
 
     fn mux_new_window(&mut self) {
@@ -1658,6 +1664,18 @@ impl AppModel {
             return true;
         }
         false
+    }
+
+    fn handle_mux_copy_mode_key(&mut self, chord: &KeyChord) -> bool {
+        if self.mux_session.active_pane().mode != PaneMode::Copy {
+            return false;
+        }
+
+        if chord == &KeyChord::single("Escape", Modifiers::NONE) {
+            let pane = self.mux_session.exit_copy_mode();
+            self.status = format!("Mux: copy mode exited for {pane}.");
+        }
+        true
     }
 
     /// Resize live terminals so each grid matches its mux pane.
@@ -4169,6 +4187,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(mux_command_ids::LAST_PANE, "Mux: Last Pane"),
         PaletteEntry::new(mux_command_ids::SWAP_PANE_NEXT, "Mux: Swap Pane Next"),
         PaletteEntry::new(mux_command_ids::ZOOM_PANE, "Mux: Zoom Pane"),
+        PaletteEntry::new(mux_command_ids::COPY_MODE, "Mux: Enter Copy Mode"),
         PaletteEntry::new(mux_command_ids::FOCUS_UP, "Mux: Focus Up"),
         PaletteEntry::new(mux_command_ids::FOCUS_DOWN, "Mux: Focus Down"),
         PaletteEntry::new(mux_command_ids::FOCUS_LEFT, "Mux: Focus Left"),
@@ -5816,6 +5835,19 @@ mod tests {
     }
 
     #[test]
+    fn palette_lists_mux_copy_mode_command() {
+        let ids = palette_entries()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            ids.iter()
+                .any(|candidate| candidate == mux_command_ids::COPY_MODE)
+        );
+    }
+
+    #[test]
     fn mux_swap_command_uses_the_headless_session_path() {
         let mut model = model();
         model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
@@ -5860,6 +5892,23 @@ mod tests {
         model.run_command(mux_command_ids::ZOOM_PANE);
         assert_eq!(model.mux_pane_rects_for_terminal(terminal).len(), 3);
         assert_eq!(model.mux_session.active_window().zoomed, None);
+    }
+
+    #[test]
+    fn mux_copy_mode_consumes_terminal_keys_until_escape() {
+        let mut model = model();
+
+        model.run_command(mux_command_ids::COPY_MODE);
+        assert_eq!(model.mux_session.active_pane().mode, PaneMode::Copy);
+        assert!(model.status.contains("copy mode entered for pane-0"));
+
+        model.layout.focus(PaneId::Terminal);
+        model.dispatch(chord("j"));
+        assert_eq!(model.mux_session.active_pane().mode, PaneMode::Copy);
+
+        model.dispatch(chord("Escape"));
+        assert_eq!(model.mux_session.active_pane().mode, PaneMode::Live);
+        assert!(model.status.contains("copy mode exited for pane-0"));
     }
 
     #[test]

@@ -881,6 +881,11 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   the scrollback buffer, mirrors the editor Vim FSM (M1.2 patterns) so
   there's exactly **one** Vim-style FSM in the codebase. Selection +
   yank → OS clipboard via `winit`.
+  - Implemented base state: `mux.copy_mode.enter` records `PaneMode::Copy`
+    on the active pane, resets its scrollback offset to the live edge, and
+    terminal-focused keys are consumed until Escape returns the pane to
+    `PaneMode::Live`. The command is also exposed through the palette.
+    Motion/search/selection/yank remain the next M7.6 layer.
 - Tests: golden of the rendered selection after a recorded key script
   on a fixture scrollback.
 

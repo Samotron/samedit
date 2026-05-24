@@ -517,6 +517,16 @@ impl Session {
             .expect("active window id is maintained by Session")
     }
 
+    /// Borrow the active pane in the active window.
+    pub fn active_pane(&self) -> &Pane {
+        let window = self.active_window();
+        window
+            .panes
+            .iter()
+            .find(|pane| pane.id == window.active)
+            .expect("active pane id is maintained by Window")
+    }
+
     /// Create and select a new window with a single pane.
     pub fn new_window(&mut self, name: impl Into<String>) -> WindowId {
         let window_id = self.alloc_window();
@@ -645,6 +655,34 @@ impl Session {
             window.zoomed = Some(window.active);
             window.zoomed
         }
+    }
+
+    /// Enter copy mode on the active pane and reset its viewport to live edge.
+    pub fn enter_copy_mode(&mut self) -> PaneId {
+        let window = self.active_window_mut();
+        let pane_id = window.active;
+        let pane = window
+            .panes
+            .iter_mut()
+            .find(|pane| pane.id == pane_id)
+            .expect("active pane id is maintained by Window");
+        pane.mode = PaneMode::Copy;
+        pane.scrollback_offset = 0;
+        pane_id
+    }
+
+    /// Return the active pane to live terminal mode.
+    pub fn exit_copy_mode(&mut self) -> PaneId {
+        let window = self.active_window_mut();
+        let pane_id = window.active;
+        let pane = window
+            .panes
+            .iter_mut()
+            .find(|pane| pane.id == pane_id)
+            .expect("active pane id is maintained by Window");
+        pane.mode = PaneMode::Live;
+        pane.scrollback_offset = 0;
+        pane_id
     }
 
     /// Resize the split that directly contains the active pane.
@@ -1343,6 +1381,20 @@ mod tests {
 
         session.select_pane(PaneId(0)).expect("pane 0 exists");
         assert_eq!(session.active_window().zoomed, Some(PaneId(0)));
+    }
+
+    #[test]
+    fn copy_mode_is_recorded_on_the_active_pane() {
+        let mut session = Session::new("dev");
+        session.split_active(SplitDirection::Horizontal);
+
+        assert_eq!(session.enter_copy_mode(), PaneId(1));
+        assert_eq!(session.active_pane().mode, PaneMode::Copy);
+        assert_eq!(session.active_pane().scrollback_offset, 0);
+
+        assert_eq!(session.exit_copy_mode(), PaneId(1));
+        assert_eq!(session.active_pane().mode, PaneMode::Live);
+        assert_eq!(session.active_pane().scrollback_offset, 0);
     }
 
     #[test]
