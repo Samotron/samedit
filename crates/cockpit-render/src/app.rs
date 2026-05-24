@@ -33,6 +33,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey as WinitNamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::atlas_persist;
 use crate::frame::{FrameError, FramePlanner};
 use crate::key_event::{KeyEvent, KeyModifiers, LogicalKey, NamedKey, event_to_chord};
 use crate::painter::Painter;
@@ -267,7 +268,22 @@ impl<A: CockpitApp> Harness<A> {
 
         // SAFETY: the GL context is current on the calling thread.
         let renderer = unsafe { GlRenderer::new(Rc::clone(&gl), ATLAS_SIZE, ATLAS_SIZE) }?;
-        let planner = FramePlanner::new(ATLAS_SIZE, ATLAS_SIZE)?;
+        let mut planner = FramePlanner::new(ATLAS_SIZE, ATLAS_SIZE)?;
+
+        // M6.4 disk-cache warm. Best-effort: any I/O or rehydration
+        // failure logs at debug/warn and falls back to a fresh atlas.
+        if let Some(path) = atlas_persist::default_cache_path() {
+            match planner.warm_from_disk(&path) {
+                Ok(Some(pixels)) => {
+                    // SAFETY: the context was made current above.
+                    if let Err(err) = unsafe { renderer.upload_full_atlas(&pixels) } {
+                        tracing::warn!(error = %err, "atlas upload after warm failed");
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(error = %err, "atlas warm_from_disk error"),
+            }
+        }
 
         Ok(GlState {
             window,
@@ -368,6 +384,18 @@ impl<A: CockpitApp> ApplicationHandler for Harness<A> {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.app.on_shutdown();
+        // M6.4: write the warmed atlas back to disk so the next launch
+        // can skip the per-glyph upload cost. Best-effort — a failed
+        // write logs and continues; it must never block exit.
+        if let Some(gl) = self.gl.as_mut()
+            && let Some(path) = atlas_persist::default_cache_path()
+        {
+            match gl.planner.persist_to_disk(&path) {
+                Ok(true) => tracing::debug!(path = %path.display(), "atlas snapshot persisted"),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(error = %err, "atlas persist_to_disk error"),
+            }
+        }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {

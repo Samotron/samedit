@@ -124,6 +124,7 @@ should never gain a window/GPU dependency.
 | Splash / hydration progress state        | `cockpit-ui::hydration`  |
 | Anything calling `winit` or `glow`       | `cockpit-render`         |
 | Per-frame state advance (M6.2 `tick`)    | `cockpit-render::CockpitApp` |
+| Glyph atlas disk cache codec / IO        | `cockpit-render::atlas_persist` |
 | DuckDB / ggsql / new SQL backend         | `cockpit-sql`            |
 | Notebook cell parser / view-model        | `cockpit-notebook`       |
 | dbt-lite analytics (detect / DAG / build)| `cockpit-analytics`      |

@@ -656,9 +656,18 @@ budget — the binary stays small, and the first query pays the spawn cost.
   config is held in a `thread_local!` `RefCell<Option<_>>` that fills
   the first time the matching language hits `compute`. No change
   needed; documented here so the milestone has a checked box.
-- [ ] **M6.4 — Glyph atlas disk cache** — persist the warmed atlas to
-  the OS cache dir; rebuild only on theme/font change. *(Deferred —
-  GPU-side change with sequencing risk, lands in a focused follow-up.)*
+- [x] **M6.4 — Glyph atlas disk cache** — `cockpit-render::atlas_persist`
+  is the codec (magic + version + manifest + RGBA8 buffer) plus the
+  `default_cache_path()` / `load_from_disk` / `store_to_disk` helpers.
+  `GlyphRasterCache` keeps a CPU shadow of every atlas write and grew
+  `snapshot(font_system, hash)` + `rehydrate(snapshot, font_system)`,
+  which replays the allocator in stored order and bails on rect drift
+  so the on-disk pixel layout stays in sync with the live allocator.
+  `FramePlanner::warm_from_disk` / `persist_to_disk` glue the two
+  together; the harness calls warm before frame 1 and persist on exit.
+  Invalidation is driven by `font_set_config_hash(atlas_w, atlas_h,
+  padding, sorted post-script names)` — any new font / atlas size / etc.
+  drops the cache instead of risking a glyph mismatch.
 - [x] **M6.5 — Deferred LSP spawn** — verified: `start_lsp_for_document`
   is the only LSP spawn site, called from `open_document`, gated by
   `LSP_MAX_BYTES` and `ServerConfig::for_language`. Nothing spawns on

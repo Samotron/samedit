@@ -665,12 +665,15 @@ version = "0.0.1"
 dependencies = [
  "cockpit-commands",
  "cosmic-text",
+ "directories",
  "etagere",
  "glow",
  "glutin",
  "glutin-winit",
  "raw-window-handle",
+ "tempfile",
  "thiserror 2.0.18",
+ "tracing",
  "winit",
 ]
 
