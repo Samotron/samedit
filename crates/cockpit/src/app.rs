@@ -1699,6 +1699,16 @@ impl AppModel {
             && let Some(cursor) = self.mux_session.set_copy_cursor_col(max_col, max_col)
         {
             self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+        } else if chord == &KeyChord::single("v", Modifiers::NONE)
+            && let Some(selection) = self.mux_session.toggle_copy_selection()
+        {
+            self.status = match selection {
+                Some(selection) => format!(
+                    "Mux: copy selection started at {}:{}.",
+                    selection.anchor.row, selection.anchor.col
+                ),
+                None => "Mux: copy selection cleared.".to_string(),
+            };
         }
         true
     }
@@ -3656,10 +3666,22 @@ impl AppModel {
         };
         match pane.mode {
             PaneMode::Live => pane_id.to_string(),
-            PaneMode::Copy => format!(
-                "{} COPY {} {}:{}",
-                pane_id, pane.scrollback_offset, pane.copy_cursor.row, pane.copy_cursor.col
-            ),
+            PaneMode::Copy => {
+                let selection = pane
+                    .copy_selection_range()
+                    .map(|(start, end)| {
+                        format!(" SEL {}:{}-{}:{}", start.row, start.col, end.row, end.col)
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "{} COPY {} {}:{}{}",
+                    pane_id,
+                    pane.scrollback_offset,
+                    pane.copy_cursor.row,
+                    pane.copy_cursor.col,
+                    selection
+                )
+            }
         }
     }
 
@@ -5650,6 +5672,36 @@ mod tests {
         assert!(labels.contains(&"pane-1 COPY 2 0:0"));
     }
 
+    #[test]
+    fn paint_terminal_mux_split_labels_copy_mode_selection() {
+        let mut model = model();
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.mux_session.move_copy_cursor(1, 2, 10, 10);
+        model.mux_session.toggle_copy_selection();
+        model.mux_session.move_copy_cursor(1, 2, 10, 10);
+        let mut painter = Painter::new();
+
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+
+        let labels: Vec<&str> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"pane-1 COPY 0 2:4 SEL 1:2-2:4"));
+    }
+
     /// Build a model whose editor already has `contents` open on a temp file.
     fn open_temp_doc(contents: &str) -> (AppModel, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6002,6 +6054,13 @@ mod tests {
         assert_eq!(model.mux_session.active_pane().copy_cursor.col, 79);
         model.dispatch(chord("0"));
         assert_eq!(model.mux_session.active_pane().copy_cursor.col, 0);
+
+        model.dispatch(chord("v"));
+        assert!(model.mux_session.active_pane().copy_selection.is_some());
+        assert!(model.status.contains("copy selection started"));
+        model.dispatch(chord("v"));
+        assert_eq!(model.mux_session.active_pane().copy_selection, None);
+        assert!(model.status.contains("copy selection cleared"));
 
         model.dispatch(chord("Escape"));
         assert_eq!(model.mux_session.active_pane().mode, PaneMode::Live);

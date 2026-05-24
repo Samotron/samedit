@@ -886,11 +886,12 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
     terminal-focused keys are consumed until Escape returns the pane to
     `PaneMode::Live`. `j/k` update the active pane's scrollback offset
     with saturation; `h/l` move a copy-mode cursor inside the visible
-    viewport; and `0`/`$` jump the cursor to line edges. This gives the
-    later scrollback-ring renderer a stable viewport and cursor state.
-    Copy-mode panes render their mode, offset, and cursor position in the
-    mux pane label, and the command is also exposed through the palette.
-    Search/selection/yank remain the next M7.6 layer.
+    viewport; `0`/`$` jump the cursor to line edges; and `v` toggles a
+    headless selection anchor at the cursor. This gives the later
+    scrollback-ring renderer a stable viewport, cursor, and selection
+    state. Copy-mode panes render their mode, offset, cursor position,
+    and selection range in the mux pane label, and the command is also
+    exposed through the palette. Search/yank remain the next M7.6 layer.
 - Tests: golden of the rendered selection after a recorded key script
   on a fixture scrollback.
 

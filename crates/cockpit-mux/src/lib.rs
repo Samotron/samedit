@@ -296,6 +296,12 @@ impl CopyCursor {
     }
 }
 
+/// Selection anchor inside copy mode's viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopySelection {
+    pub anchor: CopyCursor,
+}
+
 /// One terminal pane. Real PTY handles live in `cockpit-terminal`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pane {
@@ -304,6 +310,8 @@ pub struct Pane {
     pub mode: PaneMode,
     #[serde(default, skip_serializing_if = "CopyCursor::is_default")]
     pub copy_cursor: CopyCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_selection: Option<CopySelection>,
 }
 
 impl Pane {
@@ -313,7 +321,14 @@ impl Pane {
             scrollback_offset: 0,
             mode: PaneMode::Live,
             copy_cursor: CopyCursor::default(),
+            copy_selection: None,
         }
+    }
+
+    /// Normalized copy selection endpoints, if this pane has an active anchor.
+    pub fn copy_selection_range(&self) -> Option<(CopyCursor, CopyCursor)> {
+        let selection = self.copy_selection?;
+        Some(normalize_selection(selection.anchor, self.copy_cursor))
     }
 }
 
@@ -690,6 +705,7 @@ impl Session {
         pane.mode = PaneMode::Copy;
         pane.scrollback_offset = 0;
         pane.copy_cursor = CopyCursor::default();
+        pane.copy_selection = None;
         pane_id
     }
 
@@ -700,6 +716,7 @@ impl Session {
         pane.mode = PaneMode::Live;
         pane.scrollback_offset = 0;
         pane.copy_cursor = CopyCursor::default();
+        pane.copy_selection = None;
         pane_id
     }
 
@@ -744,6 +761,21 @@ impl Session {
         }
         pane.copy_cursor.col = col.min(max_col);
         Some(pane.copy_cursor)
+    }
+
+    /// Toggle copy-mode selection anchored at the current cursor.
+    pub fn toggle_copy_selection(&mut self) -> Option<Option<CopySelection>> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        pane.copy_selection = match pane.copy_selection {
+            Some(_) => None,
+            None => Some(CopySelection {
+                anchor: pane.copy_cursor,
+            }),
+        };
+        Some(pane.copy_selection)
     }
 
     /// Resize the split that directly contains the active pane.
@@ -953,6 +985,14 @@ fn apply_bounded_delta(value: usize, delta: isize, max: usize) -> usize {
         value.saturating_sub(delta.unsigned_abs())
     } else {
         value.saturating_add(delta as usize).min(max)
+    }
+}
+
+fn normalize_selection(left: CopyCursor, right: CopyCursor) -> (CopyCursor, CopyCursor) {
+    if (left.row, left.col) <= (right.row, right.col) {
+        (left, right)
+    } else {
+        (right, left)
     }
 }
 
@@ -1522,6 +1562,43 @@ mod tests {
             session.set_copy_cursor_col(usize::MAX, 12),
             Some(CopyCursor { row: 0, col: 12 })
         );
+    }
+
+    #[test]
+    fn copy_mode_selection_toggles_from_the_current_cursor() {
+        let mut session = Session::new("dev");
+
+        assert_eq!(session.toggle_copy_selection(), None);
+        session.enter_copy_mode();
+        session.move_copy_cursor(2, 4, 10, 10);
+
+        assert_eq!(
+            session.toggle_copy_selection(),
+            Some(Some(CopySelection {
+                anchor: CopyCursor { row: 2, col: 4 },
+            }))
+        );
+        session.move_copy_cursor(-1, -3, 10, 10);
+        assert_eq!(
+            session.active_pane().copy_selection_range(),
+            Some((CopyCursor { row: 1, col: 1 }, CopyCursor { row: 2, col: 4 },))
+        );
+
+        assert_eq!(session.toggle_copy_selection(), Some(None));
+        assert_eq!(session.active_pane().copy_selection_range(), None);
+    }
+
+    #[test]
+    fn copy_mode_selection_clears_when_leaving_copy_mode() {
+        let mut session = Session::new("dev");
+
+        session.enter_copy_mode();
+        session.toggle_copy_selection();
+        assert!(session.active_pane().copy_selection.is_some());
+
+        session.exit_copy_mode();
+        assert_eq!(session.active_pane().mode, PaneMode::Live);
+        assert_eq!(session.active_pane().copy_selection, None);
     }
 
     #[test]
