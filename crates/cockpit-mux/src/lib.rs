@@ -736,6 +736,16 @@ impl Session {
         Some(pane.copy_cursor)
     }
 
+    /// Move the active copy-mode cursor to an absolute column.
+    pub fn set_copy_cursor_col(&mut self, col: usize, max_col: usize) -> Option<CopyCursor> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        pane.copy_cursor.col = col.min(max_col);
+        Some(pane.copy_cursor)
+    }
+
     /// Resize the split that directly contains the active pane.
     pub fn resize_pane(&mut self, delta: f32) -> Result<(), MuxError> {
         let window = self.active_window_mut();
@@ -1494,6 +1504,24 @@ mod tests {
 
         session.exit_copy_mode();
         assert_eq!(session.active_pane().copy_cursor, CopyCursor::default());
+    }
+
+    #[test]
+    fn copy_mode_cursor_jumps_to_line_edges() {
+        let mut session = Session::new("dev");
+
+        assert_eq!(session.set_copy_cursor_col(5, 10), None);
+        session.enter_copy_mode();
+        session.move_copy_cursor(0, 4, 10, 10);
+
+        assert_eq!(
+            session.set_copy_cursor_col(0, 10),
+            Some(CopyCursor { row: 0, col: 0 })
+        );
+        assert_eq!(
+            session.set_copy_cursor_col(usize::MAX, 12),
+            Some(CopyCursor { row: 0, col: 12 })
+        );
     }
 
     #[test]

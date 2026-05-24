@@ -1670,6 +1670,7 @@ impl AppModel {
         if self.mux_session.active_pane().mode != PaneMode::Copy {
             return false;
         }
+        let (max_row, max_col) = self.copy_mode_grid_bounds();
 
         if chord == &KeyChord::single("Escape", Modifiers::NONE) {
             let pane = self.mux_session.exit_copy_mode();
@@ -1683,20 +1684,34 @@ impl AppModel {
         {
             self.status = format!("Mux: copy mode offset {offset}.");
         } else if chord == &KeyChord::single("h", Modifiers::NONE) {
-            if let Some(cursor) = self
-                .mux_session
-                .move_copy_cursor(0, -1, usize::MAX, usize::MAX)
-            {
+            if let Some(cursor) = self.mux_session.move_copy_cursor(0, -1, max_row, max_col) {
                 self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
             }
         } else if chord == &KeyChord::single("l", Modifiers::NONE)
-            && let Some(cursor) = self
-                .mux_session
-                .move_copy_cursor(0, 1, usize::MAX, usize::MAX)
+            && let Some(cursor) = self.mux_session.move_copy_cursor(0, 1, max_row, max_col)
+        {
+            self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+        } else if chord == &KeyChord::single("0", Modifiers::NONE) {
+            if let Some(cursor) = self.mux_session.set_copy_cursor_col(0, max_col) {
+                self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+            }
+        } else if chord == &KeyChord::single("$", Modifiers::NONE)
+            && let Some(cursor) = self.mux_session.set_copy_cursor_col(max_col, max_col)
         {
             self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
         }
         true
+    }
+
+    fn copy_mode_grid_bounds(&self) -> (usize, usize) {
+        let Some(terminal) = self.active_terminal() else {
+            return (usize::MAX, 79);
+        };
+        let grid = terminal.snapshot().grid;
+        (
+            grid.height().saturating_sub(1),
+            grid.width().saturating_sub(1),
+        )
     }
 
     /// Resize live terminals so each grid matches its mux pane.
@@ -5981,6 +5996,11 @@ mod tests {
         model.dispatch(chord("l"));
         assert_eq!(model.mux_session.active_pane().copy_cursor.col, 1);
         model.dispatch(chord("h"));
+        assert_eq!(model.mux_session.active_pane().copy_cursor.col, 0);
+
+        model.dispatch(chord("$"));
+        assert_eq!(model.mux_session.active_pane().copy_cursor.col, 79);
+        model.dispatch(chord("0"));
         assert_eq!(model.mux_session.active_pane().copy_cursor.col, 0);
 
         model.dispatch(chord("Escape"));
