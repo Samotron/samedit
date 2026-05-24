@@ -527,6 +527,16 @@ impl Session {
             .expect("active pane id is maintained by Window")
     }
 
+    fn active_pane_mut(&mut self) -> &mut Pane {
+        let window = self.active_window_mut();
+        let pane_id = window.active;
+        window
+            .panes
+            .iter_mut()
+            .find(|pane| pane.id == pane_id)
+            .expect("active pane id is maintained by Window")
+    }
+
     /// Create and select a new window with a single pane.
     pub fn new_window(&mut self, name: impl Into<String>) -> WindowId {
         let window_id = self.alloc_window();
@@ -659,13 +669,8 @@ impl Session {
 
     /// Enter copy mode on the active pane and reset its viewport to live edge.
     pub fn enter_copy_mode(&mut self) -> PaneId {
-        let window = self.active_window_mut();
-        let pane_id = window.active;
-        let pane = window
-            .panes
-            .iter_mut()
-            .find(|pane| pane.id == pane_id)
-            .expect("active pane id is maintained by Window");
+        let pane = self.active_pane_mut();
+        let pane_id = pane.id;
         pane.mode = PaneMode::Copy;
         pane.scrollback_offset = 0;
         pane_id
@@ -673,16 +678,27 @@ impl Session {
 
     /// Return the active pane to live terminal mode.
     pub fn exit_copy_mode(&mut self) -> PaneId {
-        let window = self.active_window_mut();
-        let pane_id = window.active;
-        let pane = window
-            .panes
-            .iter_mut()
-            .find(|pane| pane.id == pane_id)
-            .expect("active pane id is maintained by Window");
+        let pane = self.active_pane_mut();
+        let pane_id = pane.id;
         pane.mode = PaneMode::Live;
         pane.scrollback_offset = 0;
         pane_id
+    }
+
+    /// Move the active copy-mode viewport. Positive deltas move away from
+    /// the live edge; negative deltas move back toward it.
+    pub fn scroll_copy_mode(&mut self, delta: isize, max_offset: usize) -> Option<usize> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        let next = if delta.is_negative() {
+            pane.scrollback_offset.saturating_sub(delta.unsigned_abs())
+        } else {
+            pane.scrollback_offset.saturating_add(delta as usize)
+        };
+        pane.scrollback_offset = next.min(max_offset);
+        Some(pane.scrollback_offset)
     }
 
     /// Resize the split that directly contains the active pane.
@@ -1394,6 +1410,22 @@ mod tests {
 
         assert_eq!(session.exit_copy_mode(), PaneId(1));
         assert_eq!(session.active_pane().mode, PaneMode::Live);
+        assert_eq!(session.active_pane().scrollback_offset, 0);
+    }
+
+    #[test]
+    fn copy_mode_scroll_offset_moves_with_saturation() {
+        let mut session = Session::new("dev");
+
+        assert_eq!(session.scroll_copy_mode(1, 10), None);
+        session.enter_copy_mode();
+
+        assert_eq!(session.scroll_copy_mode(3, 10), Some(3));
+        assert_eq!(session.active_pane().scrollback_offset, 3);
+        assert_eq!(session.scroll_copy_mode(99, 10), Some(10));
+        assert_eq!(session.active_pane().scrollback_offset, 10);
+        assert_eq!(session.scroll_copy_mode(-4, 10), Some(6));
+        assert_eq!(session.scroll_copy_mode(-99, 10), Some(0));
         assert_eq!(session.active_pane().scrollback_offset, 0);
     }
 

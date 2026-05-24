@@ -884,8 +884,10 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   - Implemented base state: `mux.copy_mode.enter` records `PaneMode::Copy`
     on the active pane, resets its scrollback offset to the live edge, and
     terminal-focused keys are consumed until Escape returns the pane to
-    `PaneMode::Live`. The command is also exposed through the palette.
-    Motion/search/selection/yank remain the next M7.6 layer.
+    `PaneMode::Live`. `j/k` update the active pane's scrollback offset
+    with saturation, giving the later scrollback-ring renderer a stable
+    viewport state. The command is also exposed through the palette.
+    Search/selection/yank remain the next M7.6 layer.
 - Tests: golden of the rendered selection after a recorded key script
   on a fixture scrollback.
 

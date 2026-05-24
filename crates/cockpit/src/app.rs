@@ -1674,6 +1674,14 @@ impl AppModel {
         if chord == &KeyChord::single("Escape", Modifiers::NONE) {
             let pane = self.mux_session.exit_copy_mode();
             self.status = format!("Mux: copy mode exited for {pane}.");
+        } else if chord == &KeyChord::single("j", Modifiers::NONE) {
+            if let Some(offset) = self.mux_session.scroll_copy_mode(1, usize::MAX) {
+                self.status = format!("Mux: copy mode offset {offset}.");
+            }
+        } else if chord == &KeyChord::single("k", Modifiers::NONE)
+            && let Some(offset) = self.mux_session.scroll_copy_mode(-1, usize::MAX)
+        {
+            self.status = format!("Mux: copy mode offset {offset}.");
         }
         true
     }
@@ -5905,6 +5913,10 @@ mod tests {
         model.layout.focus(PaneId::Terminal);
         model.dispatch(chord("j"));
         assert_eq!(model.mux_session.active_pane().mode, PaneMode::Copy);
+        assert_eq!(model.mux_session.active_pane().scrollback_offset, 1);
+
+        model.dispatch(chord("k"));
+        assert_eq!(model.mux_session.active_pane().scrollback_offset, 0);
 
         model.dispatch(chord("Escape"));
         assert_eq!(model.mux_session.active_pane().mode, PaneMode::Live);
