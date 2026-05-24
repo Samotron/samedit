@@ -3606,7 +3606,7 @@ impl AppModel {
         canvas.text(
             x + 4.0,
             y + 3.0,
-            pane.pane.to_string(),
+            self.mux_pane_label(pane.pane),
             if pane.active {
                 self.theme.text
             } else {
@@ -3614,6 +3614,22 @@ impl AppModel {
             },
             FONT - 2.0,
         );
+    }
+
+    fn mux_pane_label(&self, pane_id: cockpit_mux::PaneId) -> String {
+        let Some(pane) = self
+            .mux_session
+            .active_window()
+            .panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+        else {
+            return pane_id.to_string();
+        };
+        match pane.mode {
+            PaneMode::Live => pane_id.to_string(),
+            PaneMode::Copy => format!("{} COPY {}", pane_id, pane.scrollback_offset),
+        }
     }
 
     fn paint_mux_placeholder(
@@ -5573,6 +5589,34 @@ mod tests {
             .collect();
         assert!(labels.contains(&"pane-0"));
         assert!(labels.contains(&"pane-1"));
+    }
+
+    #[test]
+    fn paint_terminal_mux_split_labels_copy_mode_offset() {
+        let mut model = model();
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.mux_session.scroll_copy_mode(2, 10);
+        let mut painter = Painter::new();
+
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+
+        let labels: Vec<&str> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"pane-1 COPY 2"));
     }
 
     /// Build a model whose editor already has `contents` open on a temp file.
