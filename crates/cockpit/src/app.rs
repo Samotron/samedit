@@ -920,6 +920,7 @@ impl AppModel {
             mux_command_ids::LAST_PANE
             | mux_command_ids::FOCUS_LEFT
             | mux_command_ids::FOCUS_UP => self.mux_previous_pane(),
+            mux_command_ids::SWAP_PANE_NEXT => self.mux_swap_active_pane(),
             mux_command_ids::RESIZE_RIGHT | mux_command_ids::RESIZE_DOWN => {
                 self.mux_resize_active_pane(0.05)
             }
@@ -935,9 +936,7 @@ impl AppModel {
                 self.status = "Mux: rename window UI lands with the command palette input surface."
                     .to_string();
             }
-            mux_command_ids::ZOOM_PANE => {
-                self.status = "Mux: zoom pane rendering lands with multi-pane paint.".to_string();
-            }
+            mux_command_ids::ZOOM_PANE => self.mux_toggle_zoom(),
             mux_command_ids::COPY_MODE => {
                 self.status = "Mux: copy mode lands in M7.6.".to_string();
             }
@@ -1002,6 +1001,23 @@ impl AppModel {
                 self.status = format!("Mux: resized {pane}.");
             }
             Err(err) => self.status = format!("Mux: {err}."),
+        }
+    }
+
+    fn mux_swap_active_pane(&mut self) {
+        match self.mux_session.swap_panes() {
+            Ok(()) => {
+                let pane = self.mux_session.active_window().active;
+                self.status = format!("Mux: swapped {pane}.");
+            }
+            Err(err) => self.status = format!("Mux: {err}."),
+        }
+    }
+
+    fn mux_toggle_zoom(&mut self) {
+        match self.mux_session.toggle_zoom() {
+            Some(pane) => self.status = format!("Mux: zoomed {pane}."),
+            None => self.status = "Mux: unzoomed pane.".to_string(),
         }
     }
 
@@ -4151,6 +4167,8 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(mux_command_ids::KILL_PANE, "Mux: Kill Pane"),
         PaletteEntry::new(mux_command_ids::NEXT_PANE, "Mux: Next Pane"),
         PaletteEntry::new(mux_command_ids::LAST_PANE, "Mux: Last Pane"),
+        PaletteEntry::new(mux_command_ids::SWAP_PANE_NEXT, "Mux: Swap Pane Next"),
+        PaletteEntry::new(mux_command_ids::ZOOM_PANE, "Mux: Zoom Pane"),
         PaletteEntry::new(mux_command_ids::FOCUS_UP, "Mux: Focus Up"),
         PaletteEntry::new(mux_command_ids::FOCUS_DOWN, "Mux: Focus Down"),
         PaletteEntry::new(mux_command_ids::FOCUS_LEFT, "Mux: Focus Left"),
@@ -5774,6 +5792,8 @@ mod tests {
         for id in [
             mux_command_ids::NEXT_PANE,
             mux_command_ids::LAST_PANE,
+            mux_command_ids::SWAP_PANE_NEXT,
+            mux_command_ids::ZOOM_PANE,
             mux_command_ids::FOCUS_UP,
             mux_command_ids::FOCUS_DOWN,
             mux_command_ids::FOCUS_LEFT,
@@ -5793,6 +5813,53 @@ mod tests {
         for id in mux_command_ids::SELECT_WINDOW {
             assert!(ids.iter().any(|candidate| candidate == id), "{id}");
         }
+    }
+
+    #[test]
+    fn mux_swap_command_uses_the_headless_session_path() {
+        let mut model = model();
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+
+        model.run_command(mux_command_ids::SWAP_PANE_NEXT);
+
+        assert_eq!(model.mux_session.active_window().active.get(), 2);
+        assert_eq!(
+            model
+                .mux_session
+                .active_window()
+                .layout
+                .leaves()
+                .into_iter()
+                .map(cockpit_mux::PaneId::get)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+        assert!(model.status.contains("swapped pane-2"));
+    }
+
+    #[test]
+    fn mux_zoom_command_projects_only_the_active_terminal_pane() {
+        let mut model = primed_model();
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+        model.run_command(mux_command_ids::SPLIT_VERTICAL);
+
+        model.run_command(mux_command_ids::ZOOM_PANE);
+
+        let terminal = model
+            .last_layout
+            .as_ref()
+            .and_then(|layout| layout.terminal)
+            .expect("terminal pane visible");
+        let rects = model.mux_pane_rects_for_terminal(terminal);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].pane, model.mux_session.active_window().active);
+        assert_eq!(model.mux_session.active_window().layout.leaves().len(), 3);
+        assert!(model.status.contains("zoomed pane-2"));
+
+        model.run_command(mux_command_ids::ZOOM_PANE);
+        assert_eq!(model.mux_pane_rects_for_terminal(terminal).len(), 3);
+        assert_eq!(model.mux_session.active_window().zoomed, None);
     }
 
     #[test]

@@ -841,11 +841,15 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   - Built-in layout presets are tracked on each mux window, and
     `mux.layout.next` cycles `even-horizontal → main-vertical → tiled`
     instead of forcing a single preset.
-  - The command palette exposes the mux focus and resize vocabulary
-    (`next/last/focus_up/down/left/right` plus
-    `resize_up/down/left/right`) and numbered window selection commands,
-    matching the prefix bindings and keeping those commands on the shared
-    command spine.
+  - `mux.pane.zoom` now toggles a headless per-window zoom flag; rendering
+    projection returns only the active pane while zoomed without rewriting
+    the underlying split tree, and focus changes while zoomed keep the
+    newly active pane visible.
+  - The command palette exposes the mux focus, swap, and resize
+    vocabulary (`next/last/focus_up/down/left/right`, `swap_next`,
+    `zoom`, and `resize_up/down/left/right`) plus numbered window
+    selection commands, matching the prefix bindings and keeping those
+    commands on the shared command spine.
 - Pane borders: 1px lines from the theme; active pane gets an accent.
 - Resize keys (`Ctrl+b` then `Ctrl+arrow`, tmux-style) adjust the
   enclosing split's `ratio`; visible leaf PTYs are resized from their

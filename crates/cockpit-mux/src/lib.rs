@@ -33,6 +33,7 @@ pub mod command_ids {
     pub const KILL_PANE: &str = "mux.pane.kill";
     pub const NEXT_PANE: &str = "mux.pane.next";
     pub const LAST_PANE: &str = "mux.pane.last";
+    pub const SWAP_PANE_NEXT: &str = "mux.pane.swap_next";
     pub const FOCUS_UP: &str = "mux.pane.focus_up";
     pub const FOCUS_DOWN: &str = "mux.pane.focus_down";
     pub const FOCUS_LEFT: &str = "mux.pane.focus_left";
@@ -256,6 +257,7 @@ pub fn command_for_chord(chord: &KeyChord) -> Option<CommandId> {
         "x" => Some(command_ids::KILL_PANE.into()),
         "o" => Some(command_ids::NEXT_PANE.into()),
         ";" => Some(command_ids::LAST_PANE.into()),
+        "}" => Some(command_ids::SWAP_PANE_NEXT.into()),
         "ArrowUp" => Some(command_ids::FOCUS_UP.into()),
         "ArrowDown" => Some(command_ids::FOCUS_DOWN.into()),
         "ArrowLeft" => Some(command_ids::FOCUS_LEFT.into()),
@@ -442,6 +444,8 @@ pub struct Window {
     pub layout: LayoutNode,
     pub active: PaneId,
     pub layout_preset: LayoutPreset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoomed: Option<PaneId>,
     pub panes: Vec<Pane>,
 }
 
@@ -454,12 +458,20 @@ impl Window {
             layout: LayoutNode::Leaf { pane: active },
             active,
             layout_preset: LayoutPreset::EvenHorizontal,
+            zoomed: None,
             panes: vec![pane],
         }
     }
 
     /// Project the window layout into pane rectangles for the terminal area.
     pub fn pane_rects(&self, bounds: Rect, border_px: u32) -> Vec<PaneRect> {
+        if let Some(pane) = self.zoomed.filter(|pane| self.layout.contains(*pane)) {
+            return vec![PaneRect {
+                pane,
+                rect: bounds,
+                active: pane == self.active,
+            }];
+        }
         self.layout.pane_rects(bounds, self.active, border_px)
     }
 }
@@ -559,6 +571,7 @@ impl Session {
         window.layout.split_leaf(active, new_pane_id, dir);
         window.panes.push(Pane::new(new_pane_id));
         window.active = new_pane_id;
+        window.zoomed = None;
         new_pane_id
     }
 
@@ -571,6 +584,9 @@ impl Session {
         let killed = window.active;
         window.layout.remove_leaf(killed);
         window.panes.retain(|pane| pane.id != killed);
+        if window.zoomed == Some(killed) {
+            window.zoomed = None;
+        }
         window.active = window
             .layout
             .leaves()
@@ -597,6 +613,9 @@ impl Session {
             return Err(MuxError::UnknownPane(pane));
         }
         window.active = pane;
+        if window.zoomed.is_some() {
+            window.zoomed = Some(pane);
+        }
         Ok(())
     }
 
@@ -616,6 +635,18 @@ impl Session {
         Ok(())
     }
 
+    /// Toggle zoom for the active pane in the active window.
+    pub fn toggle_zoom(&mut self) -> Option<PaneId> {
+        let window = self.active_window_mut();
+        if window.zoomed == Some(window.active) {
+            window.zoomed = None;
+            None
+        } else {
+            window.zoomed = Some(window.active);
+            window.zoomed
+        }
+    }
+
     /// Resize the split that directly contains the active pane.
     pub fn resize_pane(&mut self, delta: f32) -> Result<(), MuxError> {
         let window = self.active_window_mut();
@@ -633,6 +664,7 @@ impl Session {
         let panes = window.layout.leaves();
         window.layout = layout_for_preset(&panes, preset);
         window.layout_preset = preset;
+        window.zoomed = None;
     }
 
     /// Cycle the active window to the next built-in layout preset.
@@ -666,6 +698,9 @@ impl Session {
             .position(|pane| *pane == window.active)
             .unwrap_or(0);
         window.active = leaves[wrap_index(index, delta, leaves.len())];
+        if window.zoomed.is_some() {
+            window.zoomed = Some(window.active);
+        }
     }
 
     fn alloc_window(&mut self) -> WindowId {
@@ -893,6 +928,7 @@ mod tests {
             ("x", command_ids::KILL_PANE),
             ("o", command_ids::NEXT_PANE),
             (";", command_ids::LAST_PANE),
+            ("}", command_ids::SWAP_PANE_NEXT),
             ("ArrowUp", command_ids::FOCUS_UP),
             ("ArrowDown", command_ids::FOCUS_DOWN),
             ("ArrowLeft", command_ids::FOCUS_LEFT),
@@ -1250,6 +1286,63 @@ mod tests {
             session.active_window().layout.leaves(),
             vec![PaneId(2), PaneId(1), PaneId(0)]
         );
+    }
+
+    #[test]
+    fn zoom_projects_only_the_active_pane_without_rewriting_layout() {
+        let mut session = Session::new("dev");
+        session.split_active(SplitDirection::Horizontal);
+        session.split_active(SplitDirection::Vertical);
+        let leaves = session.active_window().layout.leaves();
+
+        assert_eq!(session.toggle_zoom(), Some(PaneId(2)));
+        assert_eq!(session.active_window().zoomed, Some(PaneId(2)));
+        assert_eq!(session.active_window().layout.leaves(), leaves);
+        assert_eq!(
+            session
+                .active_window()
+                .pane_rects(Rect::new(10, 20, 300, 200), 1),
+            vec![PaneRect {
+                pane: PaneId(2),
+                rect: Rect::new(10, 20, 300, 200),
+                active: true,
+            }]
+        );
+
+        assert_eq!(session.toggle_zoom(), None);
+        assert_eq!(session.active_window().zoomed, None);
+        assert_eq!(
+            session
+                .active_window()
+                .pane_rects(Rect::new(0, 0, 90, 60), 1)
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn zoom_tracks_focus_changes_so_the_active_pane_stays_visible() {
+        let mut session = Session::new("dev");
+        session.split_active(SplitDirection::Horizontal);
+        session.split_active(SplitDirection::Horizontal);
+
+        assert_eq!(session.toggle_zoom(), Some(PaneId(2)));
+        session.previous_pane();
+        assert_eq!(session.active_window().active, PaneId(1));
+        assert_eq!(session.active_window().zoomed, Some(PaneId(1)));
+        assert_eq!(
+            session
+                .active_window()
+                .pane_rects(Rect::new(0, 0, 120, 80), 1),
+            vec![PaneRect {
+                pane: PaneId(1),
+                rect: Rect::new(0, 0, 120, 80),
+                active: true,
+            }]
+        );
+
+        session.select_pane(PaneId(0)).expect("pane 0 exists");
+        assert_eq!(session.active_window().zoomed, Some(PaneId(0)));
     }
 
     #[test]
