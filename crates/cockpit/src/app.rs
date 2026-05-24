@@ -1682,6 +1682,19 @@ impl AppModel {
             && let Some(offset) = self.mux_session.scroll_copy_mode(-1, usize::MAX)
         {
             self.status = format!("Mux: copy mode offset {offset}.");
+        } else if chord == &KeyChord::single("h", Modifiers::NONE) {
+            if let Some(cursor) = self
+                .mux_session
+                .move_copy_cursor(0, -1, usize::MAX, usize::MAX)
+            {
+                self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+            }
+        } else if chord == &KeyChord::single("l", Modifiers::NONE)
+            && let Some(cursor) = self
+                .mux_session
+                .move_copy_cursor(0, 1, usize::MAX, usize::MAX)
+        {
+            self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
         }
         true
     }
@@ -3628,7 +3641,10 @@ impl AppModel {
         };
         match pane.mode {
             PaneMode::Live => pane_id.to_string(),
-            PaneMode::Copy => format!("{} COPY {}", pane_id, pane.scrollback_offset),
+            PaneMode::Copy => format!(
+                "{} COPY {} {}:{}",
+                pane_id, pane.scrollback_offset, pane.copy_cursor.row, pane.copy_cursor.col
+            ),
         }
     }
 
@@ -5616,7 +5632,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(labels.contains(&"pane-1 COPY 2"));
+        assert!(labels.contains(&"pane-1 COPY 2 0:0"));
     }
 
     /// Build a model whose editor already has `contents` open on a temp file.
@@ -5961,6 +5977,11 @@ mod tests {
 
         model.dispatch(chord("k"));
         assert_eq!(model.mux_session.active_pane().scrollback_offset, 0);
+
+        model.dispatch(chord("l"));
+        assert_eq!(model.mux_session.active_pane().copy_cursor.col, 1);
+        model.dispatch(chord("h"));
+        assert_eq!(model.mux_session.active_pane().copy_cursor.col, 0);
 
         model.dispatch(chord("Escape"));
         assert_eq!(model.mux_session.active_pane().mode, PaneMode::Live);

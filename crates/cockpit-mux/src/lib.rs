@@ -283,12 +283,27 @@ pub enum PaneMode {
     Copy,
 }
 
+/// Cursor position inside copy mode's viewport.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyCursor {
+    pub row: usize,
+    pub col: usize,
+}
+
+impl CopyCursor {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// One terminal pane. Real PTY handles live in `cockpit-terminal`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: PaneId,
     pub scrollback_offset: usize,
     pub mode: PaneMode,
+    #[serde(default, skip_serializing_if = "CopyCursor::is_default")]
+    pub copy_cursor: CopyCursor,
 }
 
 impl Pane {
@@ -297,6 +312,7 @@ impl Pane {
             id,
             scrollback_offset: 0,
             mode: PaneMode::Live,
+            copy_cursor: CopyCursor::default(),
         }
     }
 }
@@ -673,6 +689,7 @@ impl Session {
         let pane_id = pane.id;
         pane.mode = PaneMode::Copy;
         pane.scrollback_offset = 0;
+        pane.copy_cursor = CopyCursor::default();
         pane_id
     }
 
@@ -682,6 +699,7 @@ impl Session {
         let pane_id = pane.id;
         pane.mode = PaneMode::Live;
         pane.scrollback_offset = 0;
+        pane.copy_cursor = CopyCursor::default();
         pane_id
     }
 
@@ -699,6 +717,23 @@ impl Session {
         };
         pane.scrollback_offset = next.min(max_offset);
         Some(pane.scrollback_offset)
+    }
+
+    /// Move the active copy-mode cursor inside the visible viewport.
+    pub fn move_copy_cursor(
+        &mut self,
+        row_delta: isize,
+        col_delta: isize,
+        max_row: usize,
+        max_col: usize,
+    ) -> Option<CopyCursor> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        pane.copy_cursor.row = apply_bounded_delta(pane.copy_cursor.row, row_delta, max_row);
+        pane.copy_cursor.col = apply_bounded_delta(pane.copy_cursor.col, col_delta, max_col);
+        Some(pane.copy_cursor)
     }
 
     /// Resize the split that directly contains the active pane.
@@ -901,6 +936,14 @@ fn split_rect(bounds: Rect, dir: SplitDirection, ratio: f32, border_px: u32) -> 
 fn wrap_index(index: usize, delta: isize, len: usize) -> usize {
     let len = len as isize;
     (index as isize + delta).rem_euclid(len) as usize
+}
+
+fn apply_bounded_delta(value: usize, delta: isize, max: usize) -> usize {
+    if delta.is_negative() {
+        value.saturating_sub(delta.unsigned_abs())
+    } else {
+        value.saturating_add(delta as usize).min(max)
+    }
 }
 
 impl fmt::Display for PaneId {
@@ -1427,6 +1470,30 @@ mod tests {
         assert_eq!(session.scroll_copy_mode(-4, 10), Some(6));
         assert_eq!(session.scroll_copy_mode(-99, 10), Some(0));
         assert_eq!(session.active_pane().scrollback_offset, 0);
+    }
+
+    #[test]
+    fn copy_mode_cursor_moves_inside_the_visible_viewport() {
+        let mut session = Session::new("dev");
+
+        assert_eq!(session.move_copy_cursor(0, 1, 10, 10), None);
+        session.enter_copy_mode();
+
+        assert_eq!(
+            session.move_copy_cursor(2, 3, 10, 10),
+            Some(CopyCursor { row: 2, col: 3 })
+        );
+        assert_eq!(
+            session.move_copy_cursor(99, 99, 10, 10),
+            Some(CopyCursor { row: 10, col: 10 })
+        );
+        assert_eq!(
+            session.move_copy_cursor(-99, -4, 10, 10),
+            Some(CopyCursor { row: 0, col: 6 })
+        );
+
+        session.exit_copy_mode();
+        assert_eq!(session.active_pane().copy_cursor, CopyCursor::default());
     }
 
     #[test]
