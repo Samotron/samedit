@@ -33,6 +33,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey as WinitNamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::atlas_persist;
 use crate::frame::{FrameError, FramePlanner};
 use crate::key_event::{KeyEvent, KeyModifiers, LogicalKey, NamedKey, event_to_chord};
 use crate::painter::Painter;
@@ -121,6 +122,21 @@ pub trait CockpitApp {
     /// app wake the loop for redraws driven by background threads (PTY output).
     /// Default: ignored.
     fn set_redraw_handle(&mut self, _handle: RedrawHandle) {}
+
+    /// Advance any main-thread state machine that wants a frame-by-frame
+    /// cadence — currently the splash-then-hydrate driver (v0.6 M6.2).
+    /// Called once after the most recent frame has been swapped, before
+    /// the harness decides whether to schedule another redraw. Default:
+    /// no-op.
+    fn tick(&mut self) {}
+
+    /// True if the app wants another frame painted as soon as possible
+    /// (without waiting on input or a [`RedrawHandle`] wake). The
+    /// splash-then-hydrate frame loop returns `true` until every cold-
+    /// start phase has finished (v0.6 M6.2). Default: `false`.
+    fn wants_continuous_redraw(&self) -> bool {
+        false
+    }
 
     /// Called once as the event loop exits, before [`run_app`] returns — the
     /// place to persist state. Default: ignored.
@@ -252,7 +268,22 @@ impl<A: CockpitApp> Harness<A> {
 
         // SAFETY: the GL context is current on the calling thread.
         let renderer = unsafe { GlRenderer::new(Rc::clone(&gl), ATLAS_SIZE, ATLAS_SIZE) }?;
-        let planner = FramePlanner::new(ATLAS_SIZE, ATLAS_SIZE)?;
+        let mut planner = FramePlanner::new(ATLAS_SIZE, ATLAS_SIZE)?;
+
+        // M6.4 disk-cache warm. Best-effort: any I/O or rehydration
+        // failure logs at debug/warn and falls back to a fresh atlas.
+        if let Some(path) = atlas_persist::default_cache_path() {
+            match planner.warm_from_disk(&path) {
+                Ok(Some(pixels)) => {
+                    // SAFETY: the context was made current above.
+                    if let Err(err) = unsafe { renderer.upload_full_atlas(&pixels) } {
+                        tracing::warn!(error = %err, "atlas upload after warm failed");
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(error = %err, "atlas warm_from_disk error"),
+            }
+        }
 
         Ok(GlState {
             window,
@@ -329,6 +360,16 @@ impl<A: CockpitApp> Harness<A> {
         gl.surface
             .swap_buffers(&gl.context)
             .map_err(|err| AppError::Setup(format!("buffer swap failed: {err}")))?;
+
+        // M6.2 splash-then-hydrate: advance any per-frame state machine
+        // *after* the frame is visible, then immediately ask for another
+        // frame if the app still has work to drive itself through. This
+        // keeps the splash on screen during phase-1 of hydration without
+        // depending on user input or a wake from a background thread.
+        self.app.tick();
+        if self.app.wants_continuous_redraw() {
+            gl.window.request_redraw();
+        }
         Ok(())
     }
 }
@@ -343,6 +384,18 @@ impl<A: CockpitApp> ApplicationHandler for Harness<A> {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.app.on_shutdown();
+        // M6.4: write the warmed atlas back to disk so the next launch
+        // can skip the per-glyph upload cost. Best-effort — a failed
+        // write logs and continues; it must never block exit.
+        if let Some(gl) = self.gl.as_mut()
+            && let Some(path) = atlas_persist::default_cache_path()
+        {
+            match gl.planner.persist_to_disk(&path) {
+                Ok(true) => tracing::debug!(path = %path.display(), "atlas snapshot persisted"),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(error = %err, "atlas persist_to_disk error"),
+            }
+        }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {

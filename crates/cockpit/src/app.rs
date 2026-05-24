@@ -3986,57 +3986,202 @@ fn paint_confirm(
     );
 }
 
-/// [`CockpitApp`] adapter: forwards harness callbacks to the [`AppModel`].
+/// [`CockpitApp`] adapter: holds either a hydrating cold-start driver or
+/// a live [`AppModel`] and forwards harness callbacks accordingly.
+///
+/// During hydration the shell paints a splash (see [`crate::splash`]),
+/// ignores key / mouse input, and asks the harness for continuous
+/// redraws so the post-paint [`tick`](CockpitApp::tick) loop can advance
+/// one phase per frame (v0.6 M6.2). Once every phase has finished, the
+/// shell transitions to `Live(model)` and forwards everything as before.
 pub struct AppShell {
-    model: AppModel,
+    state: ShellState,
+    /// Splash theme. Kept on the shell so [`CockpitApp::theme`] can hand
+    /// back a `&Theme` while no model exists yet.
+    splash_theme: Theme,
+    /// Redraw handle stashed before the model is born so we can hand it
+    /// to the live model the moment hydration completes (background PTY
+    /// threads expect a wake handle).
+    pending_redraw: Option<RedrawHandle>,
+}
+
+/// Lifecycle of the shell.
+pub(crate) enum ShellState {
+    /// Cold-start phases still running. Painter shows the splash.
+    Hydrating(crate::hydration::HydrationDriver),
+    /// Live cockpit. Every harness callback forwards to the model.
+    Live(AppModel),
+    /// Hydration failed; the splash stays on screen with the error.
+    /// Holds the final progress snapshot so the splash can re-render.
+    Failed(cockpit_ui::HydrationProgress),
+    /// Transient placeholder used by `mem::replace` during state
+    /// transitions. Never observable from outside the shell.
+    Transitioning,
 }
 
 impl AppShell {
-    /// Wrap a model for the windowing harness.
-    pub fn new(model: AppModel) -> Self {
-        Self { model }
+    /// Build a shell that will hydrate the project at `path` on the
+    /// render thread (M6.2). The window opens with the splash painted on
+    /// frame 1; subsequent frames run one cold-start phase each.
+    pub fn hydrating(path: std::path::PathBuf) -> Self {
+        Self {
+            state: ShellState::Hydrating(crate::hydration::HydrationDriver::new(path)),
+            splash_theme: Theme::default(),
+            pending_redraw: None,
+        }
+    }
+
+    // The four predicates below are introspection helpers used by the
+    // M6.2 unit tests to drive `tick`-based state-machine assertions
+    // without exposing the private `ShellState` enum. They have no
+    // production callers; clippy's dead-code lint doesn't follow
+    // `cfg(test)`-gated callers from sibling modules, so we mark the
+    // helpers explicitly.
+    #[allow(dead_code)]
+    pub fn is_hydrating(&self) -> bool {
+        matches!(self.state, ShellState::Hydrating(_))
+    }
+
+    #[allow(dead_code)]
+    pub fn is_live(&self) -> bool {
+        matches!(self.state, ShellState::Live(_))
+    }
+
+    #[allow(dead_code)]
+    pub fn is_failed(&self) -> bool {
+        matches!(self.state, ShellState::Failed(_))
+    }
+
+    #[allow(dead_code)]
+    pub fn model(&self) -> Option<&AppModel> {
+        match &self.state {
+            ShellState::Live(model) => Some(model),
+            _ => None,
+        }
     }
 }
 
 impl CockpitApp for AppShell {
     fn paint(&mut self, painter: &mut Painter, viewport: Viewport) {
-        self.model.paint(painter, viewport);
+        match &mut self.state {
+            ShellState::Live(model) => model.paint(painter, viewport),
+            ShellState::Hydrating(driver) => {
+                crate::splash::paint_splash(
+                    painter,
+                    viewport,
+                    driver.progress(),
+                    &self.splash_theme,
+                );
+            }
+            ShellState::Failed(progress) => {
+                crate::splash::paint_splash(painter, viewport, progress, &self.splash_theme);
+            }
+            ShellState::Transitioning => {
+                // Defensive: the splash background keeps a frame from
+                // flashing through if we ever observe Transitioning.
+                crate::splash::paint_splash(
+                    painter,
+                    viewport,
+                    &cockpit_ui::HydrationProgress::default_phases(),
+                    &self.splash_theme,
+                );
+            }
+        }
     }
 
     fn theme(&self) -> &Theme {
-        &self.model.theme
+        match &self.state {
+            ShellState::Live(model) => &model.theme,
+            _ => &self.splash_theme,
+        }
     }
 
     fn on_key(&mut self, chord: KeyChord) {
-        self.model.dispatch(chord);
+        if let ShellState::Live(model) = &mut self.state {
+            model.dispatch(chord);
+        }
+        // Splash and failed states ignore input — there's nothing
+        // meaningful for the user to do except wait or close the
+        // window. The OS close affordance still works.
     }
 
     fn on_mouse_down(&mut self, button: MouseButton, position: PointerPosition) {
-        self.model.on_pointer_down(button, position);
+        if let ShellState::Live(model) = &mut self.state {
+            model.on_pointer_down(button, position);
+        }
     }
 
     fn on_mouse_up(&mut self, button: MouseButton, position: PointerPosition) {
-        self.model.on_pointer_up(button, position);
+        if let ShellState::Live(model) = &mut self.state {
+            model.on_pointer_up(button, position);
+        }
     }
 
     fn on_mouse_move(&mut self, position: PointerPosition) {
-        self.model.on_pointer_move(position);
+        if let ShellState::Live(model) = &mut self.state {
+            model.on_pointer_move(position);
+        }
     }
 
     fn on_scroll(&mut self, position: PointerPosition, dx: f32, dy: f32) {
-        self.model.on_scroll(position, dx, dy);
+        if let ShellState::Live(model) = &mut self.state {
+            model.on_scroll(position, dx, dy);
+        }
     }
 
     fn set_redraw_handle(&mut self, handle: RedrawHandle) {
-        self.model.set_redraw_handle(handle);
+        match &mut self.state {
+            ShellState::Live(model) => model.set_redraw_handle(handle),
+            _ => {
+                // The model doesn't exist yet — stash the handle so it
+                // is wired up the moment hydration completes.
+                self.pending_redraw = Some(handle);
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        let driver = match &mut self.state {
+            ShellState::Hydrating(driver) => driver,
+            _ => return,
+        };
+        match driver.advance() {
+            crate::hydration::HydrationOutcome::Continue => {}
+            crate::hydration::HydrationOutcome::Ready(model) => {
+                let mut model = *model;
+                if let Some(handle) = self.pending_redraw.take() {
+                    model.set_redraw_handle(handle);
+                }
+                tracing::info!(project = model.project_name(), "cockpit hydration complete");
+                self.state = ShellState::Live(model);
+            }
+            crate::hydration::HydrationOutcome::Failed(message) => {
+                tracing::error!(error = %message, "cockpit hydration failed");
+                let prev = std::mem::replace(&mut self.state, ShellState::Transitioning);
+                let progress = match prev {
+                    ShellState::Hydrating(driver) => driver.progress().clone(),
+                    _ => cockpit_ui::HydrationProgress::default_phases(),
+                };
+                self.state = ShellState::Failed(progress);
+            }
+        }
+    }
+
+    fn wants_continuous_redraw(&self) -> bool {
+        matches!(self.state, ShellState::Hydrating(_))
     }
 
     fn on_shutdown(&mut self) {
-        self.model.on_shutdown();
+        if let ShellState::Live(model) = &mut self.state {
+            model.on_shutdown();
+        }
     }
 
     fn wants_exit(&self) -> bool {
-        self.model.wants_exit()
+        match &self.state {
+            ShellState::Live(model) => model.wants_exit(),
+            _ => false,
+        }
     }
 }
 
@@ -5818,5 +5963,53 @@ mod ui_smoke {
         assert!(!model.wants_exit());
         model.run_command(APP_QUIT);
         assert!(model.wants_exit(), "App: Quit must set the wants_exit flag",);
+    }
+
+    /// M6.2: shell starts in the hydrating state, asks the harness for
+    /// continuous redraws, and walks through every phase via `tick`
+    /// until it transitions to `Live`.
+    #[test]
+    fn app_shell_hydrates_through_tick_to_a_live_model() {
+        let mut shell = AppShell::hydrating(fixture_path("rust-basic"));
+        assert!(shell.is_hydrating());
+        assert!(shell.wants_continuous_redraw());
+        assert!(!shell.is_live());
+
+        // Bounded loop: every phase advances on one tick, and the
+        // terminal `Ready` consumes one more.
+        for _ in 0..cockpit_ui::HydrationPhase::ALL.len() + 1 {
+            if shell.is_live() {
+                break;
+            }
+            shell.tick();
+        }
+        assert!(
+            shell.is_live(),
+            "shell should have transitioned to live after hydration"
+        );
+        assert!(!shell.wants_continuous_redraw());
+        assert_eq!(
+            shell.model().expect("live model").project_name(),
+            "rust-basic"
+        );
+    }
+
+    /// M6.2: a missing-path hydration parks the shell in the failed
+    /// state without panicking, and `wants_continuous_redraw` flips off
+    /// so the harness stops spinning frames.
+    #[test]
+    fn app_shell_lands_in_failed_state_on_bad_path() {
+        let mut shell = AppShell::hydrating(std::path::PathBuf::from(
+            "/this/path/should/not/exist/anywhere",
+        ));
+        for _ in 0..cockpit_ui::HydrationPhase::ALL.len() + 1 {
+            if shell.is_failed() {
+                break;
+            }
+            shell.tick();
+        }
+        assert!(shell.is_failed(), "shell should have failed hydration");
+        assert!(!shell.wants_continuous_redraw());
+        assert!(shell.model().is_none());
     }
 }

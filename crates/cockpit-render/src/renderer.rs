@@ -181,6 +181,44 @@ impl GlRenderer {
         &self.gl
     }
 
+    /// Upload a complete, pre-warmed atlas texture in a single
+    /// `tex_sub_image_2d` call. The buffer must be exactly
+    /// `atlas_width * atlas_height * 4` bytes of RGBA8 pixels — anything
+    /// else is rejected. Used by the M6.4 disk-cache load path so the
+    /// renderer can flip directly from the empty initial texture to a
+    /// fully populated one without paying the per-glyph upload cost on
+    /// the first frame.
+    ///
+    /// # Safety
+    /// Assumes the OpenGL context is current on the calling thread.
+    pub unsafe fn upload_full_atlas(&self, pixels: &[u8]) -> Result<(), RendererError> {
+        let expected = (self.atlas_width as usize) * (self.atlas_height as usize) * 4;
+        if pixels.len() != expected {
+            return Err(RendererError::GlError(format!(
+                "atlas upload expected {expected} bytes, got {}",
+                pixels.len()
+            )));
+        }
+        // SAFETY: caller asserts the context is current.
+        unsafe {
+            self.gl
+                .bind_texture(glow::TEXTURE_2D, Some(self.atlas_texture));
+            self.gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                self.atlas_width,
+                self.atlas_height,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(pixels)),
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        Ok(())
+    }
+
     /// Draw the current frame.
     ///
     /// # Safety

@@ -7,6 +7,7 @@
 pub mod completion;
 pub mod file_browser;
 pub mod file_finder;
+pub mod hydration;
 pub mod launcher;
 pub mod palette;
 pub mod prompt;
@@ -14,6 +15,7 @@ pub mod prompt;
 pub use completion::{CompletionItem, CompletionPopup};
 pub use file_browser::{FileBrowser, FileBrowserAction, FileRow};
 pub use file_finder::{FuzzyFinder, FuzzyMatch};
+pub use hydration::{CompletedPhase, HydrationPhase, HydrationProgress};
 pub use launcher::{Launcher, LauncherAction, LauncherIntent, LauncherSelection, RecentProject};
 pub use palette::{Palette, PaletteEntry, PaletteMatch};
 pub use prompt::ConfirmPrompt;

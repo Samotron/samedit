@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod atlas;
+pub mod atlas_persist;
 pub mod frame;
 pub mod geometry;
 pub mod glyph_cache;
@@ -20,6 +21,9 @@ pub use app::{
     AppError, CockpitApp, MouseButton, PointerPosition, RedrawHandle, Viewport, run_app,
 };
 pub use atlas::{AtlasError, AtlasRect, GlyphAllocation, GlyphAtlas};
+pub use atlas_persist::{
+    ATLAS_FORMAT_VERSION, ATLAS_MAGIC, AtlasPersistError, AtlasSnapshot, GlyphManifestEntry,
+};
 pub use frame::{FrameError, FramePlanner, PreparedGlyph, PreparedTextRun, RenderFrame};
 pub use geometry::{GeometryError, Mesh, Vertex, rect_mesh_from_batches, rect_mesh_from_commands};
 pub use glyph_cache::{
