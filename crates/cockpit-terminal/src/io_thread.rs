@@ -5,8 +5,9 @@
 
 use std::{
     io::{self, Read},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 /// Events emitted by the terminal reader thread.
@@ -27,6 +28,12 @@ impl ReaderThread {
     /// Receive the next event from the reader thread.
     pub fn recv(&self) -> Result<TerminalIoEvent, mpsc::RecvError> {
         self.receiver.recv()
+    }
+
+    /// Receive the next event from the reader thread, timing out if the PTY is
+    /// quiet.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<TerminalIoEvent, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
     }
 
     /// Join the reader thread.

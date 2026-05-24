@@ -175,6 +175,8 @@ pub enum PtyError {
 
 #[cfg(all(test, feature = "integration"))]
 mod integration_tests {
+    use crate::io_thread::TerminalIoEvent;
+
     use super::*;
 
     #[test]
@@ -185,6 +187,7 @@ mod integration_tests {
             CommandSpec::new("/bin/sh", Vec::<String>::new())
         };
         let mut session = PtySession::spawn(&command, PtyDimensions::new(24, 80)).unwrap();
+        let reader = session.spawn_reader_thread().unwrap();
 
         let command = if cfg!(windows) {
             b"echo cockpit-pty\r\n".as_slice()
@@ -192,9 +195,24 @@ mod integration_tests {
             b"printf cockpit-pty\\n\n".as_slice()
         };
         session.write_all(command).unwrap();
-        let output = session
-            .read_until(b"cockpit-pty", Duration::from_secs(5))
-            .unwrap();
+        let mut output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !output
+            .windows(b"cockpit-pty".len())
+            .any(|window| window == b"cockpit-pty")
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for PTY output: {}",
+                String::from_utf8_lossy(&output)
+            );
+            match reader.recv_timeout(remaining).unwrap() {
+                TerminalIoEvent::Output(bytes) => output.extend(bytes),
+                TerminalIoEvent::Eof => panic!("PTY closed before expected output"),
+                TerminalIoEvent::ReadError(error) => panic!("PTY read failed: {error}"),
+            }
+        }
         assert!(String::from_utf8_lossy(&output).contains("cockpit-pty"));
 
         session.resize(PtyDimensions::new(30, 100)).unwrap();
