@@ -642,10 +642,16 @@ budget — the binary stays small, and the first query pays the spawn cost.
   is the opt-in (`--features bench`) integration test that fails the
   build when detection + tree load blow a 500 ms budget on the
   `rust-basic` fixture. CI's bench leg gates regressions on this.
-- [ ] **M6.2 — Splash-then-hydrate frame** — paint the empty three-pane
-  shell on frame 1; defer project detection, tree-sitter grammar load,
-  glyph atlas warm-up, and config parse to subsequent frames. *(Deferred
-  — needs render-loop refactor + real-hardware timing.)*
+- [x] **M6.2 — Splash-then-hydrate frame** — the window opens with a
+  splash painted on frame 1 (`cockpit/src/splash.rs`); subsequent frames
+  each advance one cold-start phase through `HydrationDriver`
+  (`cockpit/src/hydration.rs`). The pure `HydrationProgress` state
+  machine lives in `cockpit-ui` so the splash logic is fully unit-
+  testable. `CockpitApp` gains `tick()` + `wants_continuous_redraw()`
+  so the harness drives the state machine post-paint without any input.
+  *(Real-hardware <100 ms gate still needs a benchmark on the slowest
+  target Linux laptop — M6.1's `cold_start` test guards the regression
+  budget on CI in the meantime.)*
 - [x] **M6.3 — Lazy tree-sitter grammars** — already lazy: every grammar
   config is held in a `thread_local!` `RefCell<Option<_>>` that fills
   the first time the matching language hits `compute`. No change

@@ -6,20 +6,20 @@
 //! without a display server.
 
 mod app;
+mod hydration;
 mod launcher;
+mod splash;
 mod startup;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::Parser;
-use cockpit_project::{
-    FileTree, ProjectDetection, RecentProjects, detect_project, recent_projects_path,
-};
+use cockpit_project::{ProjectDetection, RecentProjects, detect_project, recent_projects_path};
 use cockpit_testkit::{BUILTIN_FIXTURES, fixture_path};
 
-use crate::app::{AppModel, AppShell};
+use crate::app::AppShell;
 use crate::launcher::{LauncherModel, LauncherResult};
 
 #[derive(Debug, Parser)]
@@ -78,49 +78,43 @@ fn run(cli: Cli) -> Result<()> {
 /// Start either a project workspace or the project launcher. If a launcher
 /// selection results in a project, this function tail-calls itself to open
 /// that project.
+///
+/// The normal path opens the window with the splash painted on frame 1
+/// and defers detection / tree load / model build / config / git / cache
+/// to the per-frame [`crate::hydration::HydrationDriver`] (v0.6 M6.2).
+/// `--print` stays fully synchronous because it never opens a window.
 fn run_project_or_launcher(path: Option<PathBuf>, print: bool) -> Result<()> {
     let Some(path) = path else {
         return run_launcher();
     };
 
-    let detection = startup::time_phase("startup.detect", || {
-        detect_project(&path).with_context(|| format!("detect project at `{}`", path.display()))
-    })?;
-
     if print {
+        // Headless path: do the work inline and dump detection to
+        // stdout. No window, no splash.
+        let detection = startup::time_phase("startup.detect", || {
+            detect_project(&path).with_context(|| format!("detect project at `{}`", path.display()))
+        })?;
+        record_recent_project(&detection);
         print_detection(&detection);
         return Ok(());
     }
 
-    record_recent_project(&detection);
+    let initial_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    let title = format!("Coding Cockpit — {initial_name}");
+    tracing::info!(project = initial_name, "opening window with splash");
 
-    let tree = startup::time_phase("startup.tree", || {
-        FileTree::load(&path).with_context(|| format!("load file tree at `{}`", path.display()))
-    })?;
-    let mut model = startup::time_phase("startup.model", || {
-        AppModel::new(detection, tree).map_err(|err| anyhow!(err))
-    })?;
-    startup::time_phase("startup.config", || {
-        if let Some(path) = cockpit_config::user_config_path() {
-            match cockpit_config::Config::load_optional(&path) {
-                Ok(config) => model.apply_user_config(&config),
-                Err(err) => {
-                    tracing::warn!(error = %err, "user config load failed");
-                }
-            }
-        }
-    });
-    startup::time_phase("startup.git", || model.refresh_git_status());
-    startup::time_phase("startup.cache", || model.restore_cached_state());
-    let title = format!("Coding Cockpit — {}", model.project_name());
-    tracing::info!(project = model.project_name(), "opening window");
-
-    cockpit_render::run_app(title, AppShell::new(model)).context("windowing harness failed")?;
+    cockpit_render::run_app(title, AppShell::hydrating(path))
+        .context("windowing harness failed")?;
     Ok(())
 }
 
 /// Add a project to the launcher's recent-projects registry. Best-effort: a
-/// cache failure must never stop the project from opening.
+/// cache failure must never stop the project from opening. Used by the
+/// `--print` path; the hydration driver records recents itself on the
+/// normal path.
 fn record_recent_project(detection: &ProjectDetection) {
     let Ok(path) = recent_projects_path() else {
         return;

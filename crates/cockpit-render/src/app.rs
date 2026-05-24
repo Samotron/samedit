@@ -122,6 +122,21 @@ pub trait CockpitApp {
     /// Default: ignored.
     fn set_redraw_handle(&mut self, _handle: RedrawHandle) {}
 
+    /// Advance any main-thread state machine that wants a frame-by-frame
+    /// cadence — currently the splash-then-hydrate driver (v0.6 M6.2).
+    /// Called once after the most recent frame has been swapped, before
+    /// the harness decides whether to schedule another redraw. Default:
+    /// no-op.
+    fn tick(&mut self) {}
+
+    /// True if the app wants another frame painted as soon as possible
+    /// (without waiting on input or a [`RedrawHandle`] wake). The
+    /// splash-then-hydrate frame loop returns `true` until every cold-
+    /// start phase has finished (v0.6 M6.2). Default: `false`.
+    fn wants_continuous_redraw(&self) -> bool {
+        false
+    }
+
     /// Called once as the event loop exits, before [`run_app`] returns — the
     /// place to persist state. Default: ignored.
     fn on_shutdown(&mut self) {}
@@ -329,6 +344,16 @@ impl<A: CockpitApp> Harness<A> {
         gl.surface
             .swap_buffers(&gl.context)
             .map_err(|err| AppError::Setup(format!("buffer swap failed: {err}")))?;
+
+        // M6.2 splash-then-hydrate: advance any per-frame state machine
+        // *after* the frame is visible, then immediately ask for another
+        // frame if the app still has work to drive itself through. This
+        // keeps the splash on screen during phase-1 of hydration without
+        // depending on user input or a wake from a background thread.
+        self.app.tick();
+        if self.app.wants_continuous_redraw() {
+            gl.window.request_redraw();
+        }
         Ok(())
     }
 }
