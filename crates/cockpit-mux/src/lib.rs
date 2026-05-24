@@ -102,11 +102,24 @@ pub enum SplitDirection {
 }
 
 /// Built-in layout presets matching the tmux subset in the v0.7 plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum LayoutPreset {
     EvenHorizontal,
     MainVertical,
     Tiled,
+}
+
+impl LayoutPreset {
+    pub const ALL: [Self; 3] = [Self::EvenHorizontal, Self::MainVertical, Self::Tiled];
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::EvenHorizontal => Self::MainVertical,
+            Self::MainVertical => Self::Tiled,
+            Self::Tiled => Self::EvenHorizontal,
+        }
+    }
 }
 
 /// One mux command emitted by the prefix FSM.
@@ -428,6 +441,7 @@ pub struct Window {
     pub name: String,
     pub layout: LayoutNode,
     pub active: PaneId,
+    pub layout_preset: LayoutPreset,
     pub panes: Vec<Pane>,
 }
 
@@ -439,6 +453,7 @@ impl Window {
             name: name.into(),
             layout: LayoutNode::Leaf { pane: active },
             active,
+            layout_preset: LayoutPreset::EvenHorizontal,
             panes: vec![pane],
         }
     }
@@ -617,6 +632,14 @@ impl Session {
         let window = self.active_window_mut();
         let panes = window.layout.leaves();
         window.layout = layout_for_preset(&panes, preset);
+        window.layout_preset = preset;
+    }
+
+    /// Cycle the active window to the next built-in layout preset.
+    pub fn next_layout(&mut self) -> LayoutPreset {
+        let preset = self.active_window().layout_preset.next();
+        self.select_layout(preset);
+        preset
     }
 
     fn select_relative_window(&mut self, delta: isize) {
@@ -1052,6 +1075,7 @@ mod tests {
                 "pane": 0
               },
               "active": 0,
+              "layout_preset": "even-horizontal",
               "panes": [
                 {
                   "id": 0,
@@ -1110,6 +1134,7 @@ mod tests {
                 }
               },
               "active": 2,
+              "layout_preset": "even-horizontal",
               "panes": [
                 {
                   "id": 0,
@@ -1283,6 +1308,7 @@ mod tests {
                 }
               },
               "active": 2,
+              "layout_preset": "main-vertical",
               "panes": [
                 {
                   "id": 0,
@@ -1307,5 +1333,24 @@ mod tests {
           "next_pane": 3
         }
         "#);
+    }
+
+    #[test]
+    fn next_layout_cycles_builtin_presets() {
+        let mut session = Session::new("dev");
+        session.split_active(SplitDirection::Horizontal);
+        session.split_active(SplitDirection::Vertical);
+
+        assert_eq!(
+            session.active_window().layout_preset,
+            LayoutPreset::EvenHorizontal
+        );
+        assert_eq!(session.next_layout(), LayoutPreset::MainVertical);
+        assert_eq!(
+            session.active_window().layout_preset,
+            LayoutPreset::MainVertical
+        );
+        assert_eq!(session.next_layout(), LayoutPreset::Tiled);
+        assert_eq!(session.next_layout(), LayoutPreset::EvenHorizontal);
     }
 }

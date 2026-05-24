@@ -25,7 +25,7 @@ use cockpit_lsp::{
     ServerConfig,
 };
 use cockpit_mux::{
-    LayoutPreset, PrefixDispatcher, Rect as MuxRect, Session as MuxSession, SplitDirection,
+    PrefixDispatcher, Rect as MuxRect, Session as MuxSession, SplitDirection,
     command_ids as mux_command_ids,
 };
 use cockpit_notebook::{
@@ -320,8 +320,27 @@ pub struct AppModel {
 /// a pure delta from the drag origin.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DragState {
-    LeftBorder { start_x: f32, start_width: u32 },
-    RightBorder { start_x: f32, start_width: u32 },
+    LeftBorder {
+        start_x: f32,
+        start_width: u32,
+    },
+    RightBorder {
+        start_x: f32,
+        start_width: u32,
+    },
+    MuxDivider {
+        axis: MuxDragAxis,
+        pane: cockpit_mux::PaneId,
+        last_x: f32,
+        last_y: f32,
+        extent: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MuxDragAxis {
+    Horizontal,
+    Vertical,
 }
 
 impl AppModel {
@@ -604,6 +623,30 @@ impl AppModel {
                 let new_width = (start_width as f32 + delta).clamp(160.0, 1000.0);
                 self.layout.set_right_width(new_width as u32);
             }
+            DragState::MuxDivider {
+                axis,
+                pane,
+                last_x,
+                last_y,
+                extent,
+            } => {
+                let delta = match axis {
+                    MuxDragAxis::Horizontal => position.x - last_x,
+                    MuxDragAxis::Vertical => position.y - last_y,
+                };
+                let ratio_delta = delta / extent.max(1.0);
+                if ratio_delta.abs() > f32::EPSILON {
+                    let _ = self.mux_session.select_pane(pane);
+                    let _ = self.mux_session.resize_pane(-ratio_delta);
+                }
+                self.drag = Some(DragState::MuxDivider {
+                    axis,
+                    pane,
+                    last_x: position.x,
+                    last_y: position.y,
+                    extent,
+                });
+            }
         }
     }
 
@@ -656,6 +699,9 @@ impl AppModel {
             }
         }
         if let Some(rect) = layout.terminal {
+            if let Some(drag) = self.detect_mux_border_drag(rect, position) {
+                return Some(drag);
+            }
             let border_x = rect.x as f32;
             if (position.x - border_x).abs() <= band
                 && position.y >= TOP_BAR_H
@@ -665,6 +711,60 @@ impl AppModel {
                     start_x: position.x,
                     start_width: rect.width,
                 });
+            }
+        }
+        None
+    }
+
+    fn detect_mux_border_drag(&self, rect: UiRect, position: PointerPosition) -> Option<DragState> {
+        let band = 6.0_f32;
+        let pane_rects = self.mux_pane_rects_for_terminal(rect);
+        if pane_rects.len() < 2 {
+            return None;
+        }
+
+        for (index, a) in pane_rects.iter().enumerate() {
+            for b in pane_rects.iter().skip(index + 1) {
+                let a_right = a.rect.x + a.rect.width;
+                let b_right = b.rect.x + b.rect.width;
+                let a_bottom = a.rect.y + a.rect.height;
+                let b_bottom = b.rect.y + b.rect.height;
+                let y0 = a.rect.y.max(b.rect.y) as f32;
+                let y1 = a_bottom.min(b_bottom) as f32;
+                let x0 = a.rect.x.max(b.rect.x) as f32;
+                let x1 = a_right.min(b_right) as f32;
+
+                for border_x in [a_right, b_right] {
+                    let separates = (border_x <= b.rect.x || border_x <= a.rect.x)
+                        && y1 > y0
+                        && position.y >= y0
+                        && position.y <= y1;
+                    if separates && (position.x - border_x as f32).abs() <= band {
+                        return Some(DragState::MuxDivider {
+                            axis: MuxDragAxis::Horizontal,
+                            pane: b.pane,
+                            last_x: position.x,
+                            last_y: position.y,
+                            extent: rect.width.max(1) as f32,
+                        });
+                    }
+                }
+
+                for border_y in [a_bottom, b_bottom] {
+                    let separates = (border_y <= b.rect.y || border_y <= a.rect.y)
+                        && x1 > x0
+                        && position.x >= x0
+                        && position.x <= x1;
+                    if separates && (position.y - border_y as f32).abs() <= band {
+                        return Some(DragState::MuxDivider {
+                            axis: MuxDragAxis::Vertical,
+                            pane: b.pane,
+                            last_x: position.x,
+                            last_y: position.y,
+                            extent: rect.height.max(1) as f32,
+                        });
+                    }
+                }
             }
         }
         None
@@ -956,8 +1056,8 @@ impl AppModel {
     }
 
     fn mux_next_layout(&mut self) {
-        self.mux_session.select_layout(LayoutPreset::Tiled);
-        self.status = "Mux: selected tiled layout.".to_string();
+        let preset = self.mux_session.next_layout();
+        self.status = format!("Mux: selected {preset:?} layout.");
     }
 
     /// Send `mise run <task>` to the terminal session, starting it if needed.
@@ -4036,12 +4136,29 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(mux_command_ids::KILL_WINDOW, "Mux: Kill Window"),
         PaletteEntry::new(mux_command_ids::NEXT_WINDOW, "Mux: Next Window"),
         PaletteEntry::new(mux_command_ids::PREVIOUS_WINDOW, "Mux: Previous Window"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_0, "Mux: Select Window 0"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_1, "Mux: Select Window 1"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_2, "Mux: Select Window 2"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_3, "Mux: Select Window 3"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_4, "Mux: Select Window 4"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_5, "Mux: Select Window 5"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_6, "Mux: Select Window 6"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_7, "Mux: Select Window 7"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_8, "Mux: Select Window 8"),
+        PaletteEntry::new(mux_command_ids::SELECT_WINDOW_9, "Mux: Select Window 9"),
         PaletteEntry::new(mux_command_ids::SPLIT_HORIZONTAL, "Mux: Split Horizontal"),
         PaletteEntry::new(mux_command_ids::SPLIT_VERTICAL, "Mux: Split Vertical"),
         PaletteEntry::new(mux_command_ids::KILL_PANE, "Mux: Kill Pane"),
         PaletteEntry::new(mux_command_ids::NEXT_PANE, "Mux: Next Pane"),
-        PaletteEntry::new(mux_command_ids::RESIZE_RIGHT, "Mux: Grow Pane"),
-        PaletteEntry::new(mux_command_ids::RESIZE_LEFT, "Mux: Shrink Pane"),
+        PaletteEntry::new(mux_command_ids::LAST_PANE, "Mux: Last Pane"),
+        PaletteEntry::new(mux_command_ids::FOCUS_UP, "Mux: Focus Up"),
+        PaletteEntry::new(mux_command_ids::FOCUS_DOWN, "Mux: Focus Down"),
+        PaletteEntry::new(mux_command_ids::FOCUS_LEFT, "Mux: Focus Left"),
+        PaletteEntry::new(mux_command_ids::FOCUS_RIGHT, "Mux: Focus Right"),
+        PaletteEntry::new(mux_command_ids::RESIZE_UP, "Mux: Resize Up"),
+        PaletteEntry::new(mux_command_ids::RESIZE_DOWN, "Mux: Resize Down"),
+        PaletteEntry::new(mux_command_ids::RESIZE_LEFT, "Mux: Resize Left"),
+        PaletteEntry::new(mux_command_ids::RESIZE_RIGHT, "Mux: Resize Right"),
         PaletteEntry::new(mux_command_ids::NEXT_LAYOUT, "Mux: Next Layout"),
         PaletteEntry::new(TEST_RUN_ALL, "Test: Run All"),
         PaletteEntry::new(TEST_RUN_CURRENT_FILE, "Test: Run Current File"),
@@ -5583,6 +5700,23 @@ mod tests {
     }
 
     #[test]
+    fn mux_next_layout_cycles_preset_state() {
+        let mut model = model();
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+        model.run_command(mux_command_ids::NEXT_LAYOUT);
+        assert_eq!(
+            model.mux_session.active_window().layout_preset,
+            cockpit_mux::LayoutPreset::MainVertical
+        );
+
+        model.run_command(mux_command_ids::NEXT_LAYOUT);
+        assert_eq!(
+            model.mux_session.active_window().layout_preset,
+            cockpit_mux::LayoutPreset::Tiled
+        );
+    }
+
+    #[test]
     fn mux_prefix_consumes_unknown_followup_without_forwarding_to_terminal() {
         let mut model = model();
         model.dispatch(chord("Ctrl+l"));
@@ -5611,6 +5745,54 @@ mod tests {
                 .recent_commands_summary()
                 .contains(mux_command_ids::SELECT_WINDOW_0)
         );
+    }
+
+    #[test]
+    fn palette_lists_every_mux_resize_command() {
+        let ids = palette_entries()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect::<Vec<_>>();
+
+        for id in [
+            mux_command_ids::RESIZE_UP,
+            mux_command_ids::RESIZE_DOWN,
+            mux_command_ids::RESIZE_LEFT,
+            mux_command_ids::RESIZE_RIGHT,
+        ] {
+            assert!(ids.iter().any(|candidate| candidate == id), "{id}");
+        }
+    }
+
+    #[test]
+    fn palette_lists_mux_focus_commands() {
+        let ids = palette_entries()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect::<Vec<_>>();
+
+        for id in [
+            mux_command_ids::NEXT_PANE,
+            mux_command_ids::LAST_PANE,
+            mux_command_ids::FOCUS_UP,
+            mux_command_ids::FOCUS_DOWN,
+            mux_command_ids::FOCUS_LEFT,
+            mux_command_ids::FOCUS_RIGHT,
+        ] {
+            assert!(ids.iter().any(|candidate| candidate == id), "{id}");
+        }
+    }
+
+    #[test]
+    fn palette_lists_mux_select_window_commands() {
+        let ids = palette_entries()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect::<Vec<_>>();
+
+        for id in mux_command_ids::SELECT_WINDOW {
+            assert!(ids.iter().any(|candidate| candidate == id), "{id}");
+        }
     }
 
     #[test]
@@ -6297,6 +6479,66 @@ format_on_save = true
             "right width {} should exceed initial {initial}",
             model.layout.preferences().right_width
         );
+    }
+
+    #[test]
+    fn dragging_a_mux_terminal_border_resizes_the_split() {
+        let mut model = primed_model();
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+        let left_pane = model.mux_session.active_window().layout.leaves()[0];
+        model
+            .mux_session
+            .select_pane(left_pane)
+            .expect("left pane can be focused before dragging divider");
+
+        // Default 1280-wide layout: terminal content spans roughly
+        // x=800..1280, so the 50/50 mux split border is near x=1040.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(1040.0, 120.0));
+        model.on_pointer_move(PointerPosition::new(1088.0, 120.0));
+        model.on_pointer_up(MouseButton::Left, PointerPosition::new(1088.0, 120.0));
+
+        match &model.mux_session.active_window().layout {
+            cockpit_mux::LayoutNode::Split { ratio, .. } => {
+                assert!(
+                    *ratio > 0.55,
+                    "dragging right should move the split ratio right even when the left pane was active, got {ratio}"
+                );
+            }
+            other => panic!("expected split layout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dragging_a_vertical_mux_terminal_border_resizes_the_split() {
+        let mut model = primed_model();
+        model.run_command(mux_command_ids::SPLIT_VERTICAL);
+
+        let terminal = model
+            .last_layout
+            .as_ref()
+            .and_then(|layout| layout.terminal)
+            .expect("terminal pane visible");
+        let rects = model.mux_pane_rects_for_terminal(terminal);
+        let top = rects
+            .iter()
+            .find(|pane| pane.pane.get() == 0)
+            .expect("top pane projected");
+        let border_y = (top.rect.y + top.rect.height) as f32;
+        let x = top.rect.x as f32 + top.rect.width as f32 / 2.0;
+
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(x, border_y));
+        model.on_pointer_move(PointerPosition::new(x, border_y + 72.0));
+        model.on_pointer_up(MouseButton::Left, PointerPosition::new(x, border_y + 72.0));
+
+        match &model.mux_session.active_window().layout {
+            cockpit_mux::LayoutNode::Split { ratio, .. } => {
+                assert!(
+                    *ratio > 0.55,
+                    "dragging down should move the split ratio down, got {ratio}"
+                );
+            }
+            other => panic!("expected split layout, got {other:?}"),
+        }
     }
 
     #[test]
