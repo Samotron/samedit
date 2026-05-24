@@ -12,6 +12,7 @@
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cockpit_commands::KeyChord;
 use glutin::config::{Config, ConfigTemplateBuilder};
@@ -176,10 +177,28 @@ pub enum AppError {
     Frame(#[from] FrameError),
 }
 
+/// Tracks whether [`run_app`] has already been entered in this process
+/// (M7.1). `winit::EventLoop` is hard-coded to one-per-process — the
+/// second call panics with `EventLoop can't be recreated`. We fail loud
+/// here instead so the cause is obvious in dev; the launcher → project
+/// hand-off lives in [`CockpitApp`] state machines, never in a second
+/// `run_app`.
+static RUN_APP_CALLED: AtomicBool = AtomicBool::new(false);
+
 /// Run `app` in a window titled `title` until it exits.
 ///
 /// Blocks until the window closes. Returns the first fatal error, if any.
+///
+/// **Hard rule (M7.1):** at most one call per process. A second call panics.
 pub fn run_app<A: CockpitApp>(title: impl Into<String>, mut app: A) -> Result<(), AppError> {
+    if RUN_APP_CALLED.swap(true, Ordering::SeqCst) {
+        panic!(
+            "cockpit_render::run_app called more than once in the same process — \
+             winit only supports one EventLoop per process. \
+             Transition between launcher and project inside the same CockpitApp \
+             (see crates/cockpit/src/app.rs AppShell)."
+        );
+    }
     let event_loop = EventLoop::<()>::with_user_event()
         .build()
         .map_err(|err| AppError::Setup(err.to_string()))?;

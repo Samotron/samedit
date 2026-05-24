@@ -571,6 +571,7 @@ dependencies = [
  "cockpit-config",
  "cockpit-editor",
  "cockpit-lsp",
+ "cockpit-mux",
  "cockpit-notebook",
  "cockpit-project",
  "cockpit-render",
@@ -634,6 +635,17 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "cockpit-mux"
+version = "0.0.1"
+dependencies = [
+ "cockpit-commands",
+ "insta",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

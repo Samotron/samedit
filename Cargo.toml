@@ -15,6 +15,7 @@ cockpit-commands = { path = "crates/cockpit-commands" }
 cockpit-project = { path = "crates/cockpit-project" }
 cockpit-editor = { path = "crates/cockpit-editor" }
 cockpit-lsp = { path = "crates/cockpit-lsp" }
+cockpit-mux = { path = "crates/cockpit-mux" }
 cockpit-terminal = { path = "crates/cockpit-terminal" }
 cockpit-ui = { path = "crates/cockpit-ui" }
 cockpit-analytics = { path = "crates/cockpit-analytics" }

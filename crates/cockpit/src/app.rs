@@ -24,6 +24,10 @@ use cockpit_lsp::{
     Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, Response,
     ServerConfig,
 };
+use cockpit_mux::{
+    LayoutPreset, PrefixDispatcher, Rect as MuxRect, Session as MuxSession, SplitDirection,
+    command_ids as mux_command_ids,
+};
 use cockpit_notebook::{
     CellKind, Notebook, is_notebook_source, parse_notebook, parse_quarto, quarto_render_spec,
 };
@@ -245,7 +249,12 @@ pub struct AppModel {
     palette_mode: PaletteMode,
     finder: Option<FuzzyFinder>,
     file_index: Option<Vec<String>>,
-    terminal: Option<LiveTerminal>,
+    terminals: HashMap<cockpit_mux::PaneId, LiveTerminal>,
+    /// Native mux state (v0.7 M7.4). Pane ids key the live terminal map
+    /// so split panes can own independent PTYs while the mux model stays
+    /// headless.
+    mux_session: MuxSession,
+    mux_prefix: PrefixDispatcher,
     redraw: Option<RedrawHandle>,
     cache_path: Option<PathBuf>,
     /// Most recent key chords, oldest first (spec §18.13 key event inspector).
@@ -356,7 +365,9 @@ impl AppModel {
             palette_mode: PaletteMode::Commands,
             finder: None,
             file_index: None,
-            terminal: None,
+            terminals: HashMap::new(),
+            mux_session: MuxSession::new(detection.display_name.clone()),
+            mux_prefix: PrefixDispatcher::default(),
             redraw: None,
             cache_path: None,
             key_log: VecDeque::with_capacity(DEBUG_LOG_SIZE),
@@ -512,6 +523,9 @@ impl AppModel {
             return;
         }
         let focused = self.layout.focused();
+        if focused == PaneId::Terminal && self.handle_mux_prefix(&chord) {
+            return;
+        }
         match self.router.route(focused, chord) {
             RoutedInput::Command(id) => self.run_command(id.as_str()),
             RoutedInput::Unhandled(chord) | RoutedInput::TerminalPassthrough(chord) => {
@@ -555,6 +569,7 @@ impl AppModel {
             && pane_contains(rect, position)
         {
             self.layout.focus(PaneId::Terminal);
+            self.select_mux_pane_at(rect, position);
             self.ensure_terminal();
         }
     }
@@ -607,7 +622,7 @@ impl AppModel {
         }
         if let Some(rect) = layout.terminal
             && pane_contains(rect, position)
-            && let Some(terminal) = self.terminal.as_mut()
+            && let Some(terminal) = self.active_terminal_mut()
         {
             // Forward the wheel as a Zellij/termwiz scroll arrow sequence
             // by emitting CSI A/B per step. termwiz interprets these as
@@ -673,6 +688,32 @@ impl AppModel {
         self.activate_selection();
     }
 
+    fn select_mux_pane_at(&mut self, rect: UiRect, position: PointerPosition) {
+        let Some(pane) = self
+            .mux_pane_rects_for_terminal(rect)
+            .into_iter()
+            .find(|pane| mux_rect_contains(pane.rect, position))
+            .map(|pane| pane.pane)
+        else {
+            return;
+        };
+        if self.mux_session.select_pane(pane).is_ok() {
+            self.status = format!("Mux: focused {pane}.");
+        }
+    }
+
+    fn mux_pane_rects_for_terminal(&self, rect: UiRect) -> Vec<cockpit_mux::PaneRect> {
+        self.mux_session.active_window().pane_rects(
+            MuxRect::new(
+                rect.x,
+                rect.y + TOP_BAR_H as u32 + HEADER_H as u32,
+                rect.width,
+                rect.height.saturating_sub(HEADER_H as u32),
+            ),
+            1,
+        )
+    }
+
     /// Push a chord onto the recent-key ring buffer (spec §18.13).
     fn record_key_event(&mut self, chord: &KeyChord) {
         if self.key_log.len() == DEBUG_LOG_SIZE {
@@ -692,6 +733,9 @@ impl AppModel {
     /// Apply a resolved global command.
     fn run_command(&mut self, id: &str) {
         self.record_command(id);
+        if self.run_mux_command(id) {
+            return;
+        }
         match id {
             command_ids::FOCUS_FILES => self.layout.focus(PaneId::Files),
             command_ids::FOCUS_EDITOR => self.layout.focus(PaneId::Editor),
@@ -765,11 +809,162 @@ impl AppModel {
         self.status = "Run mise task — type to filter, Enter to run, Esc to close.".to_string();
     }
 
+    fn run_mux_command(&mut self, id: &str) -> bool {
+        match id {
+            mux_command_ids::SPLIT_HORIZONTAL => self.mux_split(SplitDirection::Horizontal),
+            mux_command_ids::SPLIT_VERTICAL => self.mux_split(SplitDirection::Vertical),
+            mux_command_ids::KILL_PANE => self.mux_kill_pane(),
+            mux_command_ids::NEXT_PANE
+            | mux_command_ids::FOCUS_RIGHT
+            | mux_command_ids::FOCUS_DOWN => self.mux_next_pane(),
+            mux_command_ids::LAST_PANE
+            | mux_command_ids::FOCUS_LEFT
+            | mux_command_ids::FOCUS_UP => self.mux_previous_pane(),
+            mux_command_ids::RESIZE_RIGHT | mux_command_ids::RESIZE_DOWN => {
+                self.mux_resize_active_pane(0.05)
+            }
+            mux_command_ids::RESIZE_LEFT | mux_command_ids::RESIZE_UP => {
+                self.mux_resize_active_pane(-0.05)
+            }
+            mux_command_ids::NEXT_WINDOW => self.mux_next_window(),
+            mux_command_ids::PREVIOUS_WINDOW => self.mux_previous_window(),
+            mux_command_ids::NEW_WINDOW => self.mux_new_window(),
+            mux_command_ids::KILL_WINDOW => self.mux_kill_window(),
+            mux_command_ids::NEXT_LAYOUT => self.mux_next_layout(),
+            mux_command_ids::RENAME_WINDOW => {
+                self.status = "Mux: rename window UI lands with the command palette input surface."
+                    .to_string();
+            }
+            mux_command_ids::ZOOM_PANE => {
+                self.status = "Mux: zoom pane rendering lands with multi-pane paint.".to_string();
+            }
+            mux_command_ids::COPY_MODE => {
+                self.status = "Mux: copy mode lands in M7.6.".to_string();
+            }
+            mux_command_ids::PASTE => {
+                self.status = "Mux: paste uses copy-mode buffer in M7.6.".to_string();
+            }
+            mux_command_ids::DETACH => {
+                self.status = "Mux: detach/attach lands in M7.5.".to_string();
+            }
+            other => {
+                if let Some(index) = mux_select_window_index(other) {
+                    self.mux_select_window(index);
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn mux_split(&mut self, dir: SplitDirection) {
+        let pane = self.mux_session.split_active(dir);
+        self.layout.focus(PaneId::Terminal);
+        self.status = format!("Mux: split terminal pane ({pane}).");
+        if self.redraw.is_some() {
+            self.ensure_terminal();
+        }
+    }
+
+    fn mux_kill_pane(&mut self) {
+        match self.mux_session.kill_pane() {
+            Ok(pane) => {
+                self.terminals.remove(&pane);
+                self.status = format!("Mux: killed {pane}.");
+            }
+            Err(err) => self.status = format!("Mux: {err}."),
+        }
+    }
+
+    fn mux_next_pane(&mut self) {
+        self.mux_session.next_pane();
+        let pane = self.mux_session.active_window().active;
+        self.status = format!("Mux: focused {pane}.");
+        if self.redraw.is_some() {
+            self.ensure_terminal();
+        }
+    }
+
+    fn mux_previous_pane(&mut self) {
+        self.mux_session.previous_pane();
+        let pane = self.mux_session.active_window().active;
+        self.status = format!("Mux: focused {pane}.");
+        if self.redraw.is_some() {
+            self.ensure_terminal();
+        }
+    }
+
+    fn mux_resize_active_pane(&mut self, delta: f32) {
+        match self.mux_session.resize_pane(delta) {
+            Ok(()) => {
+                let pane = self.mux_session.active_window().active;
+                self.status = format!("Mux: resized {pane}.");
+            }
+            Err(err) => self.status = format!("Mux: {err}."),
+        }
+    }
+
+    fn mux_new_window(&mut self) {
+        let index = self.mux_session.windows.len();
+        let id = self.mux_session.new_window(index.to_string());
+        self.status = format!("Mux: new window {}.", id.get());
+    }
+
+    fn mux_kill_window(&mut self) {
+        let panes = self.mux_session.active_window().layout.leaves();
+        match self.mux_session.kill_window() {
+            Ok(window) => {
+                for pane in panes {
+                    self.terminals.remove(&pane);
+                }
+                self.status = format!("Mux: killed window {}.", window.get());
+                if self.redraw.is_some() {
+                    self.ensure_terminal();
+                }
+            }
+            Err(err) => self.status = format!("Mux: {err}."),
+        }
+    }
+
+    fn mux_next_window(&mut self) {
+        self.mux_session.next_window();
+        self.status = format!("Mux: window {}.", self.mux_session.active.get());
+        if self.redraw.is_some() && self.layout.focused() == PaneId::Terminal {
+            self.ensure_terminal();
+        }
+    }
+
+    fn mux_previous_window(&mut self) {
+        self.mux_session.previous_window();
+        self.status = format!("Mux: window {}.", self.mux_session.active.get());
+        if self.redraw.is_some() && self.layout.focused() == PaneId::Terminal {
+            self.ensure_terminal();
+        }
+    }
+
+    fn mux_select_window(&mut self, index: usize) {
+        match self.mux_session.select_window(index) {
+            Ok(()) => {
+                self.status = format!("Mux: window {}.", self.mux_session.active.get());
+                if self.redraw.is_some() && self.layout.focused() == PaneId::Terminal {
+                    self.ensure_terminal();
+                }
+            }
+            Err(err) => self.status = format!("Mux: {err}."),
+        }
+    }
+
+    fn mux_next_layout(&mut self) {
+        self.mux_session.select_layout(LayoutPreset::Tiled);
+        self.status = "Mux: selected tiled layout.".to_string();
+    }
+
     /// Send `mise run <task>` to the terminal session, starting it if needed.
     fn run_mise_task(&mut self, task: &str) {
         self.ensure_terminal();
         let command = format!("mise run {task}\r");
-        match self.terminal.as_mut() {
+        match self.active_terminal_mut() {
             Some(terminal) => match terminal.send_input(command.as_bytes()) {
                 Ok(()) => {
                     self.layout.focus(PaneId::Terminal);
@@ -816,7 +1011,7 @@ impl AppModel {
     /// terminal pane on success.
     fn paste_into_terminal(&mut self, bytes: &[u8], success: String) {
         self.ensure_terminal();
-        match self.terminal.as_mut() {
+        match self.active_terminal_mut() {
             Some(terminal) => match terminal.send_input(bytes) {
                 Ok(()) => {
                     self.layout.focus(PaneId::Terminal);
@@ -896,7 +1091,7 @@ impl AppModel {
     fn send_command_to_terminal(&mut self, command: &str, success: String) {
         self.ensure_terminal();
         let line = format!("{command}\r");
-        match self.terminal.as_mut() {
+        match self.active_terminal_mut() {
             Some(terminal) => match terminal.send_input(line.as_bytes()) {
                 Ok(()) => {
                     self.layout.focus(PaneId::Terminal);
@@ -983,13 +1178,17 @@ impl AppModel {
     fn pane_tree_summary(&self) -> String {
         let prefs = self.layout.preferences();
         let focused = self.layout.focused();
-        let term = match &self.terminal {
-            Some(_) => "spawned",
-            None => "none",
-        };
+        let term = self.terminals.len();
+        let mux_window = self.mux_session.active_window();
+        let mux_panes = mux_window.layout.leaves().len();
         format!(
-            "files={}px, terminal={}px, focused={:?}, terminal_proc={term}",
-            prefs.left_width, prefs.right_width, focused,
+            "files={}px, terminal={}px, focused={:?}, terminal_procs={term}, mux_window={}, mux_panes={}, mux_active={}",
+            prefs.left_width,
+            prefs.right_width,
+            focused,
+            mux_window.id.get(),
+            mux_panes,
+            mux_window.active,
         )
     }
 
@@ -1026,7 +1225,7 @@ impl AppModel {
     /// Scan the terminal's visible output for file references (spec §17). With
     /// a single match jump straight to it; with several, offer a picker.
     fn open_terminal_paths(&mut self) {
-        let Some(terminal) = self.terminal.as_ref() else {
+        let Some(terminal) = self.active_terminal() else {
             self.status = "No terminal — start one to navigate its output.".to_string();
             return;
         };
@@ -1267,9 +1466,10 @@ impl AppModel {
         }
     }
 
-    /// Spawn the terminal session on first use of the terminal pane.
+    /// Spawn the active mux pane's terminal session on first use.
     fn ensure_terminal(&mut self) {
-        if self.terminal.is_some() {
+        let pane = self.mux_session.active_window().active;
+        if self.terminals.contains_key(&pane) {
             return;
         }
         let Some(redraw) = self.redraw.clone() else {
@@ -1296,19 +1496,33 @@ impl AppModel {
         let wake: WakeFn = Box::new(move || redraw.request());
         match LiveTerminal::spawn(&command, PtyDimensions::new(24, 80), wake) {
             Ok(terminal) => {
-                self.terminal = Some(terminal);
-                self.status = format!("Terminal started ({label}).");
+                self.terminals.insert(pane, terminal);
+                self.status = format!("Terminal started for {pane} ({label}).");
             }
             Err(err) => self.status = format!("Terminal failed to start: {err}"),
         }
     }
 
+    fn active_terminal_mut(&mut self) -> Option<&mut LiveTerminal> {
+        let pane = self.mux_session.active_window().active;
+        self.terminals.get_mut(&pane)
+    }
+
+    fn active_terminal(&self) -> Option<&LiveTerminal> {
+        let pane = self.mux_session.active_window().active;
+        self.terminals.get(&pane)
+    }
+
     /// Forward a chord to the PTY when the terminal pane is focused.
     fn handle_terminal_key(&mut self, chord: &KeyChord) {
+        if self.handle_mux_prefix(chord) {
+            return;
+        }
+
         let Some(bytes) = chord_to_terminal_bytes(chord) else {
             return;
         };
-        let Some(terminal) = self.terminal.as_mut() else {
+        let Some(terminal) = self.active_terminal_mut() else {
             return;
         };
         if let Err(err) = terminal.send_input(&bytes) {
@@ -1316,17 +1530,33 @@ impl AppModel {
         }
     }
 
-    /// Resize the live terminal so its grid matches the terminal pane.
+    fn handle_mux_prefix(&mut self, chord: &KeyChord) -> bool {
+        if let Some(commands) = self.mux_prefix.handle_key(chord) {
+            let ids: Vec<String> = commands
+                .into_iter()
+                .map(|command| command.id().to_string())
+                .collect();
+            for id in ids {
+                self.run_command(&id);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Resize live terminals so each grid matches its mux pane.
     fn sync_terminal_size(&mut self, rect: UiRect) {
-        let Some(terminal) = self.terminal.as_mut() else {
-            return;
-        };
-        let char_w = FONT * CHAR_W_RATIO;
-        let inner_w = (rect.width as f32 - 2.0 * PAD).max(char_w);
-        let inner_h = (rect.height as f32 - HEADER_H - PAD).max(ROW_H);
-        let cols = (inner_w / char_w) as u16;
-        let rows = (inner_h / ROW_H) as u16;
-        let _ = terminal.resize(PtyDimensions::new(rows, cols));
+        for pane in self.mux_pane_rects_for_terminal(rect) {
+            let Some(terminal) = self.terminals.get_mut(&pane.pane) else {
+                continue;
+            };
+            let char_w = FONT * CHAR_W_RATIO;
+            let inner_w = (pane.rect.width as f32 - 2.0 * PAD).max(char_w);
+            let inner_h = (pane.rect.height as f32 - PAD).max(ROW_H);
+            let cols = (inner_w / char_w) as u16;
+            let rows = (inner_h / ROW_H) as u16;
+            let _ = terminal.resize(PtyDimensions::new(rows, cols));
+        }
     }
 
     /// File-browser navigation when the files pane is focused.
@@ -3161,31 +3391,117 @@ impl AppModel {
 
     fn paint_terminal(&self, canvas: &mut Canvas<'_>, rect: UiRect, focused: bool) {
         let content = self.paint_pane(canvas, rect, "TERMINAL", focused);
-        let Some(terminal) = &self.terminal else {
-            let lines = [
-                "Integrated terminal",
-                "",
-                "Focus this pane (Ctrl+L) to start a session.",
-                "Runs the project's Zellij workspace when mise and",
-                "zellij are on PATH; otherwise a plain shell.",
-            ];
-            let top = content.y + PAD;
-            for (index, line) in lines.iter().enumerate() {
-                canvas.text(
-                    content.x + PAD,
-                    top + index as f32 * ROW_H + 3.0,
-                    *line,
-                    self.theme.muted_text,
-                    FONT,
-                );
-            }
+        let pane_rects = self.mux_session.active_window().pane_rects(
+            MuxRect::new(
+                content.x.max(0.0) as u32,
+                content.y.max(0.0) as u32,
+                content.w.max(0.0) as u32,
+                content.h.max(0.0) as u32,
+            ),
+            1,
+        );
+        if pane_rects.len() == 1 && !self.terminals.contains_key(&pane_rects[0].pane) {
+            self.paint_terminal_placeholder(canvas, &content);
             return;
-        };
+        }
 
+        for pane in pane_rects {
+            if self.mux_session.active_window().layout.leaves().len() > 1 {
+                self.paint_mux_pane_frame(canvas, pane, focused);
+            }
+            match self.terminals.get(&pane.pane) {
+                Some(terminal) => {
+                    self.paint_terminal_grid(canvas, pane, terminal, focused && pane.active)
+                }
+                None => self.paint_mux_placeholder(canvas, pane, "pending PTY"),
+            }
+        }
+    }
+
+    fn paint_terminal_placeholder(&self, canvas: &mut Canvas<'_>, content: &ContentRect) {
+        let lines = [
+            "Integrated terminal",
+            "",
+            "Focus this pane (Ctrl+L) to start a session.",
+            "Runs the project's Zellij workspace when mise and",
+            "zellij are on PATH; otherwise a plain shell.",
+        ];
+        let top = content.y + PAD;
+        for (index, line) in lines.iter().enumerate() {
+            canvas.text(
+                content.x + PAD,
+                top + index as f32 * ROW_H + 3.0,
+                *line,
+                self.theme.muted_text,
+                FONT,
+            );
+        }
+    }
+
+    fn paint_mux_pane_frame(
+        &self,
+        canvas: &mut Canvas<'_>,
+        pane: cockpit_mux::PaneRect,
+        terminal_focused: bool,
+    ) {
+        let rect = pane.rect;
+        let x = rect.x as f32;
+        let y = rect.y as f32;
+        let w = rect.width as f32;
+        let h = rect.height as f32;
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let border = if pane.active && terminal_focused {
+            self.theme.accent
+        } else {
+            self.theme.pane_border
+        };
+        canvas.rect(x, y, w, 1.0, border);
+        canvas.rect(x, y + h - 1.0, w, 1.0, border);
+        canvas.rect(x, y, 1.0, h, border);
+        canvas.rect(x + w - 1.0, y, 1.0, h, border);
+        canvas.text(
+            x + 4.0,
+            y + 3.0,
+            pane.pane.to_string(),
+            if pane.active {
+                self.theme.text
+            } else {
+                self.theme.muted_text
+            },
+            FONT - 2.0,
+        );
+    }
+
+    fn paint_mux_placeholder(
+        &self,
+        canvas: &mut Canvas<'_>,
+        pane: cockpit_mux::PaneRect,
+        label: &str,
+    ) {
+        canvas.text(
+            pane.rect.x as f32 + PAD,
+            pane.rect.y as f32 + ROW_H + 4.0,
+            label,
+            self.theme.muted_text,
+            FONT,
+        );
+    }
+
+    fn paint_terminal_grid(
+        &self,
+        canvas: &mut Canvas<'_>,
+        pane: cockpit_mux::PaneRect,
+        terminal: &LiveTerminal,
+        focused: bool,
+    ) {
+        let content_x = pane.rect.x as f32;
+        let content_y = pane.rect.y as f32;
         let snapshot = terminal.snapshot();
         let grid = &snapshot.grid;
         let char_w = FONT * CHAR_W_RATIO;
-        let top = content.y + PAD * 0.5;
+        let top = content_y + PAD * 0.5;
 
         for row in 0..grid.height() {
             let Some(text) = grid.row_text(row) else {
@@ -3194,7 +3510,7 @@ impl AppModel {
             let trimmed = text.trim_end();
             if !trimmed.is_empty() {
                 canvas.text(
-                    content.x + PAD,
+                    content_x + PAD,
                     top + row as f32 * ROW_H + 3.0,
                     trimmed.to_string(),
                     self.theme.text,
@@ -3204,7 +3520,7 @@ impl AppModel {
         }
 
         let cursor = grid.cursor();
-        let cursor_x = content.x + PAD + cursor.col as f32 * char_w;
+        let cursor_x = content_x + PAD + cursor.col as f32 * char_w;
         let cursor_y = top + cursor.row as f32 * ROW_H;
         let cursor_color = if focused {
             self.theme.cursor
@@ -3231,8 +3547,8 @@ impl AppModel {
         };
         if let Some(notice) = notice {
             canvas.text(
-                content.x + PAD,
-                content.y + content.h - ROW_H + 3.0,
+                content_x + PAD,
+                content_y + pane.rect.height as f32 - ROW_H + 3.0,
                 notice,
                 self.theme.muted_text,
                 FONT,
@@ -3285,6 +3601,14 @@ impl Canvas<'_> {
 fn pane_contains(rect: UiRect, position: PointerPosition) -> bool {
     let x0 = rect.x as f32;
     let y0 = rect.y as f32 + TOP_BAR_H;
+    let x1 = x0 + rect.width as f32;
+    let y1 = y0 + rect.height as f32;
+    position.x >= x0 && position.x < x1 && position.y >= y0 && position.y < y1
+}
+
+fn mux_rect_contains(rect: MuxRect, position: PointerPosition) -> bool {
+    let x0 = rect.x as f32;
+    let y0 = rect.y as f32;
     let x1 = x0 + rect.width as f32;
     let y1 = y0 + rect.height as f32;
     position.x >= x0 && position.x < x1 && position.y >= y0 && position.y < y1
@@ -3688,6 +4012,12 @@ fn extract_marked_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn mux_select_window_index(id: &str) -> Option<usize> {
+    mux_command_ids::SELECT_WINDOW
+        .iter()
+        .position(|candidate| *candidate == id)
+}
+
 /// The command palette's v0.1 command set (spec §16).
 fn palette_entries() -> Vec<PaletteEntry> {
     vec![
@@ -3702,6 +4032,17 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(TERMINAL_OPEN_PATH, "Terminal: Open Path"),
         PaletteEntry::new(TERMINAL_SEND_FILE_PATH, "Terminal: Send Current File Path"),
         PaletteEntry::new(TERMINAL_SEND_SELECTION, "Terminal: Send Selection"),
+        PaletteEntry::new(mux_command_ids::NEW_WINDOW, "Mux: New Window"),
+        PaletteEntry::new(mux_command_ids::KILL_WINDOW, "Mux: Kill Window"),
+        PaletteEntry::new(mux_command_ids::NEXT_WINDOW, "Mux: Next Window"),
+        PaletteEntry::new(mux_command_ids::PREVIOUS_WINDOW, "Mux: Previous Window"),
+        PaletteEntry::new(mux_command_ids::SPLIT_HORIZONTAL, "Mux: Split Horizontal"),
+        PaletteEntry::new(mux_command_ids::SPLIT_VERTICAL, "Mux: Split Vertical"),
+        PaletteEntry::new(mux_command_ids::KILL_PANE, "Mux: Kill Pane"),
+        PaletteEntry::new(mux_command_ids::NEXT_PANE, "Mux: Next Pane"),
+        PaletteEntry::new(mux_command_ids::RESIZE_RIGHT, "Mux: Grow Pane"),
+        PaletteEntry::new(mux_command_ids::RESIZE_LEFT, "Mux: Shrink Pane"),
+        PaletteEntry::new(mux_command_ids::NEXT_LAYOUT, "Mux: Next Layout"),
         PaletteEntry::new(TEST_RUN_ALL, "Test: Run All"),
         PaletteEntry::new(TEST_RUN_CURRENT_FILE, "Test: Run Current File"),
         PaletteEntry::new(TEST_RUN_NEAREST, "Test: Run Nearest"),
@@ -3986,27 +4327,42 @@ fn paint_confirm(
     );
 }
 
-/// [`CockpitApp`] adapter: holds either a hydrating cold-start driver or
-/// a live [`AppModel`] and forwards harness callbacks accordingly.
+/// [`CockpitApp`] adapter: holds the project launcher, a hydrating
+/// cold-start driver, or a live [`AppModel`] and forwards harness
+/// callbacks accordingly.
 ///
-/// During hydration the shell paints a splash (see [`crate::splash`]),
-/// ignores key / mouse input, and asks the harness for continuous
-/// redraws so the post-paint [`tick`](CockpitApp::tick) loop can advance
-/// one phase per frame (v0.6 M6.2). Once every phase has finished, the
-/// shell transitions to `Live(model)` and forwards everything as before.
+/// The shell is the **single** `CockpitApp` implementation the binary
+/// hands to [`cockpit_render::run_app`] (M7.1: `run_app` is called at
+/// most once per process — `winit::EventLoop` cannot be recreated). It
+/// transitions in-place between its states:
+///
+/// - `Launcher` → the project picker (recent projects, Open Folder).
+///   On selection, [`tick`](CockpitApp::tick) replaces this state with
+///   `Hydrating` for the chosen path.
+/// - `Hydrating` → splash painted on frame 1, one cold-start phase
+///   advanced per frame (v0.6 M6.2). On completion, transitions to
+///   `Live(model)`.
+/// - `Live` → the three-pane cockpit. Every harness callback forwards
+///   to the model.
+/// - `Failed` → splash stays up with the hydration error message.
 pub struct AppShell {
     state: ShellState,
-    /// Splash theme. Kept on the shell so [`CockpitApp::theme`] can hand
-    /// back a `&Theme` while no model exists yet.
+    /// Splash / launcher theme. Kept on the shell so [`CockpitApp::theme`]
+    /// can hand back a `&Theme` while no model exists yet.
     splash_theme: Theme,
     /// Redraw handle stashed before the model is born so we can hand it
     /// to the live model the moment hydration completes (background PTY
     /// threads expect a wake handle).
     pending_redraw: Option<RedrawHandle>,
+    /// Once the launcher signals `Exit`, the shell flips this on and
+    /// reports it to the harness via [`CockpitApp::wants_exit`].
+    exit_requested: bool,
 }
 
 /// Lifecycle of the shell.
 pub(crate) enum ShellState {
+    /// Project picker; user hasn't chosen a project yet (M7.1).
+    Launcher(crate::launcher::LauncherModel),
     /// Cold-start phases still running. Painter shows the splash.
     Hydrating(crate::hydration::HydrationDriver),
     /// Live cockpit. Every harness callback forwards to the model.
@@ -4020,6 +4376,18 @@ pub(crate) enum ShellState {
 }
 
 impl AppShell {
+    /// Build a shell that opens the project launcher (M7.1). When the
+    /// user picks a project, the shell transitions to hydrating inside
+    /// the same event loop — no second `run_app` call.
+    pub fn launcher(model: crate::launcher::LauncherModel) -> Self {
+        Self {
+            state: ShellState::Launcher(model),
+            splash_theme: Theme::default(),
+            pending_redraw: None,
+            exit_requested: false,
+        }
+    }
+
     /// Build a shell that will hydrate the project at `path` on the
     /// render thread (M6.2). The window opens with the splash painted on
     /// frame 1; subsequent frames run one cold-start phase each.
@@ -4028,15 +4396,20 @@ impl AppShell {
             state: ShellState::Hydrating(crate::hydration::HydrationDriver::new(path)),
             splash_theme: Theme::default(),
             pending_redraw: None,
+            exit_requested: false,
         }
     }
 
-    // The four predicates below are introspection helpers used by the
-    // M6.2 unit tests to drive `tick`-based state-machine assertions
-    // without exposing the private `ShellState` enum. They have no
-    // production callers; clippy's dead-code lint doesn't follow
-    // `cfg(test)`-gated callers from sibling modules, so we mark the
-    // helpers explicitly.
+    // The predicates below are introspection helpers used by tests to
+    // drive `tick`-based state-machine assertions without exposing the
+    // private `ShellState` enum. They have no production callers;
+    // clippy's dead-code lint doesn't follow `cfg(test)`-gated callers
+    // from sibling modules, so we mark the helpers explicitly.
+    #[allow(dead_code)]
+    pub fn is_launcher(&self) -> bool {
+        matches!(self.state, ShellState::Launcher(_))
+    }
+
     #[allow(dead_code)]
     pub fn is_hydrating(&self) -> bool {
         matches!(self.state, ShellState::Hydrating(_))
@@ -4064,6 +4437,7 @@ impl AppShell {
 impl CockpitApp for AppShell {
     fn paint(&mut self, painter: &mut Painter, viewport: Viewport) {
         match &mut self.state {
+            ShellState::Launcher(model) => model.paint(painter, viewport),
             ShellState::Live(model) => model.paint(painter, viewport),
             ShellState::Hydrating(driver) => {
                 crate::splash::paint_splash(
@@ -4091,18 +4465,22 @@ impl CockpitApp for AppShell {
 
     fn theme(&self) -> &Theme {
         match &self.state {
+            ShellState::Launcher(model) => model.theme(),
             ShellState::Live(model) => &model.theme,
             _ => &self.splash_theme,
         }
     }
 
     fn on_key(&mut self, chord: KeyChord) {
-        if let ShellState::Live(model) = &mut self.state {
-            model.dispatch(chord);
+        match &mut self.state {
+            ShellState::Launcher(model) => model.on_key(chord),
+            ShellState::Live(model) => model.dispatch(chord),
+            _ => {
+                // Splash and failed states ignore input — there's
+                // nothing meaningful for the user to do except wait or
+                // close the window. The OS close affordance still works.
+            }
         }
-        // Splash and failed states ignore input — there's nothing
-        // meaningful for the user to do except wait or close the
-        // window. The OS close affordance still works.
     }
 
     fn on_mouse_down(&mut self, button: MouseButton, position: PointerPosition) {
@@ -4141,34 +4519,55 @@ impl CockpitApp for AppShell {
     }
 
     fn tick(&mut self) {
-        let driver = match &mut self.state {
-            ShellState::Hydrating(driver) => driver,
-            _ => return,
-        };
-        match driver.advance() {
-            crate::hydration::HydrationOutcome::Continue => {}
-            crate::hydration::HydrationOutcome::Ready(model) => {
-                let mut model = *model;
-                if let Some(handle) = self.pending_redraw.take() {
-                    model.set_redraw_handle(handle);
+        match &mut self.state {
+            ShellState::Launcher(model) => {
+                // M7.1 hand-off: a launcher selection becomes a state
+                // transition in-place. No second `run_app` — the same
+                // event loop now drives hydration of the chosen project.
+                match model.result() {
+                    Some(crate::launcher::LauncherResult::OpenProject(path)) => {
+                        tracing::info!(path = %path.display(), "launcher selected project");
+                        self.state =
+                            ShellState::Hydrating(crate::hydration::HydrationDriver::new(path));
+                    }
+                    Some(crate::launcher::LauncherResult::Exit) => {
+                        self.exit_requested = true;
+                    }
+                    None => {}
                 }
-                tracing::info!(project = model.project_name(), "cockpit hydration complete");
-                self.state = ShellState::Live(model);
             }
-            crate::hydration::HydrationOutcome::Failed(message) => {
-                tracing::error!(error = %message, "cockpit hydration failed");
-                let prev = std::mem::replace(&mut self.state, ShellState::Transitioning);
-                let progress = match prev {
-                    ShellState::Hydrating(driver) => driver.progress().clone(),
-                    _ => cockpit_ui::HydrationProgress::default_phases(),
-                };
-                self.state = ShellState::Failed(progress);
-            }
+            ShellState::Hydrating(driver) => match driver.advance() {
+                crate::hydration::HydrationOutcome::Continue => {}
+                crate::hydration::HydrationOutcome::Ready(model) => {
+                    let mut model = *model;
+                    if let Some(handle) = self.pending_redraw.take() {
+                        model.set_redraw_handle(handle);
+                    }
+                    tracing::info!(project = model.project_name(), "cockpit hydration complete");
+                    self.state = ShellState::Live(model);
+                }
+                crate::hydration::HydrationOutcome::Failed(message) => {
+                    tracing::error!(error = %message, "cockpit hydration failed");
+                    let prev = std::mem::replace(&mut self.state, ShellState::Transitioning);
+                    let progress = match prev {
+                        ShellState::Hydrating(driver) => driver.progress().clone(),
+                        _ => cockpit_ui::HydrationProgress::default_phases(),
+                    };
+                    self.state = ShellState::Failed(progress);
+                }
+            },
+            _ => {}
         }
     }
 
     fn wants_continuous_redraw(&self) -> bool {
-        matches!(self.state, ShellState::Hydrating(_))
+        // Launcher needs continuous redraws so `tick()` can spot the
+        // result the frame after the user presses Enter (otherwise the
+        // hand-off would wait for the next input event).
+        matches!(
+            self.state,
+            ShellState::Hydrating(_) | ShellState::Launcher(_)
+        )
     }
 
     fn on_shutdown(&mut self) {
@@ -4178,6 +4577,9 @@ impl CockpitApp for AppShell {
     }
 
     fn wants_exit(&self) -> bool {
+        if self.exit_requested {
+            return true;
+        }
         match &self.state {
             ShellState::Live(model) => model.wants_exit(),
             _ => false,
@@ -4984,6 +5386,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn paint_terminal_mux_split_emits_pane_labels() {
+        let mut model = model();
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+        let mut painter = Painter::new();
+
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+
+        let labels: Vec<&str> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"pane-0"));
+        assert!(labels.contains(&"pane-1"));
+    }
+
     /// Build a model whose editor already has `contents` open on a temp file.
     fn open_temp_doc(contents: &str) -> (AppModel, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5108,7 +5537,80 @@ mod tests {
         model.dispatch(chord("Ctrl+l"));
         assert_eq!(model.layout.focused(), PaneId::Terminal);
         // No redraw handle was set, so no PTY is spawned — and nothing panics.
-        assert!(model.terminal.is_none());
+        assert!(model.terminals.is_empty());
+    }
+
+    #[test]
+    fn mux_prefix_split_updates_the_headless_layout_tree() {
+        let mut model = model();
+        model.dispatch(chord("Ctrl+l"));
+
+        model.dispatch(chord("Ctrl+b"));
+        model.dispatch(chord("%"));
+
+        let window = model.mux_session.active_window();
+        assert_eq!(window.layout.leaves().len(), 2);
+        assert_eq!(window.active.get(), 1);
+        assert_eq!(model.layout.focused(), PaneId::Terminal);
+        assert!(model.status.contains("split terminal pane"));
+        assert!(
+            model
+                .recent_commands_summary()
+                .contains(mux_command_ids::SPLIT_HORIZONTAL)
+        );
+    }
+
+    #[test]
+    fn mux_prefix_ctrl_arrow_resizes_the_active_split() {
+        let mut model = model();
+        model.dispatch(chord("Ctrl+l"));
+        model.dispatch(chord("Ctrl+b"));
+        model.dispatch(chord("%"));
+
+        model.dispatch(chord("Ctrl+b"));
+        model.dispatch(chord("Ctrl+ArrowRight"));
+
+        match &model.mux_session.active_window().layout {
+            cockpit_mux::LayoutNode::Split { ratio, .. } => assert!((*ratio - 0.45).abs() < 0.001),
+            other => panic!("expected split layout, got {other:?}"),
+        }
+        assert!(
+            model
+                .recent_commands_summary()
+                .contains(mux_command_ids::RESIZE_RIGHT)
+        );
+        assert!(model.status.contains("resized pane-1"));
+    }
+
+    #[test]
+    fn mux_prefix_consumes_unknown_followup_without_forwarding_to_terminal() {
+        let mut model = model();
+        model.dispatch(chord("Ctrl+l"));
+
+        model.dispatch(chord("Ctrl+b"));
+        model.dispatch(chord("q"));
+
+        assert!(!model.wants_exit());
+        assert_eq!(model.mux_session.active_window().layout.leaves().len(), 1);
+        assert_eq!(
+            model.mux_prefix.state(),
+            cockpit_mux::PrefixState::Passthrough
+        );
+    }
+
+    #[test]
+    fn mux_palette_commands_share_the_same_command_path() {
+        let mut model = model();
+        model.run_command(mux_command_ids::NEW_WINDOW);
+        model.run_command(mux_command_ids::SELECT_WINDOW_0);
+
+        assert_eq!(model.mux_session.windows.len(), 2);
+        assert_eq!(model.mux_session.active.get(), 0);
+        assert!(
+            model
+                .recent_commands_summary()
+                .contains(mux_command_ids::SELECT_WINDOW_0)
+        );
     }
 
     #[test]
@@ -5743,6 +6245,21 @@ format_on_save = true
     }
 
     #[test]
+    fn clicking_a_mux_terminal_pane_focuses_that_pane() {
+        let mut model = primed_model();
+        model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
+
+        // Default 1280-wide layout: terminal content starts at x=800,
+        // y=TOP_BAR_H+HEADER_H. The right half belongs to pane-1.
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(1100.0, 120.0));
+        assert_eq!(model.mux_session.active_window().active.get(), 1);
+
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(850.0, 120.0));
+        assert_eq!(model.mux_session.active_window().active.get(), 0);
+        assert_eq!(model.layout.focused(), PaneId::Terminal);
+    }
+
+    #[test]
     fn right_click_does_not_change_focus() {
         let mut model = primed_model();
         model.layout.focus(PaneId::Editor);
@@ -6011,5 +6528,70 @@ mod ui_smoke {
         assert!(shell.is_failed(), "shell should have failed hydration");
         assert!(!shell.wants_continuous_redraw());
         assert!(shell.model().is_none());
+    }
+
+    /// M7.1: the shell starts on the launcher, transitions to hydrating
+    /// when the user picks a recent project, and lands on a live model
+    /// — all without restarting the harness.
+    #[test]
+    fn app_shell_launcher_hands_off_to_hydration_in_place() {
+        let recent =
+            cockpit_ui::launcher::RecentProject::new("rust-basic", fixture_path("rust-basic"));
+        let launcher = crate::launcher::LauncherModel::new(vec![recent]);
+        let mut shell = AppShell::launcher(launcher);
+
+        assert!(shell.is_launcher());
+        assert!(
+            shell.wants_continuous_redraw(),
+            "launcher needs continuous redraws so tick() can spot the result"
+        );
+        assert!(!shell.wants_exit());
+
+        // Selection lands on the only recent by default; Enter activates.
+        shell.on_key("Enter".parse().expect("valid chord"));
+        // One tick consumes the result and transitions to hydrating —
+        // no second event loop, no `run_app` re-entry (M7.1 hard rule).
+        shell.tick();
+        assert!(
+            shell.is_hydrating(),
+            "Enter on a recent project should hand off to hydration"
+        );
+
+        // Drive hydration through to a live model.
+        for _ in 0..cockpit_ui::HydrationPhase::ALL.len() + 1 {
+            if shell.is_live() {
+                break;
+            }
+            shell.tick();
+        }
+        assert!(
+            shell.is_live(),
+            "shell should have hydrated the picked project"
+        );
+        assert_eq!(
+            shell.model().expect("live model").project_name(),
+            "rust-basic"
+        );
+    }
+
+    /// M7.1: pressing Escape in the launcher requests exit cleanly —
+    /// the harness sees `wants_exit` and the event loop drops out
+    /// without ever opening a project window.
+    #[test]
+    fn app_shell_launcher_escape_requests_exit() {
+        let launcher = crate::launcher::LauncherModel::new(vec![]);
+        let mut shell = AppShell::launcher(launcher);
+        assert!(!shell.wants_exit());
+
+        shell.on_key("Escape".parse().expect("valid chord"));
+        shell.tick();
+        assert!(
+            shell.wants_exit(),
+            "Escape in the launcher should request a clean exit"
+        );
+        assert!(
+            shell.is_launcher(),
+            "exit is requested from the launcher state itself; no transition needed"
+        );
     }
 }

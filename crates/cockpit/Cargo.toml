@@ -21,6 +21,7 @@ cockpit-commands.workspace = true
 cockpit-config.workspace = true
 cockpit-editor.workspace = true
 cockpit-lsp.workspace = true
+cockpit-mux.workspace = true
 cockpit-notebook.workspace = true
 cockpit-render.workspace = true
 cockpit-sql.workspace = true

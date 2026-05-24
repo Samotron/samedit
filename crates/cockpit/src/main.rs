@@ -20,7 +20,7 @@ use cockpit_project::{ProjectDetection, RecentProjects, detect_project, recent_p
 use cockpit_testkit::{BUILTIN_FIXTURES, fixture_path};
 
 use crate::app::AppShell;
-use crate::launcher::{LauncherModel, LauncherResult};
+use crate::launcher::LauncherModel;
 
 #[derive(Debug, Parser)]
 #[command(name = "cockpit", version, about = "Coding Cockpit")]
@@ -60,37 +60,22 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    if let Some(name) = cli.fixture {
+    let path = if let Some(name) = cli.fixture {
         if !BUILTIN_FIXTURES.contains(&name.as_str()) {
             anyhow::bail!(
                 "unknown fixture `{name}`. Bundled fixtures: {}",
                 BUILTIN_FIXTURES.join(", ")
             );
         }
-        run_project_or_launcher(Some(fixture_path(&name)), cli.print)
-    } else if let Some(path) = cli.project {
-        run_project_or_launcher(Some(path), cli.print)
+        Some(fixture_path(&name))
     } else {
-        run_project_or_launcher(None, cli.print)
-    }
-}
-
-/// Start either a project workspace or the project launcher. If a launcher
-/// selection results in a project, this function tail-calls itself to open
-/// that project.
-///
-/// The normal path opens the window with the splash painted on frame 1
-/// and defers detection / tree load / model build / config / git / cache
-/// to the per-frame [`crate::hydration::HydrationDriver`] (v0.6 M6.2).
-/// `--print` stays fully synchronous because it never opens a window.
-fn run_project_or_launcher(path: Option<PathBuf>, print: bool) -> Result<()> {
-    let Some(path) = path else {
-        return run_launcher();
+        cli.project
     };
 
-    if print {
-        // Headless path: do the work inline and dump detection to
-        // stdout. No window, no splash.
+    // `--print` short-circuits without opening a window. It requires a
+    // path — there is no headless launcher.
+    if cli.print {
+        let path = path.context("--print requires --project or --fixture")?;
         let detection = startup::time_phase("startup.detect", || {
             detect_project(&path).with_context(|| format!("detect project at `{}`", path.display()))
         })?;
@@ -99,16 +84,50 @@ fn run_project_or_launcher(path: Option<PathBuf>, print: bool) -> Result<()> {
         return Ok(());
     }
 
-    let initial_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("project");
-    let title = format!("Coding Cockpit — {initial_name}");
-    tracing::info!(project = initial_name, "opening window with splash");
+    // Build the single [`AppShell`] the harness will drive. The shell
+    // owns the transition from launcher → hydrating → live, so M7.1's
+    // hard rule ("run_app at most once per process") holds even when
+    // the user picks a project from the launcher.
+    let (title, shell) = match path {
+        Some(path) => {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+                .to_string();
+            tracing::info!(project = %name, "opening window with splash");
+            (
+                format!("Coding Cockpit — {name}"),
+                AppShell::hydrating(path),
+            )
+        }
+        None => {
+            tracing::info!("opening project launcher");
+            (
+                "Coding Cockpit".to_string(),
+                AppShell::launcher(LauncherModel::new(load_recent_projects())),
+            )
+        }
+    };
 
-    cockpit_render::run_app(title, AppShell::hydrating(path))
-        .context("windowing harness failed")?;
+    cockpit_render::run_app(title, shell).context("windowing harness failed")?;
     Ok(())
+}
+
+/// Load the persisted recent-projects list as the launcher view-model
+/// expects it. Empty (no panic) on any IO failure — the launcher is
+/// still usable, it just shows the "no recent projects" state.
+fn load_recent_projects() -> Vec<cockpit_ui::launcher::RecentProject> {
+    recent_projects_path()
+        .ok()
+        .and_then(|path| RecentProjects::load(path).ok())
+        .map(|r| {
+            r.projects
+                .into_iter()
+                .map(|p| cockpit_ui::launcher::RecentProject::new(p.display_name, p.root_path))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Add a project to the launcher's recent-projects registry. Best-effort: a
@@ -123,28 +142,6 @@ fn record_recent_project(detection: &ProjectDetection) {
     recents.record(&detection.root_path, &detection.display_name);
     if let Err(err) = recents.store(&path) {
         tracing::warn!(error = %err, "failed to store recent projects");
-    }
-}
-
-/// Run the GUI project launcher (spec §6, M1.13).
-fn run_launcher() -> Result<()> {
-    let recents = recent_projects_path()
-        .ok()
-        .and_then(|path| RecentProjects::load(path).ok())
-        .map(|r| {
-            r.projects
-                .into_iter()
-                .map(|p| cockpit_ui::launcher::RecentProject::new(p.display_name, p.root_path))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut model = LauncherModel::new(recents);
-    cockpit_render::run_app("Coding Cockpit", &mut model).context("launcher harness failed")?;
-
-    match model.result() {
-        Some(LauncherResult::OpenProject(path)) => run_project_or_launcher(Some(path), false),
-        Some(LauncherResult::Exit) | None => Ok(()),
     }
 }
 

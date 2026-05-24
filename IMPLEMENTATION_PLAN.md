@@ -94,6 +94,7 @@ cockpit/                         # Cargo workspace root
 │   ├── cockpit            (bin) # main, app wiring, event loop ownership
 │   ├── cockpit-editor           # ropey buffer, cursor, undo, vim FSM, search, syntax
 │   ├── cockpit-project          # detection, mise, project cache, tasks, file tree
+│   ├── cockpit-mux              # native mux session/window/pane model
 │   ├── cockpit-terminal         # pty wrapper, termwiz engine, zellij, path detect, bridge
 │   ├── cockpit-commands         # command registry, keybinding resolution
 │   ├── cockpit-config           # serde config types, TOML/KDL loading, defaults
@@ -110,6 +111,7 @@ cockpit/                         # Cargo workspace root
 |--------------------|--------------|-------------------------------------------|-------------------|
 | `cockpit-editor`   | core         | `ropey`, `tree-sitter` (v0.2+)            | ✅ fully          |
 | `cockpit-project`  | core         | `serde`, `toml`                           | ✅ fully          |
+| `cockpit-mux`      | core         | `serde`                                   | ✅ fully          |
 | `cockpit-commands` | core         | —                                         | ✅ fully          |
 | `cockpit-config`   | core         | `serde`, `toml`, `kdl` (v0.3+)            | ✅ fully          |
 | `cockpit-terminal` | core + I/O   | `termwiz`, `portable-pty`                 | ✅ path-detect / zellij-cmd; ⚠️ PTY = integration |
@@ -680,6 +682,722 @@ budget — the binary stays small, and the first query pays the spawn cost.
   every cold-start phase in a `startup.*` span and records the
   duration in a global trace. `Debug: Show Startup Trace` (new
   palette entry) formats the snapshot for the status line.
+
+---
+
+## 8c. v0.7 — Single event loop + native multiplexer  (NEW — post-spec)
+
+Goal: fix the launcher → project hand-off (currently broken) and replace
+the external `zellij` dependency with an **embedded** terminal multiplexer
+modelled on tmux's philosophy (server/client, sessions/windows/panes,
+prefix-driven command vocabulary). Embedded because real tmux does not run
+on Windows, and Zellij's Windows story is shallow enough that shelling out
+to it from the cockpit makes Windows users second-class.
+
+### Why now
+
+1. **Real bug on `main`:** `cockpit::main::run_launcher` calls
+   `cockpit_render::run_app(...)` for the launcher, then on
+   `LauncherResult::OpenProject` calls `run_app(...)` *again* for the
+   project window. `winit::EventLoop` is hard-coded to one-per-process and
+   panics on the second call with `EventLoop can't be recreated`. The
+   "open a project from the launcher" path therefore does not work end
+   to end today — only `--project` / `--fixture` / starting in a project
+   directory survives.
+2. **Strategic alignment:** an embedded multiplexer pays for the v0.6
+   instant-load work (no second binary to spawn), removes the §10 spec
+   caveat about Zellij's maturity on Windows (§25 risk register), and
+   collapses the cockpit↔mux IPC surface (no `zellij-server` socket, no
+   KDL handshake) into a typed Rust API.
+
+### M7.1 — Single event loop / `AppShell` state machine  *(unblocks the launcher)*  ✅
+
+- **Hard rule:** `cockpit_render::run_app` is called **at most once per
+  process**. Enforced via a `static AtomicBool` (`RUN_APP_CALLED`) inside
+  `cockpit-render::app`; a second call panics with a message pointing the
+  reader at `AppShell`.
+- `ShellState` (in `crates/cockpit/src/app.rs`) gained a
+  `Launcher(LauncherModel)` variant alongside the existing
+  `Hydrating(HydrationDriver)` / `Live(AppModel)` / `Failed(_)` arms.
+  `AppShell` (one `CockpitApp` impl) delegates `paint`, `tick`, `on_key`,
+  and the mouse callbacks to whichever state is active.
+- Launcher → project transition runs **inside** the same event loop:
+  when `LauncherModel::result()` returns `OpenProject(path)`, `AppShell::tick`
+  swaps in `ShellState::Hydrating(HydrationDriver::new(path))` on the next
+  frame. `wants_continuous_redraw()` is true during `Launcher` so the
+  post-paint `tick` reliably spots the result. Window title currently
+  stays as set at `run_app` time; a `RedrawHandle::set_title` hook is
+  parked for the (rare) split window-title case — not needed for the
+  launcher → project handoff.
+- `LauncherModel` now implements `CockpitApp` directly (was
+  `&mut LauncherModel`) so it can be embedded by value in `ShellState`.
+  It is no longer the *outer* harness — it's the **inner** state of
+  `AppShell`. `LauncherResult::Exit` flips an `exit_requested` flag on
+  the shell; `wants_exit` returns true and the harness drops out.
+- Tests (`ui-smoke`):
+  `app_shell_launcher_hands_off_to_hydration_in_place` builds an
+  `AppShell::launcher`, simulates Enter on the only recent, ticks once
+  to land in `Hydrating`, then drives `tick` until `Live` and asserts
+  `project_name()`; `app_shell_launcher_escape_requests_exit` covers
+  the Esc → clean-exit path. All without restarting the harness.
+- **Done when:** `mise run ci` green (workspace tests + clippy + fmt);
+  `mise run test-ui-smoke` green. Real-window verification on all three
+  OSes still requires a CI push (cannot be observed from this machine).
+
+### M7.2 — `cockpit-mux` crate: data model  *(headless, fully unit-tested)*  ✅
+
+New crate. Pure data + transitions, zero `winit`/`glow`/PTY dependencies.
+It owns the multiplexer state; `cockpit-terminal` owns the per-pane PTY +
+termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
+
+```diagram
+╭─────────────╮          ╭──────────────╮          ╭─────────────╮
+│  Session    │──owns──▶│   Window     │──owns──▶│    Pane     │
+│  (≥1)       │         │   (≥1)       │         │   (≥1)      │
+│  name       │         │   name       │         │   PtyHandle │
+│  active win │         │   layout     │         │   grid view │
+╰─────────────╯         │   active pane│         ╰─────────────╯
+                        ╰──────────────╯
+```
+
+- `Session { id, name, windows: Vec<Window>, active: WindowId }`
+- `Window { id, name, layout: LayoutNode, active: PaneId }`
+- `LayoutNode = Leaf(PaneId) | Split { dir: H|V, ratio: f32, a, b }`
+  — same recursive split tree tmux uses. Rebalancing on close = collapse
+  the parent.
+- `Pane { id, pty: PtyHandle, scrollback_offset, mode: Live|Copy }`.
+- Pure ops shipped: `new_window`, `kill_window`, `select_window`,
+  `split_active(H|V)`, `kill_pane`, `next_pane`, `previous_pane`,
+  `next_window`, `previous_window`, `swap_panes`, `resize_pane(±)`,
+  `select_layout(preset)` (tmux's `even-horizontal`, `main-vertical`,
+  `tiled`).
+- Tests cover every operation above, with inline JSON snapshots for the
+  full session tree after representative scripts. The crate has no
+  `winit`/`glow`/PTY dependency; real terminals will map external handles
+  to `PaneId` in M7.4.
+- **Done when:** `cargo test -p cockpit-mux` green; workspace lint/test
+  green before merge.
+
+### M7.3 — Prefix-driven command vocabulary  *(reuses `cockpit-commands`)*  ✅
+
+- Default prefix `Ctrl+b` (configurable; spec §20 `keys.terminal.prefix`).
+  After the prefix, the next key is consumed as a mux command and
+  **never** forwarded to the active pane's PTY — this is the
+  "prefix → command" tmux interaction the spec doesn't yet describe.
+- Tmux-subset bindings shipped by default:
+  - `c` new window, `,` rename window, `&` kill window
+  - `n` / `p` next / prev window, `0`–`9` select window N
+  - `%` split horizontal, `"` split vertical, `x` kill pane
+  - `o` cycle pane, `;` last pane, arrow keys to focus a direction
+  - `z` zoom pane, `Space` cycle preset layouts
+  - `[` enter copy mode, `]` paste, `d` detach
+- Each binding resolves to a `CommandId` in `cockpit-commands` via
+  `cockpit-mux::command_ids` and `PrefixDispatcher`; no PTY input path
+  is involved. App palette registration lands with the M7.4 UI/render
+  wiring, but the command vocabulary is already stable and testable.
+- Pure FSM: `(state, key) → consumed? + Vec<MuxCommand>`. Tests cover
+  every default binding, passthrough before prefix, unknown-key
+  consumption after prefix, and the recorded keystream exit condition.
+- **Done when:** `cargo test -p cockpit-mux` green; workspace lint/test
+  green before merge.
+
+### M7.4 — Multi-pane rendering inside the terminal area
+
+- `cockpit-render` learns to subdivide the terminal-pane rectangle by
+  walking the `LayoutNode` tree from `cockpit-mux`. Each leaf is a
+  termwiz-grid blit (already shipped in M1.16).
+- Implemented first headless/app slice:
+  - `cockpit-mux::LayoutNode::pane_rects(bounds, active, border_px)`
+    projects split trees into deterministic pane rectangles with border
+    gaps; tests cover horizontal, vertical, nested, active-pane, and
+    cramped-bounds cases.
+  - `AppModel` now owns `MuxSession` + `PrefixDispatcher`; terminal focus
+    gives `Ctrl+b` first refusal before the global router, so the mux
+    prefix is not stolen by the legacy `Ctrl+b` files-pane toggle.
+  - Prefix and palette-style mux command ids mutate the headless mux tree
+    (`Ctrl+b %`, `Ctrl+b "`, window create/select/kill, pane cycle/kill,
+    layout preset) and are visible in the debug pane-tree summary.
+  - Terminal painting now walks the mux projection: inactive panes draw
+    bordered placeholders, and the active pane renders the current
+    `LiveTerminal` grid. This makes split state visible before the
+    per-pane PTY map is introduced.
+  - Mouse click focus is wired through the same projection:
+    `cockpit-mux::Session::select_pane` updates the active pane, and
+    app-level hit tests focus the clicked mux pane inside the terminal
+    area.
+  - Resize command ids (`mux.pane.resize_*`) are part of the prefix
+    vocabulary: `Ctrl+b` then `Ctrl+arrow` adjusts the active pane's
+    nearest enclosing split ratio through the same command dispatch path
+    used by palette and tests.
+  - The app now keys live terminals by `cockpit-mux::PaneId` instead of a
+    single shared PTY. Input, paste/run helpers, terminal path detection,
+    paint, cleanup, and resize fan-out target the active/visible mux
+    pane.
+- Pane borders: 1px lines from the theme; active pane gets an accent.
+- Resize keys (`Ctrl+b` then `Ctrl+arrow`, tmux-style) adjust the
+  enclosing split's `ratio`; visible leaf PTYs are resized from their
+  projected rectangles.
+- Mouse: drag a pane border to resize (reuses the M4.7 drag plumbing).
+  Click a pane to focus.
+- **Done when:** opening cockpit shows a single-pane window; `Ctrl+b %`
+  produces two side-by-side shells, both responsive to input + resize.
+
+### M7.5 — Detach / attach + session persistence
+
+- Detach (`Ctrl+b d`): the active session keeps running in-process but
+  becomes invisible; the workspace returns to the project's default
+  view (or a "session list" overlay).
+- Attach: from the session-list overlay, pick a session → it becomes
+  visible again, layout + scrollback intact.
+- **In-memory only for v0.7.** Cross-restart persistence (write-out the
+  session tree + each PTY's scrollback on shutdown) is M7.5a, deferred.
+  Spec §10 explicitly does not promise tmux's "survive cockpit exit"
+  behaviour yet — say so.
+- Tests: scripted detach → attach round-trip preserves the layout tree
+  and pane focus.
+
+### M7.6 — Scrollback + copy mode
+
+- Each `Pane` tracks a bounded scrollback ring (config: lines per pane,
+  default 10 000 — matches the spec §11 terminal expectations).
+- Copy mode (`Ctrl+b [`): vi-keys (`h j k l w b 0 $ gg G /search`) over
+  the scrollback buffer, mirrors the editor Vim FSM (M1.2 patterns) so
+  there's exactly **one** Vim-style FSM in the codebase. Selection +
+  yank → OS clipboard via `winit`.
+- Tests: golden of the rendered selection after a recorded key script
+  on a fixture scrollback.
+
+### M7.7 — Status line / mode-line
+
+- Bottom strip of the terminal pane: session name, window list with
+  active marker, time, optional `mise` task status.
+- Pure view-model in `cockpit-ui`; painter in `cockpit-render`.
+- Configurable via spec §20 (`terminal.status.format`).
+
+### M7.8 — Native layout config
+
+- New `cockpit_layout` field on `[metadata.cockpit]` (spec §9) — replaces
+  `zellij_layout`. Format: KDL (keeps the `kdl` crate that v0.3 already
+  pulled in for Zellij layouts; reuse parser, swap schema).
+- Schema mirrors the `LayoutNode` data model: nested `split` nodes,
+  leaf `pane` nodes with optional `command` strings (run on first
+  attach). Smaller surface than the Zellij KDL — no plugin slots, no
+  themes, no swap layouts (out of scope per AGENTS §2 hard rule #7).
+- Loader lives in `cockpit-config::layout` (rename of
+  `cockpit-config::zellij_layout`).
+
+### M7.9 — Remove Zellij surface
+
+- Delete `crates/cockpit-terminal/src/zellij.rs`,
+  `crates/cockpit-config/src/zellij_layout.rs`, related tests/snapshots.
+- Drop the `mise exec -- zellij attach --create …` plan from
+  `crates/cockpit-terminal/src/session.rs`; replace with a
+  `cockpit-mux::Session` bootstrapped in-process.
+- Update `spec.md` §10 ("Terminal workspace integration"), §9 (metadata
+  fields), §20 (config schema), §25 (risk register: drop the "Zellij
+  Windows maturity" row, add "embedded mux: parity with tmux must be
+  bounded"). Keep §11/§17 unchanged — the terminal engine is still
+  `termwiz`.
+- Update [`AGENTS.md`](AGENTS.md) §3–§4: rename
+  "zellij" → "embedded multiplexer (`cockpit-mux`)" in the layout +
+  decision table.
+
+### M7.10 — Windows parity
+
+- `portable-pty` already abstracts ConPTY; the multiplexer is pure Rust
+  + threads, no Unix sockets, no PIDs to track. Walk through every
+  v0.7 feature on a Windows CI runner and assert behaviour matches
+  Linux: PTY spawn, resize, prefix dispatch, splits, copy-mode yank
+  (clipboard), detach/attach.
+- Add a Windows-only integration leg to CI under `--features integration`.
+- **Done when:** the v0.7 exit checklist below is green on
+  `windows-latest`.
+
+### v0.7 exit checklist
+
+- [ ] `mise run run` (no args) → launcher → pick recent → land in project
+      workspace without process restart, on Linux, macOS, Windows.
+- [ ] Inside a project, `Ctrl+b %` and `Ctrl+b "` produce splits, both
+      panes are interactive shells.
+- [ ] `Ctrl+b c` / `n` / `p` / `0`–`9` manage windows.
+- [ ] `Ctrl+b [` enters copy mode; vi-style selection and yank work on
+      all three OSes (clipboard verified).
+- [ ] `Ctrl+b d` detaches; session-list overlay reattaches the same
+      layout + scrollback.
+- [ ] Per-project `cockpit_layout` KDL opens with the expected splits
+      and runs each leaf's `command` on first attach.
+- [ ] `zellij` binary is **not** in the dependency / detection / spawn
+      paths; grep for `zellij` returns only deprecation comments.
+- [ ] All three CI legs green: fast, integration (Linux + Windows),
+      ui-smoke.
+
+### Sequencing
+
+```diagram
+M7.1  ──▶  unblocks all UI work
+            │
+            ▼
+M7.2 ─ M7.3 ─ M7.4   (headless mux ▶ key dispatch ▶ render)
+            │
+            ▼
+M7.5  ─ M7.6  ─ M7.7   (detach/attach, copy-mode, status)
+            │
+            ▼
+M7.8  ─ M7.9   (config schema, remove Zellij)
+            │
+            ▼
+M7.10   (Windows parity gate)
+```
+
+M7.1 should ship as its own PR — it's a small, surgical fix that
+unblocks the launcher today and does not need to wait for the
+multiplexer work. M7.2 onward can start in parallel.
+
+### Risk notes
+
+| Risk                                          | Mitigation                                              |
+|-----------------------------------------------|---------------------------------------------------------|
+| Scope creep — tmux is huge                    | Ship the v0.7 exit-checklist subset; everything else is M7.x+ follow-ups. No plugins, no scripting language, no nested sessions. |
+| Two Vim FSMs (editor + copy mode) diverge     | Share the motion/operator core from `cockpit-editor`; copy-mode is a thin adapter. |
+| Window-title updates per state transition     | Add `RedrawHandle::set_title`; if `winit` proves awkward, store the title on `AppShell` and reapply each `resumed`. |
+| Cross-platform clipboard from copy mode       | Use `winit`'s clipboard API (already a `cockpit-render` dep); fall back to `arboard` only if forced. |
+| Lose Zellij users who depended on plugins     | Document the removal; no plugin marketplace was ever promised (AGENTS §2 hard rule #7). |
+
+---
+
+## 8d. v0.8 — Catppuccin + tool-pane recipes  (NEW — post-spec)
+
+Goal: ship the **Catppuccin** colour scheme as a first-class theme, and
+turn the v0.7 multiplexer into a launchpad for the external tools we
+actually use day-to-day — **Lazygit** for git, **Claude Code** /
+**Codex** for AI — via reusable, keybindable "tool-pane recipes."
+
+No AI engine code lives in cockpit. No git engine code beyond v0.3's
+`git status --porcelain` badges. Both surfaces are just mux panes
+running upstream CLIs the user already has. That is the whole point.
+
+### Dependencies
+
+- **M8.1 (Catppuccin)** is independent — ships now, does not need v0.7.
+  Standalone PR, ~one file.
+- **M8.2 / M8.3 (recipes + defaults)** require v0.7's `cockpit-mux` —
+  specifically the floating-pane and toggle-pane primitives. Land
+  after M7.4.
+
+### M8.1 — Catppuccin theme
+
+- Extend [crates/cockpit-render/src/theme.rs](file:///home/samotron/dev/samedit/crates/cockpit-render/src/theme.rs)
+  with four constructors: `Theme::catppuccin_latte()`,
+  `catppuccin_frappe()`, `catppuccin_macchiato()`, `catppuccin_mocha()`.
+  Palettes sourced from https://catppuccin.com/palette — comment each
+  colour with its hex source so palette drift is reviewable.
+- `Theme::from_name(&str) -> Option<Self>` resolves
+  `dark | latte | frappe | macchiato | mocha` (case-insensitive,
+  accepts the `catppuccin-` alias prefix). Unknown names return
+  `None` so callers fall back without panicking.
+- Wire `cockpit_config::UiConfig::theme` (already a `String`, today
+  defaults to `"dark"`) into `AppModel::apply_user_config`: on
+  unknown name, log a `tracing::warn!` and keep the current theme —
+  never crash on a typo'd config (AGENTS §2 hard rule #6 sibling: be
+  forgiving of user input).
+- New palette command `Theme: Switch…` with sub-actions per flavour;
+  selecting one updates the in-memory `AppModel::theme` immediately
+  and writes the choice back to the user config (single-key change,
+  preserves comments — use `toml_edit`, not a full re-serialise).
+- Tests (all headless, in `cockpit-render`):
+  - `from_name` resolves every flavour + aliases + unknown.
+  - Every flavour is opaque except `selection`.
+  - Latte luminance > Mocha luminance (catches palette typos).
+  - `apply_user_config_resolves_catppuccin_theme_names` in
+    `cockpit::app` tests covers the wiring end-to-end.
+- **Done when:** `ui.theme = "mocha"` in the user config opens the
+  cockpit in Mocha; `Theme: Switch Latte` from the palette
+  hot-swaps without restart on Linux + macOS + Windows.
+
+### M8.2 — Tool-pane recipes  *(needs M7.4)*
+
+- New config schema in [cockpit-config](file:///home/samotron/dev/samedit/crates/cockpit-config):
+  ```toml
+  [panes.tools.lazygit]
+  command  = "lazygit"
+  layout   = "floating"   # floating | side | bottom
+  toggle   = true         # second invocation hides the pane
+  keybind  = "<leader>g"
+  detect   = "lazygit"    # binary name (mise exec first, then PATH)
+  ```
+- Loader produces typed `ToolPaneRecipe { name, command, layout,
+  toggle, keybind, detect }` values; each becomes a `CommandId` in
+  `cockpit-commands` so the palette *and* the keybind dispatch the
+  same code (AGENTS §2 hard rule #5).
+- Mux gains two primitives on top of M7.4's split tree:
+  - **Floating pane** — overlay rectangle centred over the project,
+    sized 80% × 80%, drawn above the regular layout. Single floating
+    pane per session; opening another replaces it. `Esc` or the
+    recipe's keybind dismisses (when `toggle = true`).
+  - **Toggle behaviour** — second keybind press hides the pane
+    without killing the PTY; third press re-shows it with scrollback
+    intact. Closes when the underlying process exits.
+- Detection is the M4.10 `ProcessRunner` seam — try
+  `mise exec -- which <name>` first (project tools win), then
+  `which <name>`. Missing → palette toast: *"`lazygit` not found.
+  `mise use lazygit@latest`?"* — never auto-install (AGENTS §2 hard
+  rule #6).
+- Tests (headless): recipe parses, keybind resolves to the right
+  command, mux state transitions across show/hide/close, missing
+  binary produces the expected toast.
+- **Done when:** an arbitrary recipe in the user config gets a
+  keybind, a palette entry, and a floating-or-docked pane on
+  trigger.
+
+### M8.3 — Default recipes shipped out of the box
+
+Three default recipes baked into the binary (overridable in
+user config — same merge rule as the existing `[keys.global]`):
+
+| Name          | Command  | Layout    | Keybind        | Notes                                       |
+|---------------|----------|-----------|----------------|---------------------------------------------|
+| `lazygit`     | `lazygit`| floating  | `<leader>g`    | Lazyvim convention. Toggle on second press. |
+| `claude-code` | `claude` | side-right| `<leader>aa`   | Full-height pane on the right.              |
+| `codex`       | `codex`  | side-right| `<leader>ac`   | Same slot as Claude — only one at a time.   |
+
+- Side-right panes share a slot: opening `codex` while `claude-code`
+  is visible hides Claude and shows Codex. Avoids fighting over
+  screen real estate while keeping both PTYs alive in the
+  background.
+- All three recipes ship under `[panes.tools.*]` defaults; users can
+  override any field (e.g. swap `claude` for `aichat`) without
+  losing the rest of the schema.
+- **No** in-cockpit chat UI, file-context injection, diff-apply, or
+  prompt rendering. The user's task #2 ("see #1") was explicit:
+  *the mux is the integration.*
+- **Done when:** fresh install of cockpit + `lazygit` + `claude` +
+  `codex` on PATH → all three open with their default keybinds
+  with zero config.
+
+### M8.4 — Exit criteria
+
+- [ ] `mise run run` opens the cockpit in Catppuccin Mocha when
+      `ui.theme = "mocha"` (Linux + macOS + Windows).
+- [ ] `Theme: Switch Latte` palette command hot-swaps the theme;
+      config file picks up `theme = "latte"`.
+- [ ] `<leader>g` toggles a floating Lazygit overlay on a real git
+      repo; `Esc` dismisses.
+- [ ] `<leader>aa` opens Claude Code in a side pane; `<leader>ac`
+      replaces it with Codex; the hidden one stays alive in the
+      background and resumes on toggle-back.
+- [ ] Cold-start tracing shows the theme switch + recipe
+      registration adds < 5 ms total (no regression on the v0.6
+      100 ms budget).
+- [ ] All three CI legs green: fast, integration, ui-smoke.
+
+### Sequencing
+
+```diagram
+M8.1 (Catppuccin) ──┐
+                    ├──▶  ships now, independent
+                    │
+M7.x (multiplexer) ─┴──▶  M8.2 (recipes) ──▶ M8.3 (defaults) ──▶ M8.4
+```
+
+### Risk notes
+
+| Risk                                          | Mitigation                                              |
+|-----------------------------------------------|---------------------------------------------------------|
+| Catppuccin palette drift over time            | Comment each `Color::rgb(…)` with the upstream hex; luminance assertion catches obvious typos. |
+| Hot-swap theme leaves stale glyph atlas       | Atlas is glyph-keyed, not colour-keyed — colours are vertex attributes, so a theme swap re-paints next frame without atlas churn. Verify in a smoke test. |
+| Recipe schema bloat (themes, env, cwd, args…) | Ship the minimal schema in M8.2; defer extensions until a real user asks. |
+| Users expect deep AI integration              | Document that v0.8 ships AI as a pane, full stop. Inline diff-apply is a future v0.9+ candidate, not promised. |
+| Lazygit / claude / codex missing on Windows   | Each recipe's `detect` step lets the palette surface a clean "not installed" toast — never crash, never auto-install. |
+| Config writer corrupts user comments          | Use `toml_edit` for `Theme: Switch…` write-back (preserves comments + ordering); add a round-trip test on a commented fixture. |
+
+---
+
+## 8e. v0.9 — Lua extension system  (NEW — post-spec)
+
+Goal: let power users extend the cockpit in **Lua** without turning it
+into Neovim. The extension surface is **sandboxed behaviour
+extensions** — extensions can register commands, keybinds, themes,
+tool-pane recipes, and react to a small set of editor/mux events. They
+**cannot** spawn processes, touch the filesystem, render pixels, or
+escape the sandbox unless the user explicitly grants a capability.
+
+This is intentionally a smaller surface than Neovim's plugin runtime.
+We are not building a plugin marketplace (AGENTS.md §2 hard rule #7
+stands — see M9.6 for how we re-state it). Extensions are local files
+the user wrote or copied in. There is no `:PackerInstall`, no
+discovery server, no auto-update.
+
+### Why now (v0.9, not earlier)
+
+- The TOML schema landed in v0.1 and grew through v0.2/v0.3/v0.7/v0.8.
+  Extensions need a stable surface to bind to — registering a `theme`
+  in v0.8's schema or a `tool-pane recipe` in v0.8 is *only* useful
+  once both exist. Building Lua on top of moving schemas would force
+  rewrites every release.
+- v0.7's `cockpit-mux` and v0.8's recipe registry are the two
+  biggest things extensions want to extend. Without them the API
+  surface is too thin to justify the dependency.
+
+### Runtime choice — **mlua + vendored Lua 5.4**
+
+- `mlua` with the `lua54` + `vendored` features. Mature, fast, the
+  same VM every other Lua-extensible editor ships, and vendoring
+  avoids a system Lua dependency on Windows. The 5.4 binary cost
+  (≈200 kB on Linux release) fits the v0.6 instant-load budget — we
+  measure in M9.7.
+- `mlua::Lua::sandbox(true)` strips `os.execute`, `io.popen`,
+  `package.loadlib`, `loadfile`, `dofile`, and `require` of arbitrary
+  paths. We layer additional restrictions on top (M9.4).
+- Rejected: `piccolo` (still pre-1.0, smaller ecosystem); `rlua`
+  (effectively unmaintained); `wasm` plugins (ten times the
+  complexity for the same surface).
+
+### Architecture
+
+```diagram
+╭──────────────────╮         ╭─────────────────╮       ╭──────────────╮
+│ Extension files  │──load──▶│  cockpit-lua    │──reg──▶│ cockpit-     │
+│ *.lua            │         │  (mlua, sandbox)│       │ commands     │
+│                  │◀─event──│  event bus      │       │ cockpit-ui   │
+╰──────────────────╯         │  capability gate│       │ cockpit-mux  │
+                             ╰─────────────────╯       ╰──────────────╯
+```
+
+- New crate `cockpit-lua` owns the VM lifecycle, sandbox setup, event
+  bus, and capability checks. **Headless** (AGENTS §2 #2) — does not
+  depend on `winit`/`glow`/PTY. Tests run with no display server.
+- The cockpit binary wires `cockpit-lua` to `cockpit-commands`,
+  `cockpit-ui`, and (where relevant) `cockpit-mux`. The Lua bridge
+  is a **registrar**, not an executor — when an extension
+  `cockpit.keys.bind(…)`s, that lands as a normal `CommandId`
+  binding (AGENTS §2 #5: commands are the single spine).
+- Non-determinism (FS, process, clock) is **never** exposed to Lua
+  directly. Capabilities go through the M4.10
+  `FileSystem`/`ProcessRunner`/`Clock` seams so extensions stay
+  testable and reproducible (AGENTS §2 #3).
+
+### M9.1 — `cockpit-lua` crate scaffold
+
+- New workspace member. Wraps `mlua::Lua`, creates the sandbox,
+  installs the `cockpit.*` global, surfaces errors as typed
+  `LuaError` (`thiserror`).
+- One Lua VM per extension, not one shared VM. Isolates state so a
+  panicking extension never trashes another. Memory cost is small
+  (~50 kB per VM); benchmark in M9.7.
+- Tests (headless): VM constructs, sandbox forbids `os.execute`,
+  `print` is redirected to a captured buffer (verifies output
+  capture path).
+
+### M9.2 — Lua API surface
+
+A single `cockpit` global, organised by namespace. The whole surface
+is **registration + read-only inspection** — no mutation primitives
+that escape the registered command system.
+
+```lua
+-- Register a palette command.
+cockpit.commands.register {
+  id    = "user.format-paragraph",
+  title = "Format Paragraph",
+  run   = function(ctx) ctx.toast("Hello from Lua!") end,
+}
+
+-- Bind a key to a command (resolves through cockpit-commands).
+cockpit.keys.bind("<leader>fp", "user.format-paragraph")
+
+-- Register a theme (palette is just a table of named colors).
+cockpit.themes.register {
+  name = "user.rose-pine",
+  colors = { background = "#191724", text = "#e0def4", -- … },
+}
+
+-- Register a tool-pane recipe (same schema as v0.8 TOML).
+cockpit.panes.recipe {
+  name    = "user.btop",
+  command = "btop",
+  layout  = "floating",
+  toggle  = true,
+  keybind = "<leader>t",
+  detect  = "btop",
+}
+
+-- React to editor/mux events.
+cockpit.events.on("save", function(ctx)
+  if ctx.language == "rust" then
+    ctx.log.info("rust file saved: " .. ctx.path)
+  end
+end)
+```
+
+Available namespaces (full list):
+
+| Namespace          | Calls                                       | Notes                                  |
+|--------------------|---------------------------------------------|----------------------------------------|
+| `cockpit.commands` | `register{…}`, `dispatch(id, args?)`        | Registers a `CommandId`.               |
+| `cockpit.keys`     | `bind(chord, id)`, `unbind(chord)`          | Goes through `cockpit-commands`.       |
+| `cockpit.themes`   | `register{name, colors}`, `current()`       | Theme name appears in `Theme: Switch…` palette. |
+| `cockpit.panes`    | `recipe{…}` (v0.8 schema)                   | Recipe is registered with the mux.     |
+| `cockpit.events`   | `on(event, fn)`, `off(handle)`              | Event names listed in M9.3.            |
+| `cockpit.buffer`   | `text()`, `cursor()`, `language()`, `path()`| **Read-only.** Returns active buffer.  |
+| `cockpit.project`  | `root()`, `name()`, `tasks()`               | Read-only project metadata.            |
+| `cockpit.toast`    | `cockpit.toast("…")`                        | Status-line notification.              |
+| `cockpit.log`      | `log.info/warn/error(…)`                    | Lands in the `tracing` log.            |
+
+Explicit non-API (not exposed, ever): direct file IO, direct process
+spawn, direct PTY/grid access, direct GL/painter calls, network,
+clipboard write (read possibly later — capability-gated), reflection
+on other extensions.
+
+### M9.3 — Event hooks
+
+Cockpit emits a small fixed set of events. Adding to this list is a
+plan change, not a runtime change — the surface stays auditable.
+
+| Event              | Fired when                                  | Context fields                                    |
+|--------------------|---------------------------------------------|---------------------------------------------------|
+| `editor.open`      | A buffer becomes active                     | `path, language`                                  |
+| `editor.save`      | Save succeeded (after format-on-save)       | `path, language, bytes`                           |
+| `editor.cursor`    | Cursor moved (debounced 50 ms)              | `path, line, col`                                 |
+| `editor.mode`      | Vim mode changed                            | `path, mode` (`normal|insert|visual|command`)     |
+| `mux.pane_focus`   | Active mux pane changed                     | `session, window, pane, command`                  |
+| `mux.pane_exit`    | Pane's process exited                       | `session, pane, exit_code`                        |
+| `palette.open`     | Command palette opened                      | `query`                                           |
+| `project.open`     | Project finished hydrating                  | `root, name`                                      |
+
+- Handlers run synchronously on the UI thread with a **5 ms** budget
+  per event. Overrunning handlers are killed and the extension
+  surfaces a one-line error in the status line. Repeated overruns
+  disable the handler until reload.
+- Tests: scripted event stream against a `FakeEventBus` asserts
+  handler ordering, payload shape, and budget enforcement.
+
+### M9.4 — Capabilities
+
+Default-deny. Extensions declare what they need; the user grants in
+config.
+
+- Capability tokens (initial set):
+  - `fs.read.project` — read files inside the project root
+  - `process` — spawn declared commands via the `ProcessRunner`
+    seam (subject to user-config allowlist)
+  - `clipboard.read` / `clipboard.write` — OS clipboard access
+- Declaration in the extension header:
+  ```lua
+  --[[ @cockpit:requires fs.read.project, process ]]--
+  ```
+- Approval in `~/.config/cockpit/extensions.toml`:
+  ```toml
+  [extensions."user.rust-toys"]
+  enabled = true
+  grants  = ["fs.read.project"]
+  ```
+- An ungranted capability raises a Lua error at call site; the
+  extension can `pcall` and degrade gracefully. We never silently
+  no-op a capability call.
+- First-launch UX: an extension that declares a capability not yet
+  granted shows a one-time palette prompt: *"`user.rust-toys`
+  requests `process`. Grant? [y/N]"* — explicit user action only
+  (AGENTS §2 #6 spirit).
+
+### M9.5 — Hot-reload + error surfacing
+
+- Extension files watched via `notify`; on change, the VM for that
+  file is torn down and rebuilt. Other extensions are unaffected.
+- Load/runtime errors land on the status line (`status` toast) and
+  in the `tracing` log; **the cockpit never crashes on a bad
+  extension** (AGENTS §6: "no `unwrap()` in non-test code").
+- `Debug: Extensions` palette command (extends M3.7's debug
+  surfaces) lists each extension's state: loaded / failed /
+  disabled, plus the last error and timing snapshot.
+
+### M9.6 — Docs + non-marketplace stance
+
+- New `docs/extensions.md` — API reference + worked examples + the
+  capability list.
+- Update `AGENTS.md` §2 hard rule #7 from
+  *"no plugin marketplace"* to
+  *"no plugin marketplace, registry, or in-app installer — Lua
+  extensions are user-authored or user-copied local files only."*
+  Same intent, clarified.
+- Update `spec.md` §10 to reference extensions; §24 to add the
+  extension-load step to the cold-start budget.
+
+### M9.7 — Performance gate
+
+Cold-start regression budget (hard limits, asserted in CI under
+`--features bench`):
+
+| Step                                      | Budget          |
+|-------------------------------------------|-----------------|
+| `cockpit-lua` VM init (per VM)            | ≤ 5 ms          |
+| Discover + parse `extensions/*.lua`       | ≤ 2 ms / file   |
+| Run an extension's top-level register code| ≤ 10 ms typical |
+| Total extension-system contribution       | ≤ 50 ms         |
+
+If the budget is blown, M9 ships the API surface but defers loading
+to first-use instead of cold start (lazy-load on first `cockpit.*`
+call). Stretch goal, not a v0.9 blocker.
+
+### M9.8 — Example extensions shipped in `runtime/extensions/`
+
+Three default extensions — each demonstrates one event type and serves
+as living documentation. Users can disable them in
+`extensions.toml`:
+
+1. **`runtime.format-paragraph`** — registers a command that
+   re-wraps the active paragraph at the configured `editor.column`.
+   Demonstrates `commands.register` + `buffer.text` + (with
+   capability) buffer edit via a registered command.
+2. **`runtime.session-toast`** — on `mux.pane_exit` with a non-zero
+   exit code, surfaces a status toast. Demonstrates events + toast.
+3. **`runtime.theme-by-time-of-day`** — switches between Catppuccin
+   Latte and Mocha based on a daily schedule. Demonstrates theme
+   registration + `clock` access (requires capability).
+
+These ship in the binary as embedded strings (no extra IO cost on
+fresh installs) and can be force-disabled in CI.
+
+### Exit criteria
+
+- [ ] Drop `~/.config/cockpit/extensions/hello.lua` containing
+      `cockpit.commands.register{…}` → the command appears in the
+      palette without restart on all three OSes.
+- [ ] Lua extension that calls `os.execute("rm -rf /")` raises a
+      sandbox error and is logged; cockpit stays up.
+- [ ] An extension exceeding the 5 ms event budget gets disabled
+      with a status-line message; other extensions keep running.
+- [ ] The three `runtime/` examples work out of the box and are
+      individually disablable.
+- [ ] `mise run ci` green; bench leg confirms ≤ 50 ms cold-start
+      contribution.
+
+### Sequencing
+
+```diagram
+M7.x (mux) ─┐
+            ├─▶ M8.x (recipes) ─┐
+            │                   │
+            │                   ▼
+            └────────────▶ M9.1 (crate) ─▶ M9.2 (API) ─▶ M9.3 (events)
+                                                              │
+                                                              ▼
+                                              M9.4 (caps) ─▶ M9.5 (reload)
+                                                              │
+                                                              ▼
+                                              M9.6 (docs) ─▶ M9.7 (perf) ─▶ M9.8 (defaults)
+```
+
+### Risk notes
+
+| Risk                                          | Mitigation                                              |
+|-----------------------------------------------|---------------------------------------------------------|
+| Lua sandbox bypass                            | `mlua::Lua::sandbox` + explicit stripping of forbidden globals; fuzz tests assert the bypass list. |
+| Cold-start regression                         | Hard 50 ms budget asserted in CI; lazy-load escape hatch (M9.7). |
+| C dep makes Windows builds painful            | `lua54-vendored`; CI Windows leg already on the matrix. |
+| API surface bloat over time                   | New `cockpit.*` namespace requires a plan update and a doc page — no drive-by additions. |
+| Users want Neovim plugins to "just work"      | Document loudly that we are not Neovim; the API is small and curated by design. |
+| One extension crashes another                 | One `mlua::Lua` per extension; budget enforcement; surface errors via status line. |
+| Extensions become a load-bearing dependency   | Default extensions ship in-binary and are disablable; the cockpit is fully functional with zero extensions. |
 
 ---
 

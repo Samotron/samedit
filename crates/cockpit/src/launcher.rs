@@ -3,8 +3,10 @@
 //! [`LauncherModel`] is the project selection screen state. It uses the
 //! headless [`Launcher`](cockpit_ui::launcher::Launcher) from `cockpit-ui` and
 //! dispatches its intents back to the binary to open a real project workspace.
-//! The [`CockpitApp`] trait is implemented for `&mut LauncherModel` so the
-//! binary can retrieve the result after the window closes.
+//! The [`CockpitApp`] trait is implemented for `LauncherModel` directly so it
+//! can sit inside the [`AppShell`](crate::app::AppShell) state machine (M7.1).
+//! After the launcher signals a selection, the shell transitions to hydrating
+//! the chosen project — all within the same `winit` event loop.
 
 use std::path::PathBuf;
 
@@ -69,7 +71,7 @@ impl LauncherModel {
     }
 }
 
-impl CockpitApp for &mut LauncherModel {
+impl CockpitApp for LauncherModel {
     fn paint(&mut self, painter: &mut Painter, viewport: Viewport) {
         let scale = viewport.scale.max(0.5);
         let width = viewport.width as f32 / scale;
