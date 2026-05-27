@@ -943,9 +943,17 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   description type, and `Session::from_layout(name, description)`
   builds a session whose layout tree, pane ids, and active pane all
   derive from the description plus a `Vec<(PaneId, Option<String>)>`
-  the caller can spawn against on first attach. The cockpit binary
-  wire-up (parse layout from project metadata, build session, run
-  per-pane commands) is the next sub-task.
+  the caller can spawn against on first attach.
+- Binary wire-up: `cockpit::mux_layout::resolve_cockpit_layout` reads
+  `metadata.cockpit.cockpit_layout` from the project detection,
+  loads + parses the KDL, and `AppModel::apply_cockpit_layout`
+  replaces the default single-pane mux session with one built from
+  the layout. Per-pane first-attach commands live in
+  `AppModel::mux_pane_commands` until `ensure_terminal` consumes
+  them — at which point the PTY spawns the layout command through
+  the host shell (`sh -c` on Unix, `cmd.exe /C` on Windows) instead
+  of the Zellij / fallback launcher. Bad / missing layout paths
+  surface in the status line and keep the default session running.
 - `CockpitMetadata::cockpit_layout` joins the existing `zellij_layout`
   field on the project metadata block so the v0.7 multiplexer can
   pick up the new schema while the legacy Zellij wiring is still

@@ -8,6 +8,7 @@
 mod app;
 mod hydration;
 mod launcher;
+mod mux_layout;
 mod splash;
 mod startup;
 

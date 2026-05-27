@@ -310,6 +310,11 @@ pub struct AppModel {
     /// (M7.6). Clipboard wiring is a follow-up; the buffer surfaces in the
     /// status line so the workflow is usable today.
     mux_copy_yank: Option<String>,
+    /// First-attach commands declared in the project's `cockpit_layout` KDL
+    /// (v0.7 M7.8). Consumed by [`ensure_terminal`] on the first time a
+    /// pane is brought up so the command runs directly in its PTY instead
+    /// of the default Zellij / shell fallback.
+    mux_pane_commands: HashMap<cockpit_mux::PaneId, String>,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -380,7 +385,7 @@ impl AppModel {
     ) -> Result<Self, String> {
         let router = InputRouter::from_global_keys(&GlobalKeys::default())
             .map_err(|err| format!("input router setup failed: {err:?}"))?;
-        Ok(Self {
+        let mut model = Self {
             fs,
             process,
             browser: FileBrowser::new(tree),
@@ -416,6 +421,7 @@ impl AppModel {
             editor_pending_leader: 0,
             mux_copy_pending_g: false,
             mux_copy_yank: None,
+            mux_pane_commands: HashMap::new(),
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -423,7 +429,39 @@ impl AppModel {
             editor_scroll: 0.0,
             exit: false,
             detection,
-        })
+        };
+        model.apply_cockpit_layout();
+        Ok(model)
+    }
+
+    /// Apply a project's configured `cockpit_layout` to the active mux
+    /// session (v0.7 M7.8). When metadata declares a layout path we replace
+    /// the default single-pane session with one built from the KDL tree and
+    /// stash the per-pane first-attach commands. Missing files or parse
+    /// errors are surfaced in the status line so the user sees them, but
+    /// the cockpit keeps running on the fallback session.
+    fn apply_cockpit_layout(&mut self) {
+        match crate::mux_layout::resolve_cockpit_layout(&self.detection) {
+            Ok(Some(resolved)) => {
+                let (session, pane_commands) = cockpit_mux::Session::from_layout(
+                    self.detection.display_name.clone(),
+                    &resolved.description,
+                );
+                self.mux_session = session;
+                self.mux_pane_commands = pane_commands
+                    .into_iter()
+                    .filter_map(|(id, command)| command.map(|cmd| (id, cmd)))
+                    .collect();
+                self.status = format!(
+                    "Mux layout loaded ({} panes).",
+                    self.mux_session.active_window().panes.len()
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.status = format!("cockpit_layout ignored: {err}");
+            }
+        }
     }
 
     /// Resolve this project's cache file and restore persisted state from it
@@ -1619,22 +1657,30 @@ impl AppModel {
             self.status = "Terminal unavailable — no redraw handle.".to_string();
             return;
         };
-        let layout = self.resolve_zellij_layout();
-        let plan = plan_launch(
-            &self.detection.display_name,
-            layout.as_deref(),
-            &PathBinaryLookup,
-            ShellProfile::host_default(),
-        );
-        let (command, label) = match plan {
-            LaunchPlan::Zellij(command) => {
-                let label = match layout.as_deref() {
-                    Some(path) => format!("zellij ({})", path.display()),
-                    None => "zellij".to_string(),
-                };
-                (command, label)
+        let (command, label) = if let Some(layout_command) = self.mux_pane_commands.remove(&pane) {
+            let spec = shell_command_spec(&layout_command);
+            let label = format!("layout `{layout_command}`");
+            (spec, label)
+        } else {
+            let layout = self.resolve_zellij_layout();
+            let plan = plan_launch(
+                &self.detection.display_name,
+                layout.as_deref(),
+                &PathBinaryLookup,
+                ShellProfile::host_default(),
+            );
+            match plan {
+                LaunchPlan::Zellij(command) => {
+                    let label = match layout.as_deref() {
+                        Some(path) => format!("zellij ({})", path.display()),
+                        None => "zellij".to_string(),
+                    };
+                    (command, label)
+                }
+                LaunchPlan::Fallback { command, reason } => {
+                    (command, format!("shell — {reason:?}"))
+                }
             }
-            LaunchPlan::Fallback { command, reason } => (command, format!("shell — {reason:?}")),
         };
         let wake: WakeFn = Box::new(move || redraw.request());
         match LiveTerminal::spawn(&command, PtyDimensions::new(24, 80), wake) {
@@ -3965,6 +4011,23 @@ fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
 }
 
+/// Wrap a `cockpit_layout` pane command in the host shell so the user's
+/// command string supports the usual quoting / pipes / globs (M7.8). On
+/// Windows we run through `cmd.exe /C`; everywhere else `sh -c`.
+fn shell_command_spec(command: &str) -> cockpit_terminal::zellij::CommandSpec {
+    if cfg!(windows) {
+        cockpit_terminal::zellij::CommandSpec::new(
+            "cmd.exe".to_string(),
+            vec!["/C".to_string(), command.to_string()],
+        )
+    } else {
+        cockpit_terminal::zellij::CommandSpec::new(
+            "sh".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )
+    }
+}
+
 /// True when `chord` is `Shift+<letter>`. winit emits the lower-case key plus
 /// the shift modifier (see `cockpit_render::key_event`), but parsed text
 /// chords (`"G"`) come through as the upper-case key with no modifier.
@@ -5179,6 +5242,83 @@ mod tests {
             model.status,
         );
         assert!(model.status.contains("mise["), "status: {}", model.status,);
+    }
+
+    #[test]
+    fn cockpit_layout_metadata_replaces_default_session_and_records_commands() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = dir.path().join("layout.kdl");
+        fs::write(
+            &layout,
+            r#"
+layout {
+    split direction="horizontal" ratio=0.6 {
+        pane command="editor-here"
+        pane command="lazygit"
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("mise.toml"),
+            r#"
+[tools]
+rust = "1.95.0"
+
+[metadata.cockpit]
+name = "Layout Project"
+cockpit_layout = "layout.kdl"
+"#,
+        )
+        .unwrap();
+
+        let detection = detect_project(dir.path()).expect("detect tempdir project");
+        let tree = FileTree::load(dir.path()).expect("load tempdir tree");
+        let model = AppModel::new(detection, tree).expect("build model");
+
+        assert_eq!(model.mux_session.active_window().panes.len(), 2);
+        let commands: Vec<&str> = model
+            .mux_pane_commands
+            .values()
+            .map(String::as_str)
+            .collect();
+        assert!(commands.contains(&"editor-here"), "commands: {commands:?}");
+        assert!(commands.contains(&"lazygit"), "commands: {commands:?}");
+        assert!(
+            model.status.contains("Mux layout loaded"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn cockpit_layout_missing_file_surfaces_status_and_keeps_default_session() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("mise.toml"),
+            r#"
+[metadata.cockpit]
+cockpit_layout = "missing.kdl"
+"#,
+        )
+        .unwrap();
+
+        let detection = detect_project(dir.path()).expect("detect tempdir project");
+        let tree = FileTree::load(dir.path()).expect("load tempdir tree");
+        let model = AppModel::new(detection, tree).expect("build model");
+
+        assert_eq!(model.mux_session.active_window().panes.len(), 1);
+        assert!(model.mux_pane_commands.is_empty());
+        assert!(
+            model.status.contains("cockpit_layout ignored"),
+            "status: {}",
+            model.status
+        );
     }
 
     #[test]
