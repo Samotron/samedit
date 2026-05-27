@@ -916,6 +916,16 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   active marker, time, optional `mise` task status.
 - Pure view-model in `cockpit-ui`; painter in `cockpit-render`.
 - Configurable via spec §20 (`terminal.status.format`).
+- Headless data + default render shipped: `cockpit_mux::Session::status_summary`
+  emits a `StatusSummary { session_name, windows }` snapshot keyed by
+  window index, name, active marker, and per-window pane count.
+  `StatusSummary::render(extras)` produces the default tmux-style
+  `[<session>] 0:name 1:name* …` formatted line, with optional
+  `extras` (time, mise task, etc.) appended after a `│` separator.
+  The mode-line strip painter and config-driven format string remain
+  the next sub-task — the wire-up surfaces today via
+  `Debug: Show Mux Status` in the palette so the data layer is usable
+  before the painter lands.
 
 ### M7.8 — Native layout config
 

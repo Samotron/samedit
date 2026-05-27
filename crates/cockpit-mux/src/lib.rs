@@ -992,6 +992,40 @@ impl Session {
         }
     }
 
+    /// Headless snapshot of the data a status line / mode-line (M7.7)
+    /// needs to draw: session name plus per-window index, name, and
+    /// active marker. Time and task fields are external inputs the
+    /// caller adds when formatting.
+    pub fn status_summary(&self) -> StatusSummary {
+        let active_pane_id = self.active_pane().id;
+        let windows = self
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(index, window)| {
+                let pane_count = window.panes.len();
+                let active_pane_in_window = window
+                    .panes
+                    .iter()
+                    .position(|pane| pane.id == window.active)
+                    .unwrap_or(0);
+                WindowStatus {
+                    index,
+                    name: window.name.clone(),
+                    active: window.id == self.active,
+                    pane_count,
+                    active_pane_in_window,
+                    contains_active_pane: window.id == self.active
+                        && window.active == active_pane_id,
+                }
+            })
+            .collect();
+        StatusSummary {
+            session_name: self.name.clone(),
+            windows,
+        }
+    }
+
     fn alloc_window(&mut self) -> WindowId {
         let id = WindowId(self.next_window);
         self.next_window += 1;
@@ -1002,6 +1036,57 @@ impl Session {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
         id
+    }
+}
+
+/// Per-window state surfaced to a status / mode-line painter (M7.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowStatus {
+    pub index: usize,
+    pub name: String,
+    pub active: bool,
+    pub pane_count: usize,
+    pub active_pane_in_window: usize,
+    pub contains_active_pane: bool,
+}
+
+/// Headless snapshot used by a mode-line painter. Time / mise task come from
+/// outside this crate — pure session state lives here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSummary {
+    pub session_name: String,
+    pub windows: Vec<WindowStatus>,
+}
+
+impl StatusSummary {
+    /// Default tmux-style mode-line render. Format:
+    ///
+    /// `[<session>] 0:name 1:name* 2:name`
+    ///
+    /// where `*` marks the active window. `extras` (time, mise task) appear
+    /// right-padded after a `│` separator if any are supplied.
+    pub fn render(&self, extras: &[&str]) -> String {
+        let mut out = format!("[{}]", self.session_name);
+        for window in &self.windows {
+            out.push(' ');
+            out.push_str(&window.index.to_string());
+            out.push(':');
+            out.push_str(&window.name);
+            if window.active {
+                out.push('*');
+            }
+        }
+        let mut first_extra = true;
+        for extra in extras.iter().filter(|extra| !extra.is_empty()) {
+            if first_extra {
+                out.push_str(" │ ");
+                first_extra = false;
+            } else {
+                out.push_str(" · ");
+            }
+            out.push_str(extra);
+        }
+        out
     }
 }
 
@@ -2174,6 +2259,59 @@ mod tests {
           "next_pane": 3
         }
         "#);
+    }
+
+    #[test]
+    fn status_summary_lists_every_window_with_active_marker() {
+        let mut session = Session::new("dev");
+        session.new_window("logs");
+        session.new_window("vim");
+        // Select the middle window.
+        session.select_window(1).expect("window exists");
+
+        let summary = session.status_summary();
+        assert_eq!(summary.session_name, "dev");
+        assert_eq!(summary.windows.len(), 3);
+        assert_eq!(summary.windows[0].name, "0");
+        assert!(!summary.windows[0].active);
+        assert_eq!(summary.windows[1].name, "logs");
+        assert!(summary.windows[1].active);
+        assert_eq!(summary.windows[2].name, "vim");
+        assert!(!summary.windows[2].active);
+    }
+
+    #[test]
+    fn status_summary_tracks_panes_per_window() {
+        let mut session = Session::new("dev");
+        session.split_active(SplitDirection::Horizontal);
+        session.split_active(SplitDirection::Vertical);
+
+        let summary = session.status_summary();
+        assert_eq!(summary.windows.len(), 1);
+        assert_eq!(summary.windows[0].pane_count, 3);
+        assert_eq!(summary.windows[0].active_pane_in_window, 2);
+        assert!(summary.windows[0].contains_active_pane);
+    }
+
+    #[test]
+    fn status_summary_default_render_marks_active_window() {
+        let mut session = Session::new("dev");
+        session.new_window("logs");
+        session.select_window(1).unwrap();
+
+        let summary = session.status_summary();
+        assert_eq!(summary.render(&[]), "[dev] 0:0 1:logs*");
+    }
+
+    #[test]
+    fn status_summary_render_appends_extras_with_separators() {
+        let session = Session::new("dev");
+        let summary = session.status_summary();
+        assert_eq!(
+            summary.render(&["12:34", "build"]),
+            "[dev] 0:0* │ 12:34 · build"
+        );
+        assert_eq!(summary.render(&["", "build", ""]), "[dev] 0:0* │ build");
     }
 
     #[test]

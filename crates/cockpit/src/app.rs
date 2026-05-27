@@ -95,6 +95,8 @@ const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
 /// Command id for "summarise the recorded startup-phase trace"
 /// (v0.6 M6.7).
 const DEBUG_SHOW_STARTUP_TRACE: &str = "debug.show_startup_trace";
+/// Command id for "summarise the native mux mode-line" (v0.7 M7.7).
+const DEBUG_SHOW_MUX_STATUS: &str = "debug.show_mux_status";
 /// Command id for "go to the symbol's definition under the cursor" (M4.2).
 const LSP_GOTO_DEFINITION: &str = "lsp.goto_definition";
 /// Command id for "show hover information for the symbol under the cursor" (M4.2).
@@ -873,6 +875,7 @@ impl AppModel {
             DEBUG_SHOW_PROJECT_STATE => self.debug_show_project_state(),
             DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
             DEBUG_SHOW_STARTUP_TRACE => self.debug_show_startup_trace(),
+            DEBUG_SHOW_MUX_STATUS => self.debug_show_mux_status(),
             LSP_GOTO_DEFINITION => self.request_goto_definition(),
             LSP_SHOW_HOVER => self.request_show_hover(),
             LSP_RENAME => self.open_rename_input(),
@@ -1270,6 +1273,15 @@ impl AppModel {
         let snapshot = crate::startup::snapshot();
         let text = crate::startup::format_snapshot(&snapshot);
         tracing::info!(startup = %text, "debug: show startup trace");
+        self.status = text;
+    }
+
+    /// Surface the native mux mode-line (v0.7 M7.7). Time and mise task
+    /// extras come from the optional task surface when one is known.
+    fn debug_show_mux_status(&mut self) {
+        let summary = self.mux_session.status_summary();
+        let text = summary.render(&[]);
+        tracing::info!(mux_status = %text, "debug: show mux status");
         self.status = text;
     }
 
@@ -4454,6 +4466,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(DEBUG_SHOW_PROJECT_STATE, "Debug: Show Project State"),
         PaletteEntry::new(DEBUG_RELOAD_CONFIG, "Debug: Reload Config"),
         PaletteEntry::new(DEBUG_SHOW_STARTUP_TRACE, "Debug: Show Startup Trace"),
+        PaletteEntry::new(DEBUG_SHOW_MUX_STATUS, "Debug: Show Mux Status"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -5166,6 +5179,30 @@ mod tests {
             model.status,
         );
         assert!(model.status.contains("mise["), "status: {}", model.status,);
+    }
+
+    #[test]
+    fn debug_show_mux_status_summarises_session_and_windows() {
+        let mut model = model();
+        model.run_command(mux_command_ids::NEW_WINDOW);
+        model.run_command(mux_command_ids::SELECT_WINDOW_0);
+
+        model.debug_show_mux_status();
+        assert!(model.status.starts_with('['), "status: {}", model.status);
+        assert!(model.status.contains("0:0*"), "status: {}", model.status);
+        assert!(model.status.contains("1:1"), "status: {}", model.status);
+    }
+
+    #[test]
+    fn palette_lists_mux_status_debug_command() {
+        let ids = palette_entries()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            ids.iter().any(|id| id == DEBUG_SHOW_MUX_STATUS),
+            "entries: {ids:?}"
+        );
     }
 
     #[test]
