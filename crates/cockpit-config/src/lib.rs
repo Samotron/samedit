@@ -214,10 +214,28 @@ pub struct KeysConfig {
 /// (lazygit, claude, codex, …) in a multiplexer pane. The recipe is data
 /// only — the binary turns it into a `CommandId` and the mux's
 /// floating / docked pane primitives handle layout.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Three recipes ship out of the box (v0.8 M8.3): `lazygit`,
+/// `claude-code`, and `codex`. Users override individual fields by
+/// re-declaring the recipe in their config; un-declared defaults are
+/// preserved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PanesConfig {
     pub tools: std::collections::BTreeMap<String, ToolPaneRecipe>,
+}
+
+impl Default for PanesConfig {
+    fn default() -> Self {
+        let mut tools = std::collections::BTreeMap::new();
+        tools.insert("lazygit".to_string(), ToolPaneRecipe::default_lazygit());
+        tools.insert(
+            "claude-code".to_string(),
+            ToolPaneRecipe::default_claude_code(),
+        );
+        tools.insert("codex".to_string(), ToolPaneRecipe::default_codex());
+        Self { tools }
+    }
 }
 
 /// Where a tool-pane recipe places its pane (v0.8 M8.2).
@@ -277,6 +295,40 @@ impl ToolPaneRecipe {
             .split_whitespace()
             .next()
             .unwrap_or(&self.command)
+    }
+
+    /// Default Lazygit recipe (v0.8 M8.3). Floating overlay on `<leader>g`.
+    pub fn default_lazygit() -> Self {
+        Self {
+            command: "lazygit".to_string(),
+            layout: ToolPaneLayout::Floating,
+            toggle: true,
+            keybind: "<leader>g".to_string(),
+            detect: "lazygit".to_string(),
+        }
+    }
+
+    /// Default Claude Code recipe (v0.8 M8.3). Side-right pane on `<leader>aa`.
+    pub fn default_claude_code() -> Self {
+        Self {
+            command: "claude".to_string(),
+            layout: ToolPaneLayout::SideRight,
+            toggle: true,
+            keybind: "<leader>aa".to_string(),
+            detect: "claude".to_string(),
+        }
+    }
+
+    /// Default Codex recipe (v0.8 M8.3). Same side-right slot as Claude
+    /// Code — opening Codex hides Claude (and vice-versa).
+    pub fn default_codex() -> Self {
+        Self {
+            command: "codex".to_string(),
+            layout: ToolPaneLayout::SideRight,
+            toggle: true,
+            keybind: "<leader>ac".to_string(),
+            detect: "codex".to_string(),
+        }
     }
 }
 
@@ -479,6 +531,36 @@ detect  = "cargo"
         .unwrap();
         let toy = config.panes.tools.get("toy").unwrap();
         assert_eq!(toy.detect_binary(), "cargo");
+    }
+
+    #[test]
+    fn default_panes_config_ships_three_built_in_recipes() {
+        let panes = PanesConfig::default();
+        let names: Vec<&str> = panes.tools.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["claude-code", "codex", "lazygit"]);
+
+        let claude = &panes.tools["claude-code"];
+        assert_eq!(claude.command, "claude");
+        assert_eq!(claude.layout, ToolPaneLayout::SideRight);
+        assert_eq!(claude.keybind, "<leader>aa");
+
+        let codex = &panes.tools["codex"];
+        assert_eq!(codex.layout, ToolPaneLayout::SideRight);
+        assert_eq!(codex.keybind, "<leader>ac");
+
+        let lazygit = &panes.tools["lazygit"];
+        assert_eq!(lazygit.layout, ToolPaneLayout::Floating);
+        assert_eq!(lazygit.keybind, "<leader>g");
+    }
+
+    #[test]
+    fn empty_user_config_inherits_default_tool_recipes() {
+        let config = Config::default();
+        assert_eq!(config.panes.tools.len(), 3);
+
+        // The TOML-parsed empty config takes the same defaults.
+        let parsed = Config::from_toml("").unwrap();
+        assert_eq!(parsed.panes.tools.len(), 3);
     }
 
     #[test]

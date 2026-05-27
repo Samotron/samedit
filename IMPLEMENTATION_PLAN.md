@@ -1179,10 +1179,13 @@ user config — same merge rule as the existing `[keys.global]`):
 - Side-right panes share a slot: opening `codex` while `claude-code`
   is visible hides Claude and shows Codex. Avoids fighting over
   screen real estate while keeping both PTYs alive in the
-  background.
-- All three recipes ship under `[panes.tools.*]` defaults; users can
-  override any field (e.g. swap `claude` for `aichat`) without
-  losing the rest of the schema.
+  background. (Mux floating + slotted layout still pending — see
+  M8.2.)
+- ✅ All three recipes ship under `PanesConfig::default()` via
+  `ToolPaneRecipe::default_lazygit / _claude_code / _codex`. An empty
+  `[panes.tools]` section inherits them; users replace the whole
+  table by re-declaring `[panes.tools.*]` (per-field merge across
+  defaults is a follow-up if it proves valuable).
 - **No** in-cockpit chat UI, file-context injection, diff-apply, or
   prompt rendering. The user's task #2 ("see #1") was explicit:
   *the mux is the integration.*
