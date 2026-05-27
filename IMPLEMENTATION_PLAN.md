@@ -933,9 +933,13 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   bottom of the terminal pane and renders the rendered status text on
   a theme-accent background. The mux pane-rect projection used by
   hit-tests, drags, and resize-sync now subtracts the same strip so
-  the painted strip and the layout share bounds. Configurable format
-  strings (spec §20 `terminal.status.format`) plus live `time` /
-  `mise task` extras are the next sub-task.
+  the painted strip and the layout share bounds.
+- Live extras: `AppModel::last_mise_task` records the most recent task
+  kicked off via `run_mise_task` and the painter folds it in as
+  `task:<name>` after the window list. Configurable format strings
+  (spec §20 `terminal.status.format`) plus a `time` extra remain the
+  next sub-task — adding a tz-aware clock would pull in a new
+  dependency, so the explicit choice for now is task-only.
 
 ### M7.8 — Native layout config
 

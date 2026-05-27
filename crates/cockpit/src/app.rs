@@ -318,6 +318,9 @@ pub struct AppModel {
     /// pane is brought up so the command runs directly in its PTY instead
     /// of the default Zellij / shell fallback.
     mux_pane_commands: HashMap<cockpit_mux::PaneId, String>,
+    /// Most recently kicked-off mise task (v0.7 M7.7 status line extra).
+    /// Surfaced as `task:<name>` in the mode-line.
+    last_mise_task: Option<String>,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -425,6 +428,7 @@ impl AppModel {
             mux_copy_pending_g: false,
             mux_copy_yank: None,
             mux_pane_commands: HashMap::new(),
+            last_mise_task: None,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -1146,6 +1150,7 @@ impl AppModel {
             Some(terminal) => match terminal.send_input(command.as_bytes()) {
                 Ok(()) => {
                     self.layout.focus(PaneId::Terminal);
+                    self.last_mise_task = Some(task.to_string());
                     self.status = format!("Running mise task `{task}`.");
                 }
                 Err(err) => self.status = format!("Could not run `{task}`: {err}"),
@@ -3792,14 +3797,20 @@ impl AppModel {
 
     /// Paint the native mux mode-line at the bottom of the terminal area
     /// (v0.7 M7.7). Renders the default `StatusSummary` format on a
-    /// theme-accented background.
+    /// theme-accented background, optionally extended with the most
+    /// recently kicked-off mise task.
     fn paint_mux_status_line(&self, canvas: &mut Canvas<'_>, x: f32, y: f32, w: f32, h: f32) {
         if h <= 0.0 || w <= 0.0 {
             return;
         }
         canvas.rect(x, y, w, h, self.theme.accent);
         let summary = self.mux_session.status_summary();
-        let text = summary.render(&[]);
+        let task_label = self
+            .last_mise_task
+            .as_deref()
+            .map(|task| format!("task:{task}"));
+        let extras: Vec<&str> = task_label.as_deref().into_iter().collect();
+        let text = summary.render(&extras);
         let baseline = y + (h - FONT).max(0.0) * 0.5 + FONT * 0.85;
         canvas.text(x + PAD, baseline, text, self.theme.background, FONT);
     }
@@ -5970,6 +5981,36 @@ cockpit_layout = "missing.kdl"
         assert!(
             !painter.commands().is_empty(),
             "paint produced no draw commands"
+        );
+    }
+
+    #[test]
+    fn paint_terminal_status_line_includes_last_mise_task_when_set() {
+        let mut model = model();
+        model.last_mise_task = Some("test".to_string());
+
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+
+        let texts: Vec<String> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected = model.mux_session.status_summary().render(&["task:test"]);
+        assert!(
+            texts.iter().any(|text| text == &expected),
+            "expected `{expected}` in painted text, got {texts:?}"
         );
     }
 
