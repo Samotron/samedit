@@ -48,11 +48,10 @@ use cockpit_terminal::live::{LiveTerminal, WakeFn};
 use cockpit_terminal::path_detect::detect_paths;
 use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
-// Zellij launch planning is being decommissioned (v0.7 M7.9). The native
-// multiplexer handles all spawn / split / window concerns now, so cockpit
-// no longer pulls `LaunchPlan` / `plan_launch` into its terminal path. The
-// `cockpit_terminal::zellij::CommandSpec` type stays in use for shell spawn
-// specs until the cleanup PR migrates it to a dedicated module.
+// Zellij launch planning is decommissioned (v0.7 M7.9). The native
+// multiplexer handles all spawn / split / window concerns; cockpit
+// pulls only `CommandSpec` (now at the crate root) from
+// `cockpit-terminal`.
 use cockpit_ui::{
     CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, FileBrowser, FileBrowserAction,
     FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput,
@@ -4231,26 +4230,26 @@ fn copy_to_os_clipboard(text: &str) -> Result<(), arboard::Error> {
 }
 
 /// Default interactive shell command for a fresh mux pane (v0.7 M7.9).
-fn host_shell_spec() -> cockpit_terminal::zellij::CommandSpec {
+fn host_shell_spec() -> cockpit_terminal::CommandSpec {
     if cfg!(windows) {
-        cockpit_terminal::zellij::CommandSpec::new("powershell.exe", Vec::<String>::new())
+        cockpit_terminal::CommandSpec::new("powershell.exe", Vec::<String>::new())
     } else {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        cockpit_terminal::zellij::CommandSpec::new(shell, Vec::<String>::new())
+        cockpit_terminal::CommandSpec::new(shell, Vec::<String>::new())
     }
 }
 
 /// Wrap a `cockpit_layout` pane command in the host shell so the user's
 /// command string supports the usual quoting / pipes / globs (M7.8). On
 /// Windows we run through `cmd.exe /C`; everywhere else `sh -c`.
-fn shell_command_spec(command: &str) -> cockpit_terminal::zellij::CommandSpec {
+fn shell_command_spec(command: &str) -> cockpit_terminal::CommandSpec {
     if cfg!(windows) {
-        cockpit_terminal::zellij::CommandSpec::new(
+        cockpit_terminal::CommandSpec::new(
             "cmd.exe".to_string(),
             vec!["/C".to_string(), command.to_string()],
         )
     } else {
-        cockpit_terminal::zellij::CommandSpec::new(
+        cockpit_terminal::CommandSpec::new(
             "sh".to_string(),
             vec!["-c".to_string(), command.to_string()],
         )

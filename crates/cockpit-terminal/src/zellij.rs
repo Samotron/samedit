@@ -1,29 +1,16 @@
-//! Zellij launch planning.
+//! Zellij launch planning (deprecated — v0.7 M7.9).
 //!
-//! This module is pure command construction plus injectable binary lookup. The
-//! PTY layer later consumes [`CommandSpec`] to spawn the selected command.
+//! The embedded multiplexer (`cockpit-mux`) replaces this layer. The module
+//! stays in the crate while existing callers wind down; the PTY layer's
+//! [`CommandSpec`] now lives under [`crate::command`] and is re-exported here
+//! for backwards compatibility.
 
 use std::{
     env,
     path::{Path, PathBuf},
 };
 
-/// A process command ready for the PTY layer to spawn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandSpec {
-    pub program: String,
-    pub args: Vec<String>,
-}
-
-impl CommandSpec {
-    /// Create a command specification.
-    pub fn new(program: impl Into<String>, args: impl Into<Vec<String>>) -> Self {
-        Self {
-            program: program.into(),
-            args: args.into(),
-        }
-    }
-}
+pub use crate::command::CommandSpec;
 
 /// Reason the launcher selected a plain-shell fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
