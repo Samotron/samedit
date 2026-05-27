@@ -992,6 +992,46 @@ impl Session {
         }
     }
 
+    /// Build a session from a [`LayoutDescription`] tree, allocating fresh
+    /// pane ids in left-to-right / top-to-bottom order. The returned vector
+    /// pairs each allocated pane id with its first-attach command (M7.8)
+    /// so the caller can spawn the PTYs without re-walking the tree.
+    pub fn from_layout(
+        name: impl Into<String>,
+        description: &LayoutDescription,
+    ) -> (Self, Vec<(PaneId, Option<String>)>) {
+        let mut ids = Ids::default();
+        let first_window_id = ids.window();
+        let mut pane_commands: Vec<(PaneId, Option<String>)> = Vec::new();
+        let layout = build_layout_node(description, &mut ids, &mut pane_commands);
+        let active = pane_commands
+            .first()
+            .map(|(pane, _)| *pane)
+            .unwrap_or(PaneId(0));
+        let panes = pane_commands
+            .iter()
+            .map(|(id, _)| Pane::new(*id))
+            .collect::<Vec<_>>();
+        let window = Window {
+            id: first_window_id,
+            name: "0".to_string(),
+            layout,
+            active,
+            layout_preset: LayoutPreset::EvenHorizontal,
+            zoomed: None,
+            panes,
+        };
+        let session = Self {
+            id: SessionId(1),
+            name: name.into(),
+            windows: vec![window],
+            active: first_window_id,
+            next_window: ids.next_window,
+            next_pane: ids.next_pane,
+        };
+        (session, pane_commands)
+    }
+
     /// Headless snapshot of the data a status line / mode-line (M7.7)
     /// needs to draw: session name plus per-window index, name, and
     /// active marker. Time and task fields are external inputs the
@@ -1036,6 +1076,61 @@ impl Session {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
         id
+    }
+}
+
+/// Recursive description of a layout to build from config (v0.7 M7.8).
+/// Independent of [`PaneId`] allocation — `Session::from_layout` walks the
+/// description and allocates fresh ids.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayoutDescription {
+    /// Leaf pane with an optional command to run on first attach.
+    Pane { command: Option<String> },
+    /// Recursive split between two child descriptions.
+    Split {
+        direction: SplitDirection,
+        ratio: f32,
+        a: Box<LayoutDescription>,
+        b: Box<LayoutDescription>,
+    },
+}
+
+impl LayoutDescription {
+    /// Total leaf-pane count under this description.
+    pub fn pane_count(&self) -> usize {
+        match self {
+            Self::Pane { .. } => 1,
+            Self::Split { a, b, .. } => a.pane_count() + b.pane_count(),
+        }
+    }
+}
+
+fn build_layout_node(
+    description: &LayoutDescription,
+    ids: &mut Ids,
+    pane_commands: &mut Vec<(PaneId, Option<String>)>,
+) -> LayoutNode {
+    match description {
+        LayoutDescription::Pane { command } => {
+            let pane = ids.pane();
+            pane_commands.push((pane, command.clone()));
+            LayoutNode::Leaf { pane }
+        }
+        LayoutDescription::Split {
+            direction,
+            ratio,
+            a,
+            b,
+        } => {
+            let a = build_layout_node(a, ids, pane_commands);
+            let b = build_layout_node(b, ids, pane_commands);
+            LayoutNode::Split {
+                dir: *direction,
+                ratio: clamp_ratio(*ratio),
+                a: Box::new(a),
+                b: Box::new(b),
+            }
+        }
     }
 }
 
@@ -2259,6 +2354,61 @@ mod tests {
           "next_pane": 3
         }
         "#);
+    }
+
+    #[test]
+    fn from_layout_builds_a_single_pane_session() {
+        let description = LayoutDescription::Pane {
+            command: Some("cargo watch -x test".to_string()),
+        };
+        let (session, pane_commands) = Session::from_layout("dev", &description);
+
+        assert_eq!(session.windows.len(), 1);
+        assert_eq!(session.active_window().panes.len(), 1);
+        assert_eq!(pane_commands.len(), 1);
+        assert_eq!(pane_commands[0].1.as_deref(), Some("cargo watch -x test"));
+        assert_eq!(session.active_pane().id, pane_commands[0].0);
+    }
+
+    #[test]
+    fn from_layout_builds_nested_splits_in_leaf_order() {
+        let description = LayoutDescription::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.6,
+            a: Box::new(LayoutDescription::Pane {
+                command: Some("editor".to_string()),
+            }),
+            b: Box::new(LayoutDescription::Split {
+                direction: SplitDirection::Vertical,
+                ratio: 0.5,
+                a: Box::new(LayoutDescription::Pane { command: None }),
+                b: Box::new(LayoutDescription::Pane {
+                    command: Some("lazygit".to_string()),
+                }),
+            }),
+        };
+        let (session, pane_commands) = Session::from_layout("dev", &description);
+
+        assert_eq!(pane_commands.len(), 3);
+        assert_eq!(
+            pane_commands
+                .iter()
+                .map(|(_, cmd)| cmd.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("editor".to_string()),
+                None,
+                Some("lazygit".to_string())
+            ]
+        );
+        match &session.active_window().layout {
+            LayoutNode::Split { dir, ratio, .. } => {
+                assert_eq!(*dir, SplitDirection::Horizontal);
+                assert!((ratio - 0.6).abs() < f32::EPSILON);
+            }
+            other => panic!("expected split root, got {other:?}"),
+        }
+        assert_eq!(session.active_pane().id, pane_commands[0].0);
     }
 
     #[test]

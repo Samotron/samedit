@@ -145,12 +145,18 @@ pub struct EnvVar {
 }
 
 /// Optional `[metadata.cockpit]` block from `mise.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CockpitMetadata {
     pub name: Option<String>,
     pub default_task: Option<String>,
     pub terminal_workspace: Option<String>,
+    /// Legacy Zellij layout path (removed in v0.7 M7.9; kept here while the
+    /// transition lands so existing projects keep parsing).
     pub zellij_layout: Option<PathBuf>,
+    /// Native multiplexer layout (v0.7 M7.8). Parsed by
+    /// [`cockpit_config::CockpitLayout`].
+    pub cockpit_layout: Option<PathBuf>,
 }
 
 /// Parse `mise.toml` / `.mise.toml` from a project root.
@@ -866,6 +872,26 @@ zellij_layout = ".config/zellij/dev.kdl"
             project.metadata.unwrap().zellij_layout,
             Some(PathBuf::from(".config/zellij/dev.kdl"))
         );
+    }
+
+    #[test]
+    fn parses_native_cockpit_layout_metadata() {
+        let input = r#"
+[tools]
+rust = "1.88"
+
+[metadata.cockpit]
+name = "Native Mux"
+cockpit_layout = ".config/cockpit/dev.kdl"
+"#;
+        let project = parse_mise_toml(input).unwrap();
+        let metadata = project.metadata.expect("metadata block parsed");
+        assert_eq!(metadata.name.as_deref(), Some("Native Mux"));
+        assert_eq!(
+            metadata.cockpit_layout,
+            Some(PathBuf::from(".config/cockpit/dev.kdl"))
+        );
+        assert_eq!(metadata.zellij_layout, None);
     }
 
     #[test]

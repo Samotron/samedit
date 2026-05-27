@@ -936,8 +936,20 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   leaf `pane` nodes with optional `command` strings (run on first
   attach). Smaller surface than the Zellij KDL — no plugin slots, no
   themes, no swap layouts (out of scope per AGENTS §2 hard rule #7).
-- Loader lives in `cockpit-config::layout` (rename of
-  `cockpit-config::zellij_layout`).
+- Loader lives in `cockpit-config::cockpit_layout`. ✅
+  `CockpitLayout::from_kdl` / `::load` parse the schema into a
+  `CockpitLayoutNode` tree with optional per-pane commands.
+  `cockpit_mux::LayoutDescription` is the matching, runtime-side
+  description type, and `Session::from_layout(name, description)`
+  builds a session whose layout tree, pane ids, and active pane all
+  derive from the description plus a `Vec<(PaneId, Option<String>)>`
+  the caller can spawn against on first attach. The cockpit binary
+  wire-up (parse layout from project metadata, build session, run
+  per-pane commands) is the next sub-task.
+- `CockpitMetadata::cockpit_layout` joins the existing `zellij_layout`
+  field on the project metadata block so the v0.7 multiplexer can
+  pick up the new schema while the legacy Zellij wiring is still
+  live; M7.9 removes the Zellij field.
 
 ### M7.9 — Remove Zellij surface
 
