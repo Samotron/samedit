@@ -32,7 +32,7 @@ use cockpit_notebook::{
     CellKind, Notebook, is_notebook_source, parse_notebook, parse_quarto, quarto_render_spec,
 };
 use cockpit_project::{
-    FileNodeKind, FileSystem, FileTree, FormatPlan, KnownFormatter,
+    BinaryLookup, FileNodeKind, FileSystem, FileTree, FormatPlan, KnownFormatter,
     PathBinaryLookup as FormatPathLookup, ProcessRunner, ProcessSpec, ProjectCache,
     ProjectDetection, StdFileSystem, StdProcessRunner, mise_exec_command, plan_format,
     project_cache_path, render_format_task_snippet, walk_project_files,
@@ -1329,12 +1329,20 @@ impl AppModel {
     /// Run a tool-pane recipe by name (v0.8 M8.2). The recipe's command is
     /// sent to the active terminal pane, with the layout slot tracked in the
     /// status line. Floating-pane and side-pane spawn behaviour land in a
-    /// follow-up.
+    /// follow-up. Missing binaries surface a friendly toast rather than
+    /// auto-installing (AGENTS §2 hard rule #6).
     fn run_tool_recipe(&mut self, name: &str) {
         let Some(recipe) = self.tool_recipes.get(name).cloned() else {
             self.status = format!("Tool `{name}` not configured.");
             return;
         };
+        let binary = recipe.detect_binary().to_string();
+        if !self.tool_binary_available(&binary) {
+            self.status = format!(
+                "Tool `{name}` — `{binary}` not found. Try `mise use {binary}@latest` or install it on PATH.",
+            );
+            return;
+        }
         self.ensure_terminal();
         let payload = format!("{}\r", recipe.command);
         match self.active_terminal_mut() {
@@ -1350,6 +1358,23 @@ impl AppModel {
             },
             None => self.status = format!("Tool `{name}` — terminal unavailable."),
         }
+    }
+
+    /// True when `binary` is reachable via the project's mise tools or
+    /// the host `$PATH` (v0.8 M8.2 detect path). The mise side is a name
+    /// match against `[tools]` — the actual `mise exec --` probe is
+    /// future work once a real user asks for it.
+    fn tool_binary_available(&self, binary: &str) -> bool {
+        if self
+            .detection
+            .mise
+            .tools
+            .iter()
+            .any(|tool| tool.name == binary)
+        {
+            return true;
+        }
+        FormatPathLookup.exists(binary)
     }
 
     /// Palette entries derived from the registered tool-pane recipes.
@@ -5726,6 +5751,34 @@ cockpit_layout = "missing.kdl"
             model.status.contains("not configured"),
             "status: {}",
             model.status,
+        );
+    }
+
+    #[test]
+    fn tool_recipe_with_missing_binary_surfaces_install_hint() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.clear();
+        config.panes.tools.insert(
+            "made-up-tool".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "made-up-tool".to_string(),
+                detect: "made-up-tool-binary-that-does-not-exist".to_string(),
+                ..Default::default()
+            },
+        );
+        model.apply_user_config(&config);
+
+        model.run_command("tool.made-up-tool");
+        assert!(
+            model.status.contains("not found"),
+            "status: {}",
+            model.status
+        );
+        assert!(
+            model.status.contains("mise use"),
+            "status: {}",
+            model.status
         );
     }
 
