@@ -1,15 +1,12 @@
 //! `cockpit-config` — typed user and project configuration.
 //!
-//! Loads the user config (spec §20) from TOML, Zellij layout files from
-//! KDL (see [`zellij_layout`]), and the native cockpit multiplexer layout
-//! files (see [`cockpit_layout`]) introduced in v0.7 M7.8. Pure data +
-//! parsing; no I/O side effects beyond reading files.
+//! Loads the user config (spec §20) from TOML and the native cockpit
+//! multiplexer layout files (see [`cockpit_layout`]) introduced in v0.7
+//! M7.8. Pure data + parsing; no I/O side effects beyond reading files.
 
 pub mod cockpit_layout;
-pub mod zellij_layout;
 
 pub use cockpit_layout::{CockpitLayout, CockpitLayoutNode, CockpitSplitDirection};
-pub use zellij_layout::ZellijLayout;
 
 use std::{collections::BTreeMap, fs, io, path::Path};
 
@@ -244,8 +241,6 @@ pub enum ConfigError {
     Read(#[source] io::Error),
     #[error("failed to parse config: {0}")]
     Parse(#[source] toml::de::Error),
-    #[error("invalid Zellij layout: {0}")]
-    ZellijLayout(String),
     #[error("invalid cockpit layout: {0}")]
     CockpitLayout(String),
 }

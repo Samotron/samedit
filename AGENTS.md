@@ -11,12 +11,12 @@ the authoritative stack/architecture. Where the two disagree, the plan wins
 ## 1. What this project is
 
 A fast, native, multi-platform **coding cockpit** in Rust: project launcher +
-file browser + Vim-style editor + Zellij terminal pane. Think
-"JetBrains-style project IDE, terminal-first, Vim-centred".
+file browser + Vim-style editor + embedded multiplexer (`cockpit-mux`).
+Think "JetBrains-style project IDE, terminal-first, Vim-centred".
 
 One-line stack: **Rust + Cargo workspace + winit/glow + termwiz/portable-pty +
-ropey + mise + Zellij**. `mise` is also the only developer task runner — there
-is no `justfile`, no `make`, no `xtask`.
+ropey + mise + native multiplexer (`cockpit-mux`)**. `mise` is also the only
+developer task runner — there is no `justfile`, no `make`, no `xtask`.
 
 ---
 
@@ -84,7 +84,8 @@ samedit/                            # Cargo workspace root
 │   ├── cockpit-project/            # detection, mise, project cache, file tree
 │   │                               #  + env::{FileSystem,ProcessRunner,Clock}
 │   │                               #    seams (M4.10)
-│   ├── cockpit-terminal/           # pty, termwiz engine, zellij, path detect
+│   ├── cockpit-mux/                # native multiplexer state (M7.2+)
+│   ├── cockpit-terminal/           # pty, termwiz engine, path detect
 │   ├── cockpit-lsp/                # LSP transport — codec, JSON-RPC, client
 │   ├── cockpit-commands/           # command registry + keybinding resolution
 │   ├── cockpit-config/             # serde config types, TOML/KDL loading
@@ -116,7 +117,8 @@ should never gain a window/GPU dependency.
 | Buffer / cursor / undo / Vim mode logic  | `cockpit-editor`         |
 | Project detection, mise parsing, tasks   | `cockpit-project`        |
 | Filesystem / process / clock seams       | `cockpit-project::env`   |
-| PTY, terminal engine, Zellij, path parse | `cockpit-terminal`       |
+| PTY, terminal engine, path parse         | `cockpit-terminal`       |
+| Mux state (sessions/windows/panes)       | `cockpit-mux`            |
 | LSP codec / JSON-RPC / client transport  | `cockpit-lsp`            |
 | A new command ID or keybinding           | `cockpit-commands`       |
 | Config schema, TOML/KDL parsing          | `cockpit-config`         |

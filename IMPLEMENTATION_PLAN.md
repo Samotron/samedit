@@ -1004,13 +1004,16 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   `ensure_terminal` always spawns the host shell directly through the
   embedded multiplexer; `plan_launch` / `LaunchPlan` / `ShellProfile` /
   `PathBinaryLookup` / `resolve_zellij_layout` are out of the cockpit
-  binary. The `--print` CLI surfaces `cockpit_layout` next to the
-  legacy `zellij_layout` (now marked deprecated). Removing the
-  `crates/cockpit-terminal/src/zellij.rs` module itself plus the
-  corresponding `cockpit-config::zellij_layout` and metadata field is
-  the remaining cleanup — deferred so existing user configs that still
-  reference `zellij_layout` keep parsing while the spec / AGENTS docs
-  catch up.
+  binary. `crates/cockpit-terminal/src/zellij.rs` and
+  `crates/cockpit-config/src/zellij_layout.rs` are deleted along with
+  the `ConfigError::ZellijLayout` variant; `CommandSpec` moved to
+  `cockpit_terminal::command::CommandSpec`. The `--print` CLI keeps
+  surfacing the legacy `zellij_layout` field as "deprecated, ignored"
+  so existing user configs that still reference it keep parsing —
+  the `CockpitMetadata::zellij_layout` field is preserved for
+  serde compatibility but no code reads it. AGENTS.md now points at
+  the embedded multiplexer in §1 and §3–§4; updating spec.md §10 /
+  §9 / §20 / §25 is the remaining doc churn.
 
 ### M7.10 — Windows parity
 
