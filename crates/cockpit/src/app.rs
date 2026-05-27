@@ -61,6 +61,9 @@ pub const HEADER_H: f32 = 24.0;
 pub const ROW_H: f32 = 20.0;
 pub const FONT: f32 = 13.0;
 pub const PAD: f32 = 8.0;
+/// Height of the native mux mode-line strip at the bottom of the terminal
+/// pane (v0.7 M7.7).
+pub const STATUS_LINE_H: f32 = 18.0;
 pub const GUTTER_W: f32 = 52.0;
 pub const INDENT_W: f32 = 14.0;
 /// Monospace advance estimate, as a fraction of the font size.
@@ -855,12 +858,15 @@ impl AppModel {
     }
 
     fn mux_pane_rects_for_terminal(&self, rect: UiRect) -> Vec<cockpit_mux::PaneRect> {
+        // Reserve the bottom mode-line strip (M7.7) so hit-tests and layout
+        // share the same pane bounds the painter uses.
+        let reserved = HEADER_H as u32 + STATUS_LINE_H as u32;
         self.mux_session.active_window().pane_rects(
             MuxRect::new(
                 rect.x,
                 rect.y + TOP_BAR_H as u32 + HEADER_H as u32,
                 rect.width,
-                rect.height.saturating_sub(HEADER_H as u32),
+                rect.height.saturating_sub(reserved),
             ),
             1,
         )
@@ -3752,31 +3758,50 @@ impl AppModel {
 
     fn paint_terminal(&self, canvas: &mut Canvas<'_>, rect: UiRect, focused: bool) {
         let content = self.paint_pane(canvas, rect, "TERMINAL", focused);
+        let status_h = STATUS_LINE_H.min(content.h);
+        let pane_area_h = (content.h - status_h).max(0.0);
         let pane_rects = self.mux_session.active_window().pane_rects(
             MuxRect::new(
                 content.x.max(0.0) as u32,
                 content.y.max(0.0) as u32,
                 content.w.max(0.0) as u32,
-                content.h.max(0.0) as u32,
+                pane_area_h.max(0.0) as u32,
             ),
             1,
         );
         if pane_rects.len() == 1 && !self.terminals.contains_key(&pane_rects[0].pane) {
             self.paint_terminal_placeholder(canvas, &content);
-            return;
+        } else {
+            for pane in pane_rects {
+                if self.mux_session.active_window().layout.leaves().len() > 1 {
+                    self.paint_mux_pane_frame(canvas, pane, focused);
+                }
+                match self.terminals.get(&pane.pane) {
+                    Some(terminal) => {
+                        self.paint_terminal_grid(canvas, pane, terminal, focused && pane.active)
+                    }
+                    None => self.paint_mux_placeholder(canvas, pane, "pending PTY"),
+                }
+            }
         }
 
-        for pane in pane_rects {
-            if self.mux_session.active_window().layout.leaves().len() > 1 {
-                self.paint_mux_pane_frame(canvas, pane, focused);
-            }
-            match self.terminals.get(&pane.pane) {
-                Some(terminal) => {
-                    self.paint_terminal_grid(canvas, pane, terminal, focused && pane.active)
-                }
-                None => self.paint_mux_placeholder(canvas, pane, "pending PTY"),
-            }
+        // M7.7 mode-line: bottom strip across the full pane width.
+        let status_y = content.y + content.h - status_h;
+        self.paint_mux_status_line(canvas, content.x, status_y, content.w, status_h);
+    }
+
+    /// Paint the native mux mode-line at the bottom of the terminal area
+    /// (v0.7 M7.7). Renders the default `StatusSummary` format on a
+    /// theme-accented background.
+    fn paint_mux_status_line(&self, canvas: &mut Canvas<'_>, x: f32, y: f32, w: f32, h: f32) {
+        if h <= 0.0 || w <= 0.0 {
+            return;
         }
+        canvas.rect(x, y, w, h, self.theme.accent);
+        let summary = self.mux_session.status_summary();
+        let text = summary.render(&[]);
+        let baseline = y + (h - FONT).max(0.0) * 0.5 + FONT * 0.85;
+        canvas.text(x + PAD, baseline, text, self.theme.background, FONT);
     }
 
     fn paint_terminal_placeholder(&self, canvas: &mut Canvas<'_>, content: &ContentRect) {
@@ -5945,6 +5970,34 @@ cockpit_layout = "missing.kdl"
         assert!(
             !painter.commands().is_empty(),
             "paint produced no draw commands"
+        );
+    }
+
+    #[test]
+    fn paint_terminal_emits_mux_status_line_at_the_bottom() {
+        let mut model = model();
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+
+        let texts: Vec<String> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.clone()),
+                _ => None,
+            })
+            .collect();
+        let summary = model.mux_session.status_summary().render(&[]);
+        assert!(
+            texts.iter().any(|text| text == &summary),
+            "expected `{summary}` in painted text, got {texts:?}"
         );
     }
 

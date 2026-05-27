@@ -929,10 +929,13 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   `StatusSummary::render(extras)` produces the default tmux-style
   `[<session>] 0:name 1:name* …` formatted line, with optional
   `extras` (time, mise task, etc.) appended after a `│` separator.
-  The mode-line strip painter and config-driven format string remain
-  the next sub-task — the wire-up surfaces today via
-  `Debug: Show Mux Status` in the palette so the data layer is usable
-  before the painter lands.
+- Painter: `paint_terminal` reserves an `STATUS_LINE_H` strip at the
+  bottom of the terminal pane and renders the rendered status text on
+  a theme-accent background. The mux pane-rect projection used by
+  hit-tests, drags, and resize-sync now subtracts the same strip so
+  the painted strip and the layout share bounds. Configurable format
+  strings (spec §20 `terminal.status.format`) plus live `time` /
+  `mise task` extras are the next sub-task.
 
 ### M7.8 — Native layout config
 
