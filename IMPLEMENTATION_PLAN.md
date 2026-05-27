@@ -879,8 +879,15 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   registry-created session a disjoint id stride
   (`SESSION_ID_STRIDE = 1_000_000`) via the new
   `Session::with_id_base` constructor — splits inside that session keep
-  allocating within its own range. The actual `Ctrl+b d` /
-  session-list overlay UI and PTY-key rewiring are the next sub-task.
+  allocating within its own range.
+- Binary wire-up (single-session slice): `AppModel::mux_attached` is
+  the visible-vs-overlay flag. `Ctrl+b d` (`mux.session.detach`)
+  toggles it; while detached the terminal pane paints a
+  "Detached — Enter to re-attach" overlay (the mode-line stays so the
+  user knows which session is parked) and the PTY keeps running in the
+  background. Enter on the terminal pane re-attaches. Multi-session
+  switching via the SessionRegistry + an overlay list is the next
+  sub-task.
 - Tests: scripted detach → attach round-trip preserves the layout tree
   and pane focus.
 

@@ -321,6 +321,10 @@ pub struct AppModel {
     /// Most recently kicked-off mise task (v0.7 M7.7 status line extra).
     /// Surfaced as `task:<name>` in the mode-line.
     last_mise_task: Option<String>,
+    /// True when the workspace is attached to the mux session; false after
+    /// `Ctrl+b d` until the user re-attaches via Enter on the session-list
+    /// overlay (v0.7 M7.5). PTYs keep running while detached.
+    mux_attached: bool,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -429,6 +433,7 @@ impl AppModel {
             mux_copy_yank: None,
             mux_pane_commands: HashMap::new(),
             last_mise_task: None,
+            mux_attached: true,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -1004,9 +1009,7 @@ impl AppModel {
             mux_command_ids::PASTE => {
                 self.status = "Mux: paste uses copy-mode buffer in M7.6.".to_string();
             }
-            mux_command_ids::DETACH => {
-                self.status = "Mux: detach/attach lands in M7.5.".to_string();
-            }
+            mux_command_ids::DETACH => self.mux_toggle_detach(),
             other => {
                 if let Some(index) = mux_select_window_index(other) {
                     self.mux_select_window(index);
@@ -1085,6 +1088,21 @@ impl AppModel {
     fn mux_enter_copy_mode(&mut self) {
         let pane = self.mux_session.enter_copy_mode();
         self.status = format!("Mux: copy mode entered for {pane}.");
+    }
+
+    /// Toggle the workspace attached-to-mux flag (v0.7 M7.5 `Ctrl+b d`).
+    /// PTYs keep running in the background while detached; the terminal
+    /// pane paints a session-list overlay instead of the grid.
+    fn mux_toggle_detach(&mut self) {
+        if self.mux_attached {
+            self.mux_attached = false;
+            let name = self.mux_session.name.clone();
+            self.status = format!("Mux: detached from session `{name}`. Press Enter to reattach.");
+        } else {
+            self.mux_attached = true;
+            let name = self.mux_session.name.clone();
+            self.status = format!("Mux: re-attached to session `{name}`.");
+        }
     }
 
     fn mux_new_window(&mut self) {
@@ -1715,6 +1733,17 @@ impl AppModel {
 
     /// Forward a chord to the PTY when the terminal pane is focused.
     fn handle_terminal_key(&mut self, chord: &KeyChord) {
+        // When detached, the prefix path still works (so `Ctrl+b d` toggles
+        // back), but Enter is the explicit reattach key for the overlay.
+        if !self.mux_attached {
+            if self.handle_mux_prefix(chord) {
+                return;
+            }
+            if chord == &KeyChord::single("Enter", Modifiers::NONE) {
+                self.mux_toggle_detach();
+            }
+            return;
+        }
         if self.handle_mux_prefix(chord) {
             return;
         }
@@ -3765,6 +3794,12 @@ impl AppModel {
         let content = self.paint_pane(canvas, rect, "TERMINAL", focused);
         let status_h = STATUS_LINE_H.min(content.h);
         let pane_area_h = (content.h - status_h).max(0.0);
+        if !self.mux_attached {
+            self.paint_mux_detached_overlay(canvas, &content, pane_area_h);
+            let status_y = content.y + content.h - status_h;
+            self.paint_mux_status_line(canvas, content.x, status_y, content.w, status_h);
+            return;
+        }
         let pane_rects = self.mux_session.active_window().pane_rects(
             MuxRect::new(
                 content.x.max(0.0) as u32,
@@ -3793,6 +3828,35 @@ impl AppModel {
         // M7.7 mode-line: bottom strip across the full pane width.
         let status_y = content.y + content.h - status_h;
         self.paint_mux_status_line(canvas, content.x, status_y, content.w, status_h);
+    }
+
+    /// Paint the "detached — Enter to reattach" overlay (v0.7 M7.5)
+    /// inside the terminal pane area, leaving the mode-line strip
+    /// untouched for the caller.
+    fn paint_mux_detached_overlay(
+        &self,
+        canvas: &mut Canvas<'_>,
+        content: &ContentRect,
+        pane_area_h: f32,
+    ) {
+        let name = &self.mux_session.name;
+        let lines = [
+            "Detached".to_string(),
+            format!("Session: {name}"),
+            String::new(),
+            "Press Enter to re-attach, or Ctrl+b d to toggle.".to_string(),
+        ];
+        let total_h = lines.len() as f32 * ROW_H;
+        let start_y = content.y + (pane_area_h - total_h).max(0.0) * 0.5 + FONT;
+        for (i, line) in lines.iter().enumerate() {
+            canvas.text(
+                content.x + PAD,
+                start_y + i as f32 * ROW_H,
+                line,
+                self.theme.text,
+                FONT,
+            );
+        }
     }
 
     /// Paint the native mux mode-line at the bottom of the terminal area
@@ -5354,6 +5418,58 @@ cockpit_layout = "missing.kdl"
             model.status.contains("cockpit_layout ignored"),
             "status: {}",
             model.status
+        );
+    }
+
+    #[test]
+    fn mux_detach_command_flips_attached_and_enter_reattaches() {
+        let mut model = model();
+        assert!(model.mux_attached);
+
+        model.run_command(mux_command_ids::DETACH);
+        assert!(!model.mux_attached);
+        assert!(
+            model.status.contains("detached"),
+            "status: {}",
+            model.status
+        );
+
+        // While detached, terminal-focused Enter reattaches.
+        model.layout.focus(PaneId::Terminal);
+        model.dispatch(chord("Enter"));
+        assert!(model.mux_attached);
+        assert!(
+            model.status.contains("re-attached"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn mux_detached_paint_shows_overlay_instead_of_terminal_grid() {
+        let mut model = model();
+        model.run_command(mux_command_ids::DETACH);
+
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+        let texts: Vec<String> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "Detached"),
+            "expected detached overlay, got {texts:?}"
         );
     }
 
