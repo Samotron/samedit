@@ -195,7 +195,10 @@ fn print_detection(detection: &ProjectDetection) {
                 println!("    terminal_workspace = {terminal_workspace}");
             }
             if let Some(layout) = cockpit.zellij_layout.as_deref() {
-                println!("    zellij_layout = {}", layout.display());
+                println!("    zellij_layout = {} (deprecated)", layout.display());
+            }
+            if let Some(layout) = cockpit.cockpit_layout.as_deref() {
+                println!("    cockpit_layout = {}", layout.display());
             }
         }
     }

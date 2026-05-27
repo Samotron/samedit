@@ -1000,6 +1000,17 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
 - Update [`AGENTS.md`](AGENTS.md) §3–§4: rename
   "zellij" → "embedded multiplexer (`cockpit-mux`)" in the layout +
   decision table.
+- Progress: cockpit no longer spawns Zellij from its own terminal path.
+  `ensure_terminal` always spawns the host shell directly through the
+  embedded multiplexer; `plan_launch` / `LaunchPlan` / `ShellProfile` /
+  `PathBinaryLookup` / `resolve_zellij_layout` are out of the cockpit
+  binary. The `--print` CLI surfaces `cockpit_layout` next to the
+  legacy `zellij_layout` (now marked deprecated). Removing the
+  `crates/cockpit-terminal/src/zellij.rs` module itself plus the
+  corresponding `cockpit-config::zellij_layout` and metadata field is
+  the remaining cleanup — deferred so existing user configs that still
+  reference `zellij_layout` keep parsing while the spec / AGENTS docs
+  catch up.
 
 ### M7.10 — Windows parity
 

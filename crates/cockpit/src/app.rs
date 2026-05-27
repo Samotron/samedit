@@ -15,7 +15,7 @@ use cockpit_analytics::{
     AnalyticsProject, BuildPlan, Materialisation, build_plan, detect_analytics_project,
 };
 use cockpit_commands::{KeyChord, Modifiers};
-use cockpit_config::{GlobalKeys, ZellijLayout};
+use cockpit_config::GlobalKeys;
 use cockpit_editor::vim::{Key as VimKey, Mode};
 use cockpit_editor::{
     Editor, EditorSignal, HighlightKind, HighlightSpan, Language, nearest_test_name,
@@ -48,7 +48,11 @@ use cockpit_terminal::live::{LiveTerminal, WakeFn};
 use cockpit_terminal::path_detect::detect_paths;
 use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
-use cockpit_terminal::zellij::{LaunchPlan, PathBinaryLookup, ShellProfile, plan_launch};
+// Zellij launch planning is being decommissioned (v0.7 M7.9). The native
+// multiplexer handles all spawn / split / window concerns now, so cockpit
+// no longer pulls `LaunchPlan` / `plan_launch` into its terminal path. The
+// `cockpit_terminal::zellij::CommandSpec` type stays in use for shell spawn
+// specs until the cleanup PR migrates it to a dedicated module.
 use cockpit_ui::{
     CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, FileBrowser, FileBrowserAction,
     FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput,
@@ -1773,27 +1777,6 @@ impl AppModel {
         }
     }
 
-    /// Resolve the optional per-project Zellij layout file (spec §9 / §10 v0.3).
-    /// Returns the absolute path on a successful KDL parse; surfaces a status
-    /// warning and falls back to no-layout on read/parse errors so a broken
-    /// layout never blocks the terminal from launching.
-    fn resolve_zellij_layout(&mut self) -> Option<PathBuf> {
-        let configured = self
-            .detection
-            .mise
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.zellij_layout.as_deref())?;
-        let absolute = self.detection.root_path.join(configured);
-        match ZellijLayout::load(&absolute) {
-            Ok(layout) => Some(layout.path),
-            Err(err) => {
-                self.status = format!("Zellij layout {} ignored: {err}", configured.display(),);
-                None
-            }
-        }
-    }
-
     /// Spawn the active mux pane's terminal session on first use.
     fn ensure_terminal(&mut self) {
         let pane = self.mux_session.active_window().active;
@@ -1809,25 +1792,10 @@ impl AppModel {
             let label = format!("layout `{layout_command}`");
             (spec, label)
         } else {
-            let layout = self.resolve_zellij_layout();
-            let plan = plan_launch(
-                &self.detection.display_name,
-                layout.as_deref(),
-                &PathBinaryLookup,
-                ShellProfile::host_default(),
-            );
-            match plan {
-                LaunchPlan::Zellij(command) => {
-                    let label = match layout.as_deref() {
-                        Some(path) => format!("zellij ({})", path.display()),
-                        None => "zellij".to_string(),
-                    };
-                    (command, label)
-                }
-                LaunchPlan::Fallback { command, reason } => {
-                    (command, format!("shell — {reason:?}"))
-                }
-            }
+            // v0.7 M7.9: native multiplexer replaces Zellij. Default panes
+            // spawn the host shell directly — splits and windows are owned
+            // by `cockpit-mux`, not by an external workspace tool.
+            (host_shell_spec(), "shell".to_string())
         };
         let wake: WakeFn = Box::new(move || redraw.request());
         match LiveTerminal::spawn(&command, PtyDimensions::new(24, 80), wake) {
@@ -4027,8 +3995,8 @@ impl AppModel {
             "Integrated terminal",
             "",
             "Focus this pane (Ctrl+L) to start a session.",
-            "Runs the project's Zellij workspace when mise and",
-            "zellij are on PATH; otherwise a plain shell.",
+            "Spawns the host shell in the embedded multiplexer;",
+            "splits via Ctrl+b % / \", windows via Ctrl+b c.",
         ];
         let top = content.y + PAD;
         for (index, line) in lines.iter().enumerate() {
@@ -4260,6 +4228,16 @@ fn is_chord(chord: &KeyChord, key: &str) -> bool {
 fn copy_to_os_clipboard(text: &str) -> Result<(), arboard::Error> {
     let mut clipboard = arboard::Clipboard::new()?;
     clipboard.set_text(text.to_string())
+}
+
+/// Default interactive shell command for a fresh mux pane (v0.7 M7.9).
+fn host_shell_spec() -> cockpit_terminal::zellij::CommandSpec {
+    if cfg!(windows) {
+        cockpit_terminal::zellij::CommandSpec::new("powershell.exe", Vec::<String>::new())
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        cockpit_terminal::zellij::CommandSpec::new(shell, Vec::<String>::new())
+    }
 }
 
 /// Wrap a `cockpit_layout` pane command in the host shell so the user's
