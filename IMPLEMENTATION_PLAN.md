@@ -870,6 +870,13 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   session tree + each PTY's scrollback on shutdown) is M7.5a, deferred.
   Spec §10 explicitly does not promise tmux's "survive cockpit exit"
   behaviour yet — say so.
+- Headless data model: `cockpit_mux::SessionRegistry` holds every
+  in-flight `Session`, tracks which is active and whether the workspace
+  is attached, allocates fresh session ids on `create` / `add`, and
+  exposes `detach` / `attach(id)` / `kill(id)` operations.
+  `Session::set_name` is the rename hook the overlay will drive.
+  Cross-session pane-id allocation, the actual `Ctrl+b d` /
+  session-list overlay UI, and PTY-key rewiring are the next sub-task.
 - Tests: scripted detach → attach round-trip preserves the layout tree
   and pane focus.
 

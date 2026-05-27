@@ -1066,6 +1066,11 @@ impl Session {
         }
     }
 
+    /// Rename this session.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+    }
+
     fn alloc_window(&mut self) -> WindowId {
         let id = WindowId(self.next_window);
         self.next_window += 1;
@@ -1075,6 +1080,143 @@ impl Session {
     fn alloc_pane(&mut self) -> PaneId {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
+        id
+    }
+}
+
+/// Multi-session registry for the native multiplexer (v0.7 M7.5).
+///
+/// Cockpit keeps every detached session running in-process: a detach flips
+/// the registry into an "unattached" state so the workspace can paint a
+/// session-list overlay, and an attach makes a chosen session visible
+/// again with its layout, scrollback, and pane state intact. Session
+/// persistence across cockpit restarts is M7.5a (deferred).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRegistry {
+    sessions: Vec<Session>,
+    active: SessionId,
+    attached: bool,
+    next_session_id: u64,
+}
+
+impl SessionRegistry {
+    /// Build a registry around an initial active session. The session's id
+    /// is kept as-is; subsequent [`Self::create`] / [`Self::add`] calls
+    /// allocate fresh ids from there.
+    pub fn new(initial: Session) -> Self {
+        let active = initial.id;
+        let next = active.0.saturating_add(1);
+        Self {
+            sessions: vec![initial],
+            active,
+            attached: true,
+            next_session_id: next,
+        }
+    }
+
+    /// Currently active session id (the one the workspace is showing when
+    /// attached, or the one most recently detached from).
+    pub fn active_id(&self) -> SessionId {
+        self.active
+    }
+
+    /// True when the workspace is showing the active session. False after a
+    /// [`Self::detach`], until [`Self::attach`] re-activates one.
+    pub fn is_attached(&self) -> bool {
+        self.attached
+    }
+
+    /// Borrow every session in registration order.
+    pub fn sessions(&self) -> &[Session] {
+        &self.sessions
+    }
+
+    /// Borrow the active session.
+    pub fn active(&self) -> &Session {
+        self.find(self.active)
+            .expect("active session id is maintained by SessionRegistry")
+    }
+
+    /// Mutably borrow the active session.
+    pub fn active_mut(&mut self) -> &mut Session {
+        let id = self.active;
+        self.sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .expect("active session id is maintained by SessionRegistry")
+    }
+
+    /// Find a session by id.
+    pub fn find(&self, id: SessionId) -> Option<&Session> {
+        self.sessions.iter().find(|session| session.id == id)
+    }
+
+    /// Create a new session, register it, and activate it. The session
+    /// inherits a single live pane.
+    pub fn create(&mut self, name: impl Into<String>) -> SessionId {
+        let mut session = Session::new(name);
+        let id = self.alloc_session_id();
+        session.id = id;
+        self.sessions.push(session);
+        self.active = id;
+        self.attached = true;
+        id
+    }
+
+    /// Register an externally-built session (e.g. one produced by
+    /// `Session::from_layout`) and activate it. The session's id is
+    /// rewritten so it stays unique inside the registry.
+    pub fn add(&mut self, mut session: Session) -> SessionId {
+        let id = self.alloc_session_id();
+        session.id = id;
+        self.sessions.push(session);
+        self.active = id;
+        self.attached = true;
+        id
+    }
+
+    /// Detach from the active session. The session itself keeps running;
+    /// the workspace's terminal area should switch to the session-list
+    /// overlay until [`Self::attach`] re-activates one.
+    pub fn detach(&mut self) -> SessionId {
+        self.attached = false;
+        self.active
+    }
+
+    /// Attach to a registered session, making it the visible one.
+    pub fn attach(&mut self, id: SessionId) -> Result<SessionId, MuxError> {
+        if self.find(id).is_none() {
+            return Err(MuxError::UnknownSession(id));
+        }
+        self.active = id;
+        self.attached = true;
+        Ok(id)
+    }
+
+    /// Kill a session by id. Fails if it would leave the registry empty.
+    /// Activates the next session in registration order when the killed
+    /// session was active.
+    pub fn kill(&mut self, id: SessionId) -> Result<SessionId, MuxError> {
+        if self.sessions.len() == 1 {
+            return Err(MuxError::CannotKillLastSession);
+        }
+        let index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id)
+            .ok_or(MuxError::UnknownSession(id))?;
+        self.sessions.remove(index);
+        if self.active == id {
+            let next = index.min(self.sessions.len() - 1);
+            self.active = self.sessions[next].id;
+            self.attached = true;
+        }
+        Ok(id)
+    }
+
+    fn alloc_session_id(&mut self) -> SessionId {
+        let id = SessionId(self.next_session_id);
+        self.next_session_id = self.next_session_id.saturating_add(1);
         id
     }
 }
@@ -1199,6 +1341,10 @@ pub enum MuxError {
     WindowIndexOutOfRange(usize),
     #[error("unknown pane `{0}`")]
     UnknownPane(PaneId),
+    #[error("unknown session `{0}`")]
+    UnknownSession(SessionId),
+    #[error("cannot kill the last session in a registry")]
+    CannotKillLastSession,
     #[error("layout tree no longer references its pane set")]
     BrokenLayout,
 }
@@ -1457,6 +1603,12 @@ fn next_position(cursor: CopyCursor, rows: &[&str]) -> CopyCursor {
 impl fmt::Display for PaneId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "pane-{}", self.0)
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "session-{}", self.0)
     }
 }
 
@@ -2462,6 +2614,89 @@ mod tests {
             "[dev] 0:0* │ 12:34 · build"
         );
         assert_eq!(summary.render(&["", "build", ""]), "[dev] 0:0* │ build");
+    }
+
+    #[test]
+    fn session_registry_starts_attached_to_initial_session() {
+        let registry = SessionRegistry::new(Session::new("dev"));
+        assert!(registry.is_attached());
+        assert_eq!(registry.sessions().len(), 1);
+        assert_eq!(registry.active().name, "dev");
+    }
+
+    #[test]
+    fn session_registry_create_activates_a_fresh_session() {
+        let mut registry = SessionRegistry::new(Session::new("dev"));
+        let first = registry.active_id();
+        let second = registry.create("logs");
+
+        assert_ne!(first, second);
+        assert_eq!(registry.sessions().len(), 2);
+        assert_eq!(registry.active().name, "logs");
+        assert!(registry.is_attached());
+    }
+
+    #[test]
+    fn session_registry_detach_keeps_session_running_and_flips_attached() {
+        let mut registry = SessionRegistry::new(Session::new("dev"));
+        registry.create("logs");
+
+        let active = registry.active_id();
+        assert_eq!(registry.detach(), active);
+        assert!(!registry.is_attached());
+        // Detached registry still holds every session.
+        assert_eq!(registry.sessions().len(), 2);
+    }
+
+    #[test]
+    fn session_registry_attach_reactivates_a_known_session() {
+        let mut registry = SessionRegistry::new(Session::new("dev"));
+        let dev = registry.active_id();
+        let logs = registry.create("logs");
+        registry.detach();
+
+        assert_eq!(registry.attach(dev).unwrap(), dev);
+        assert_eq!(registry.active_id(), dev);
+        assert!(registry.is_attached());
+
+        assert_eq!(registry.attach(logs).unwrap(), logs);
+        assert_eq!(registry.active().name, "logs");
+
+        let missing = SessionId(999);
+        assert_eq!(
+            registry.attach(missing).unwrap_err(),
+            MuxError::UnknownSession(missing)
+        );
+    }
+
+    #[test]
+    fn session_registry_kill_refuses_to_empty_the_registry() {
+        let mut registry = SessionRegistry::new(Session::new("dev"));
+        let dev = registry.active_id();
+
+        assert_eq!(
+            registry.kill(dev).unwrap_err(),
+            MuxError::CannotKillLastSession
+        );
+        assert_eq!(registry.sessions().len(), 1);
+    }
+
+    #[test]
+    fn session_registry_kill_advances_active_to_the_next_session() {
+        let mut registry = SessionRegistry::new(Session::new("dev"));
+        let dev = registry.active_id();
+        let logs = registry.create("logs");
+        registry.create("vim");
+
+        // Killing the middle session activates the next in order.
+        assert_eq!(registry.kill(logs).unwrap(), logs);
+        assert_eq!(registry.sessions().len(), 2);
+        assert_eq!(registry.active().name, "vim");
+
+        // Killing a non-active session leaves the active alone.
+        registry.kill(dev).unwrap();
+        assert_eq!(registry.sessions().len(), 1);
+        assert_eq!(registry.active().name, "vim");
     }
 
     #[test]
