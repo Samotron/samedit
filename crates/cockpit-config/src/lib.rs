@@ -23,6 +23,7 @@ pub struct Config {
     pub mise: MiseConfig,
     pub terminal: TerminalConfig,
     pub keys: KeysConfig,
+    pub panes: PanesConfig,
 }
 
 impl Config {
@@ -207,6 +208,78 @@ pub struct KeysConfig {
     pub global: GlobalKeys,
 }
 
+/// `[panes.tools.*]` config block — tool-pane recipes (v0.8 M8.2).
+///
+/// Each entry creates a keybindable command that opens an upstream CLI
+/// (lazygit, claude, codex, …) in a multiplexer pane. The recipe is data
+/// only — the binary turns it into a `CommandId` and the mux's
+/// floating / docked pane primitives handle layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PanesConfig {
+    pub tools: std::collections::BTreeMap<String, ToolPaneRecipe>,
+}
+
+/// Where a tool-pane recipe places its pane (v0.8 M8.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolPaneLayout {
+    /// Centred overlay above the regular layout (~80% × 80%).
+    #[default]
+    Floating,
+    /// Full-height pane on the right of the workspace.
+    SideRight,
+    /// Full-width strip across the bottom of the workspace.
+    Bottom,
+}
+
+/// One tool-pane recipe (v0.8 M8.2). The `name` field is set by the loader
+/// from the table key — the TOML schema does not duplicate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolPaneRecipe {
+    /// Shell command line spawned in the pane.
+    pub command: String,
+    /// Layout slot. Defaults to `floating`.
+    pub layout: ToolPaneLayout,
+    /// When `true`, a second keybind press hides the pane without killing
+    /// the underlying process; a third press shows it again with the
+    /// scrollback intact. Defaults to `true`.
+    pub toggle: bool,
+    /// Configured keybinding chord (`<leader>g`, `Ctrl+Shift+t`, …).
+    /// Empty when the recipe is palette-only.
+    pub keybind: String,
+    /// Binary name probed via the `ProcessRunner` seam. Defaults to the
+    /// first whitespace-separated token of `command`.
+    pub detect: String,
+}
+
+impl Default for ToolPaneRecipe {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            layout: ToolPaneLayout::default(),
+            toggle: true,
+            keybind: String::new(),
+            detect: String::new(),
+        }
+    }
+}
+
+impl ToolPaneRecipe {
+    /// The binary name to probe — explicit `detect` if set, otherwise the
+    /// first whitespace-separated token of `command`.
+    pub fn detect_binary(&self) -> &str {
+        if !self.detect.is_empty() {
+            return &self.detect;
+        }
+        self.command
+            .split_whitespace()
+            .next()
+            .unwrap_or(&self.command)
+    }
+}
+
 /// Global keybindings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -353,6 +426,68 @@ command_palette = "Ctrl+Shift+P"
             r#"
 [editor]
 magic = true
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn parses_tool_pane_recipes_with_defaults() {
+        let config = Config::from_toml(
+            r#"
+[panes.tools.lazygit]
+command = "lazygit"
+layout = "floating"
+keybind = "<leader>g"
+
+[panes.tools."claude-code"]
+command = "claude --resume"
+layout = "side-right"
+toggle = false
+"#,
+        )
+        .unwrap();
+
+        let lazygit = config.panes.tools.get("lazygit").expect("lazygit recipe");
+        assert_eq!(lazygit.command, "lazygit");
+        assert_eq!(lazygit.layout, ToolPaneLayout::Floating);
+        assert!(lazygit.toggle, "default toggle is true");
+        assert_eq!(lazygit.keybind, "<leader>g");
+        assert_eq!(lazygit.detect_binary(), "lazygit");
+
+        let claude = config
+            .panes
+            .tools
+            .get("claude-code")
+            .expect("claude-code recipe");
+        assert_eq!(claude.command, "claude --resume");
+        assert_eq!(claude.layout, ToolPaneLayout::SideRight);
+        assert!(!claude.toggle);
+        assert_eq!(claude.detect_binary(), "claude");
+    }
+
+    #[test]
+    fn tool_pane_recipe_uses_explicit_detect_when_set() {
+        let config = Config::from_toml(
+            r#"
+[panes.tools.toy]
+command = "cargo run --release --bin custom-tool"
+detect  = "cargo"
+"#,
+        )
+        .unwrap();
+        let toy = config.panes.tools.get("toy").unwrap();
+        assert_eq!(toy.detect_binary(), "cargo");
+    }
+
+    #[test]
+    fn tool_pane_recipe_unknown_layout_is_an_error() {
+        let err = Config::from_toml(
+            r#"
+[panes.tools.x]
+command = "x"
+layout  = "windowed"
 "#,
         )
         .unwrap_err();
