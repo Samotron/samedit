@@ -30,6 +30,12 @@ impl From<&str> for CommandId {
     }
 }
 
+impl From<String> for CommandId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
 impl fmt::Display for CommandId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)

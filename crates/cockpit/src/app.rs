@@ -110,6 +110,9 @@ const THEME_SWITCH_LATTE: &str = "theme.switch.latte";
 const THEME_SWITCH_FRAPPE: &str = "theme.switch.frappe";
 const THEME_SWITCH_MACCHIATO: &str = "theme.switch.macchiato";
 const THEME_SWITCH_MOCHA: &str = "theme.switch.mocha";
+/// Command id prefix for tool-pane recipes (v0.8 M8.2). The suffix is the
+/// recipe's `[panes.tools.<name>]` key.
+const TOOL_RECIPE_PREFIX: &str = "tool.";
 /// Command id for "go to the symbol's definition under the cursor" (M4.2).
 const LSP_GOTO_DEFINITION: &str = "lsp.goto_definition";
 /// Command id for "show hover information for the symbol under the cursor" (M4.2).
@@ -346,6 +349,10 @@ pub struct AppModel {
     /// across parked + active so freshly created sessions never collide
     /// with already-running ones.
     mux_next_session_index: u64,
+    /// User-configured tool-pane recipes (v0.8 M8.2). Each recipe maps to
+    /// a `tool.<name>` palette command that spawns the recipe's command
+    /// in the active terminal pane.
+    tool_recipes: std::collections::BTreeMap<String, cockpit_config::ToolPaneRecipe>,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -458,6 +465,7 @@ impl AppModel {
             mux_parked: Vec::new(),
             mux_overlay_index: 0,
             mux_next_session_index: 1,
+            tool_recipes: std::collections::BTreeMap::new(),
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -537,6 +545,12 @@ impl AppModel {
                 );
             }
         }
+
+        // v0.8 M8.2: capture tool-pane recipes. Each registered recipe
+        // shows up in the palette as `Tool: <name>` and dispatches to
+        // `run_tool_recipe`. Spawn semantics (floating overlay vs side
+        // pane) land in follow-up sub-tasks.
+        self.tool_recipes = config.panes.tools.clone();
     }
 
     /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
@@ -986,6 +1000,10 @@ impl AppModel {
             MODELS_SHOW_DAG => self.show_dag_summary(),
             QUARTO_RENDER => self.render_quarto_document(),
             APP_QUIT => self.exit = true,
+            other if other.starts_with(TOOL_RECIPE_PREFIX) => {
+                let name = other[TOOL_RECIPE_PREFIX.len()..].to_string();
+                self.run_tool_recipe(&name);
+            }
             other => self.status = format!("Unhandled command `{other}`."),
         }
     }
@@ -993,7 +1011,9 @@ impl AppModel {
     /// Open the command palette over the workspace.
     fn open_palette(&mut self) {
         self.palette_mode = PaletteMode::Commands;
-        self.palette = Some(Palette::new(palette_entries()));
+        let mut entries = palette_entries();
+        entries.extend(self.tool_recipe_palette_entries());
+        self.palette = Some(Palette::new(entries));
         self.status = "Command palette — type to filter, Enter to run, Esc to close.".to_string();
     }
 
@@ -1304,6 +1324,44 @@ impl AppModel {
     fn mux_next_layout(&mut self) {
         let preset = self.mux_session.next_layout();
         self.status = format!("Mux: selected {preset:?} layout.");
+    }
+
+    /// Run a tool-pane recipe by name (v0.8 M8.2). The recipe's command is
+    /// sent to the active terminal pane, with the layout slot tracked in the
+    /// status line. Floating-pane and side-pane spawn behaviour land in a
+    /// follow-up.
+    fn run_tool_recipe(&mut self, name: &str) {
+        let Some(recipe) = self.tool_recipes.get(name).cloned() else {
+            self.status = format!("Tool `{name}` not configured.");
+            return;
+        };
+        self.ensure_terminal();
+        let payload = format!("{}\r", recipe.command);
+        match self.active_terminal_mut() {
+            Some(terminal) => match terminal.send_input(payload.as_bytes()) {
+                Ok(()) => {
+                    self.layout.focus(PaneId::Terminal);
+                    self.status = format!(
+                        "Tool: `{name}` → `{}` ({:?}).",
+                        recipe.command, recipe.layout
+                    );
+                }
+                Err(err) => self.status = format!("Tool `{name}` failed: {err}"),
+            },
+            None => self.status = format!("Tool `{name}` — terminal unavailable."),
+        }
+    }
+
+    /// Palette entries derived from the registered tool-pane recipes.
+    fn tool_recipe_palette_entries(&self) -> Vec<PaletteEntry> {
+        self.tool_recipes
+            .keys()
+            .map(|name| {
+                let id = format!("{TOOL_RECIPE_PREFIX}{name}");
+                let title = format!("Tool: {name}");
+                PaletteEntry::new(id, title)
+            })
+            .collect()
     }
 
     /// Send `mise run <task>` to the terminal session, starting it if needed.
@@ -5596,6 +5654,78 @@ cockpit_layout = "missing.kdl"
             model.status.contains("cockpit_layout ignored"),
             "status: {}",
             model.status
+        );
+    }
+
+    #[test]
+    fn apply_user_config_registers_tool_pane_recipes() {
+        let mut model = model();
+
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.insert(
+            "lazygit".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "lazygit".to_string(),
+                layout: cockpit_config::ToolPaneLayout::Floating,
+                toggle: true,
+                keybind: "<leader>g".to_string(),
+                detect: String::new(),
+            },
+        );
+        config.panes.tools.insert(
+            "claude-code".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "claude --resume".to_string(),
+                layout: cockpit_config::ToolPaneLayout::SideRight,
+                toggle: false,
+                keybind: "<leader>aa".to_string(),
+                detect: "claude".to_string(),
+            },
+        );
+        model.apply_user_config(&config);
+
+        let entries = model.tool_recipe_palette_entries();
+        let ids: Vec<String> = entries.iter().map(|e| e.id.to_string()).collect();
+        assert!(ids.iter().any(|id| id == "tool.lazygit"), "ids: {ids:?}");
+        assert!(
+            ids.iter().any(|id| id == "tool.claude-code"),
+            "ids: {ids:?}",
+        );
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(titles.contains(&"Tool: lazygit"));
+    }
+
+    #[test]
+    fn open_palette_includes_registered_tool_recipes() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.insert(
+            "lazygit".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "lazygit".to_string(),
+                ..Default::default()
+            },
+        );
+        model.apply_user_config(&config);
+        model.run_command(command_ids::COMMAND_PALETTE);
+
+        let palette = model.palette.as_ref().expect("palette open");
+        let ids: Vec<String> = palette
+            .entries()
+            .iter()
+            .map(|entry| entry.id.to_string())
+            .collect();
+        assert!(ids.iter().any(|id| id == "tool.lazygit"), "ids: {ids:?}");
+    }
+
+    #[test]
+    fn unknown_tool_recipe_command_surfaces_a_status_message() {
+        let mut model = model();
+        model.run_command("tool.does-not-exist");
+        assert!(
+            model.status.contains("not configured"),
+            "status: {}",
+            model.status,
         );
     }
 

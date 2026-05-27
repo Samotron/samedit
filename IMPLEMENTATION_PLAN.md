@@ -1126,19 +1126,25 @@ running upstream CLIs the user already has. That is the whole point.
 
 ### M8.2 — Tool-pane recipes  *(needs M7.4)*
 
-- New config schema in [cockpit-config](file:///home/samotron/dev/samedit/crates/cockpit-config):
+- ✅ Config schema in `cockpit-config::PanesConfig`:
   ```toml
   [panes.tools.lazygit]
   command  = "lazygit"
-  layout   = "floating"   # floating | side | bottom
+  layout   = "floating"   # floating | side-right | bottom
   toggle   = true         # second invocation hides the pane
   keybind  = "<leader>g"
   detect   = "lazygit"    # binary name (mise exec first, then PATH)
   ```
-- Loader produces typed `ToolPaneRecipe { name, command, layout,
-  toggle, keybind, detect }` values; each becomes a `CommandId` in
-  `cockpit-commands` so the palette *and* the keybind dispatch the
-  same code (AGENTS §2 hard rule #5).
+  Defaults: `layout = floating`, `toggle = true`, `detect = <first
+  command word>`. `ToolPaneRecipe::detect_binary` returns the
+  effective binary name for the probe.
+- ✅ Each registered recipe becomes a `tool.<name>` palette command
+  (dispatched via the existing `cockpit-commands` spine, AGENTS §2
+  hard rule #5). `AppModel::apply_user_config` snapshots
+  `config.panes.tools` into `AppModel::tool_recipes`; the palette
+  `open` path appends the dynamic recipe entries to the static set.
+  Triggering a recipe today sends the command string to the active
+  terminal pane.
 - Mux gains two primitives on top of M7.4's split tree:
   - **Floating pane** — overlay rectangle centred over the project,
     sized 80% × 80%, drawn above the regular layout. Single floating
