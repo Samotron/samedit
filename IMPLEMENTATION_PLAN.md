@@ -917,15 +917,15 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
     `g` pending flag so the second `g` completes `gg` without a parallel
     FSM. Word motions clamp to the same max column used by `h/l/0/$`.
   - Yank + search layer: `y` extracts the current selection text from
-    the visible terminal grid and stashes it in `AppModel::mux_copy_yank`
-    (clipboard plumbing is the next sub-task — wiring goes through
-    `cockpit-render` since `winit` doesn't expose clipboard directly,
-    so a small `arboard` integration will likely land alongside the
-    UI-side wire-up). `/` enters a search-input substate; characters
-    accumulate into the pane's `CopySearch::query`, Backspace pops,
-    Escape cancels, and Enter runs the forward search across the
-    visible rows and jumps the cursor to the first match. `n` repeats
-    the last completed search forward from the cursor.
+    the visible terminal grid, stashes it in `AppModel::mux_copy_yank`,
+    and pushes it to the OS clipboard via `arboard`. Headless / display-
+    less environments fail the clipboard write gracefully and surface
+    `(clipboard unavailable)` in the status line so the workflow still
+    finishes. `/` enters a search-input substate; characters accumulate
+    into the pane's `CopySearch::query`, Backspace pops, Escape cancels,
+    and Enter runs the forward search across the visible rows and jumps
+    the cursor to the first match. `n` repeats the last completed
+    search forward from the cursor.
 - Tests: golden of the rendered selection after a recorded key script
   on a fixture scrollback.
 

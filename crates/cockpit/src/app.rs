@@ -2026,9 +2026,16 @@ impl AppModel {
             return;
         };
         let chars = text.chars().count();
+        let clipboard_status = match copy_to_os_clipboard(&text) {
+            Ok(()) => "clipboard".to_string(),
+            Err(err) => {
+                tracing::warn!(?err, "mux copy yank: clipboard write failed");
+                "(clipboard unavailable)".to_string()
+            }
+        };
         self.mux_copy_yank = Some(text);
         let pane = self.mux_session.exit_copy_mode();
-        self.status = format!("Mux: yanked {chars} characters from {pane}.");
+        self.status = format!("Mux: yanked {chars} characters from {pane} → {clipboard_status}.");
     }
 
     /// Snapshot of the visible terminal grid rows for the active pane. Used
@@ -4245,6 +4252,14 @@ fn mux_rect_contains(rect: MuxRect, position: PointerPosition) -> bool {
 /// True when `chord` is a single unmodified press of `key`.
 fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
+}
+
+/// Push `text` to the OS clipboard (v0.7 M7.6 yank wiring). Returns an error
+/// when no clipboard service is reachable — headless test environments and
+/// some CI runners — so the caller can degrade gracefully.
+fn copy_to_os_clipboard(text: &str) -> Result<(), arboard::Error> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text.to_string())
 }
 
 /// Wrap a `cockpit_layout` pane command in the host shell so the user's
