@@ -103,6 +103,13 @@ const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
 const DEBUG_SHOW_STARTUP_TRACE: &str = "debug.show_startup_trace";
 /// Command id for "summarise the native mux mode-line" (v0.7 M7.7).
 const DEBUG_SHOW_MUX_STATUS: &str = "debug.show_mux_status";
+/// Command ids for switching the active theme (v0.8 M8.1). One per
+/// supported flavour so the palette can list them as discrete entries.
+const THEME_SWITCH_DARK: &str = "theme.switch.dark";
+const THEME_SWITCH_LATTE: &str = "theme.switch.latte";
+const THEME_SWITCH_FRAPPE: &str = "theme.switch.frappe";
+const THEME_SWITCH_MACCHIATO: &str = "theme.switch.macchiato";
+const THEME_SWITCH_MOCHA: &str = "theme.switch.mocha";
 /// Command id for "go to the symbol's definition under the cursor" (M4.2).
 const LSP_GOTO_DEFINITION: &str = "lsp.goto_definition";
 /// Command id for "show hover information for the symbol under the cursor" (M4.2).
@@ -517,6 +524,19 @@ impl AppModel {
         prefs.left_width = config.ui.left_width.into();
         prefs.right_width = config.ui.right_width.into();
         self.layout.set_preferences(prefs);
+
+        // v0.8 M8.1: resolve `ui.theme` against the Catppuccin / default
+        // palette set. Unknown names log a warning and leave the current
+        // theme in place — never crash on a typo'd config.
+        match Theme::from_name(&config.ui.theme) {
+            Some(theme) => self.theme = theme,
+            None => {
+                tracing::warn!(
+                    theme = %config.ui.theme,
+                    "unknown ui.theme; keeping current theme",
+                );
+            }
+        }
     }
 
     /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
@@ -946,6 +966,11 @@ impl AppModel {
             DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
             DEBUG_SHOW_STARTUP_TRACE => self.debug_show_startup_trace(),
             DEBUG_SHOW_MUX_STATUS => self.debug_show_mux_status(),
+            THEME_SWITCH_DARK => self.switch_theme("dark"),
+            THEME_SWITCH_LATTE => self.switch_theme("latte"),
+            THEME_SWITCH_FRAPPE => self.switch_theme("frappe"),
+            THEME_SWITCH_MACCHIATO => self.switch_theme("macchiato"),
+            THEME_SWITCH_MOCHA => self.switch_theme("mocha"),
             LSP_GOTO_DEFINITION => self.request_goto_definition(),
             LSP_SHOW_HOVER => self.request_show_hover(),
             LSP_RENAME => self.open_rename_input(),
@@ -1462,6 +1487,22 @@ impl AppModel {
         let text = crate::startup::format_snapshot(&snapshot);
         tracing::info!(startup = %text, "debug: show startup trace");
         self.status = text;
+    }
+
+    /// Hot-swap the active theme (v0.8 M8.1). Unknown names are a
+    /// programmer error here — every wired palette entry passes a name
+    /// `Theme::from_name` recognises — but we still degrade to a status
+    /// message rather than panicking.
+    fn switch_theme(&mut self, name: &str) {
+        match Theme::from_name(name) {
+            Some(theme) => {
+                self.theme = theme;
+                self.status = format!("Theme: switched to `{name}`.");
+            }
+            None => {
+                self.status = format!("Theme: unknown `{name}`.");
+            }
+        }
     }
 
     /// Surface the native mux mode-line (v0.7 M7.7). Time and mise task
@@ -4755,6 +4796,11 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(MODELS_BUILD_ALL, "Models: Build All"),
         PaletteEntry::new(MODELS_SHOW_DAG, "Models: Show DAG"),
         PaletteEntry::new(QUARTO_RENDER, "Quarto: Render"),
+        PaletteEntry::new(THEME_SWITCH_DARK, "Theme: Switch Dark"),
+        PaletteEntry::new(THEME_SWITCH_LATTE, "Theme: Switch Latte"),
+        PaletteEntry::new(THEME_SWITCH_FRAPPE, "Theme: Switch Frappé"),
+        PaletteEntry::new(THEME_SWITCH_MACCHIATO, "Theme: Switch Macchiato"),
+        PaletteEntry::new(THEME_SWITCH_MOCHA, "Theme: Switch Mocha"),
         PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
         PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
@@ -5551,6 +5597,54 @@ cockpit_layout = "missing.kdl"
             "status: {}",
             model.status
         );
+    }
+
+    #[test]
+    fn apply_user_config_resolves_catppuccin_theme_names() {
+        let mut model = model();
+        let original = model.theme.clone();
+
+        let mut config = cockpit_config::Config::default();
+        config.ui.theme = "mocha".to_string();
+        model.apply_user_config(&config);
+        assert_eq!(model.theme, cockpit_render::Theme::catppuccin_mocha());
+
+        // Unknown names log a warning and keep the current theme.
+        config.ui.theme = "solarized".to_string();
+        model.apply_user_config(&config);
+        assert_eq!(model.theme, cockpit_render::Theme::catppuccin_mocha());
+
+        config.ui.theme = "dark".to_string();
+        model.apply_user_config(&config);
+        assert_eq!(model.theme, original);
+    }
+
+    #[test]
+    fn theme_switch_palette_commands_hot_swap_without_restart() {
+        let mut model = model();
+        model.run_command(THEME_SWITCH_LATTE);
+        assert_eq!(model.theme, cockpit_render::Theme::catppuccin_latte());
+        assert!(model.status.contains("latte"), "status: {}", model.status);
+
+        model.run_command(THEME_SWITCH_MOCHA);
+        assert_eq!(model.theme, cockpit_render::Theme::catppuccin_mocha());
+    }
+
+    #[test]
+    fn palette_lists_every_theme_switch_command() {
+        let ids: Vec<String> = palette_entries()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect();
+        for id in [
+            THEME_SWITCH_DARK,
+            THEME_SWITCH_LATTE,
+            THEME_SWITCH_FRAPPE,
+            THEME_SWITCH_MACCHIATO,
+            THEME_SWITCH_MOCHA,
+        ] {
+            assert!(ids.iter().any(|c| c == id), "missing {id} in {ids:?}");
+        }
     }
 
     #[test]

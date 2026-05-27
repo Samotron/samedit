@@ -1099,30 +1099,27 @@ running upstream CLIs the user already has. That is the whole point.
 
 ### M8.1 — Catppuccin theme
 
-- Extend [crates/cockpit-render/src/theme.rs](file:///home/samotron/dev/samedit/crates/cockpit-render/src/theme.rs)
-  with four constructors: `Theme::catppuccin_latte()`,
-  `catppuccin_frappe()`, `catppuccin_macchiato()`, `catppuccin_mocha()`.
-  Palettes sourced from https://catppuccin.com/palette — comment each
-  colour with its hex source so palette drift is reviewable.
-- `Theme::from_name(&str) -> Option<Self>` resolves
-  `dark | latte | frappe | macchiato | mocha` (case-insensitive,
-  accepts the `catppuccin-` alias prefix). Unknown names return
-  `None` so callers fall back without panicking.
-- Wire `cockpit_config::UiConfig::theme` (already a `String`, today
-  defaults to `"dark"`) into `AppModel::apply_user_config`: on
-  unknown name, log a `tracing::warn!` and keep the current theme —
-  never crash on a typo'd config (AGENTS §2 hard rule #6 sibling: be
-  forgiving of user input).
-- New palette command `Theme: Switch…` with sub-actions per flavour;
-  selecting one updates the in-memory `AppModel::theme` immediately
-  and writes the choice back to the user config (single-key change,
-  preserves comments — use `toml_edit`, not a full re-serialise).
-- Tests (all headless, in `cockpit-render`):
-  - `from_name` resolves every flavour + aliases + unknown.
-  - Every flavour is opaque except `selection`.
-  - Latte luminance > Mocha luminance (catches palette typos).
-  - `apply_user_config_resolves_catppuccin_theme_names` in
-    `cockpit::app` tests covers the wiring end-to-end.
+- ✅ `cockpit-render::Theme::catppuccin_latte() / _frappe() / _macchiato()
+  / _mocha()` constructors ship with palette values pasted verbatim
+  from https://catppuccin.com/palette (each `Color::hex(0x…)` carries
+  the palette name in a trailing comment). `Color::hex` /
+  `Color::hex_with_alpha` are the new const helpers backing them.
+- ✅ `Theme::from_name(&str) -> Option<Self>` resolves
+  `dark | latte | frappe | macchiato | mocha`, case-insensitively, and
+  strips an optional `catppuccin-` alias prefix so
+  `"catppuccin-mocha"` and `"mocha"` route the same way.
+- ✅ `AppModel::apply_user_config` reads `ui.theme` through
+  `Theme::from_name`. Unknown names log a `tracing::warn!` and leave
+  the active theme alone — typo'd configs never crash the cockpit.
+- ✅ `Theme: Switch <Flavour>` palette commands hot-swap the active
+  theme immediately. The follow-up write-back to user-config (via
+  `toml_edit`, preserving comments + order) is parked for the next
+  sub-task.
+- ✅ Tests cover hex decoding, `from_name` aliasing + unknowns,
+  per-flavour opacity, and the brightness ordering
+  Mocha < Macchiato < Frappé < Latte (catches palette typos). The
+  cockpit-side `apply_user_config_resolves_catppuccin_theme_names`
+  test exercises the wiring end-to-end.
 - **Done when:** `ui.theme = "mocha"` in the user config opens the
   cockpit in Mocha; `Theme: Switch Latte` from the palette
   hot-swaps without restart on Linux + macOS + Windows.
