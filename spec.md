@@ -6,6 +6,13 @@
 > `build.zig` remain in the detection list because *user projects* can still
 > be Zig — cockpit itself is not.
 >
+> **Terminal multiplexer:** the v0.7 work replaced the Zellij hand-off with
+> an in-process multiplexer (`cockpit-mux`) modelled on tmux. References to
+> Zellij below describe the v0.1–v0.6 architecture and are kept for context;
+> the current implementation spawns the host shell directly and owns
+> splits / windows / sessions in-process. See the v0.7 section of
+> [`IMPLEMENTATION_PLAN.md`] for the active surface.
+>
 > [`IMPLEMENTATION_PLAN.md`]: IMPLEMENTATION_PLAN.md
 
 Testing is treated as a **core product principle**, not an afterthought, because
