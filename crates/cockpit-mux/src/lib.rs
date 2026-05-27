@@ -47,6 +47,9 @@ pub mod command_ids {
     pub const COPY_MODE: &str = "mux.copy_mode.enter";
     pub const PASTE: &str = "mux.paste";
     pub const DETACH: &str = "mux.session.detach";
+    pub const NEW_SESSION: &str = "mux.session.new";
+    pub const NEXT_SESSION: &str = "mux.session.next";
+    pub const PREVIOUS_SESSION: &str = "mux.session.previous";
 
     pub const SELECT_WINDOW: [&str; 10] = [
         SELECT_WINDOW_0,

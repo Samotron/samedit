@@ -25,8 +25,8 @@ use cockpit_lsp::{
     ServerConfig,
 };
 use cockpit_mux::{
-    PaneMode, PrefixDispatcher, Rect as MuxRect, Session as MuxSession, SplitDirection,
-    command_ids as mux_command_ids,
+    PaneMode, PrefixDispatcher, Rect as MuxRect, SESSION_ID_STRIDE as MUX_SESSION_STRIDE,
+    Session as MuxSession, SplitDirection, command_ids as mux_command_ids,
 };
 use cockpit_notebook::{
     CellKind, Notebook, is_notebook_source, parse_notebook, parse_quarto, quarto_render_spec,
@@ -325,6 +325,17 @@ pub struct AppModel {
     /// `Ctrl+b d` until the user re-attaches via Enter on the session-list
     /// overlay (v0.7 M7.5). PTYs keep running while detached.
     mux_attached: bool,
+    /// Background sessions parked while a different one is active
+    /// (v0.7 M7.5). Pane ids stay globally unique thanks to
+    /// [`cockpit_mux::SESSION_ID_STRIDE`], so terminals from parked
+    /// sessions remain reachable through the shared `terminals` map.
+    mux_parked: Vec<MuxSession>,
+    /// Cursor inside the detached overlay's session list (v0.7 M7.5).
+    mux_overlay_index: usize,
+    /// Counter used to seed pane id strides on `mux.session.new`. Counts
+    /// across parked + active so freshly created sessions never collide
+    /// with already-running ones.
+    mux_next_session_index: u64,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -434,6 +445,9 @@ impl AppModel {
             mux_pane_commands: HashMap::new(),
             last_mise_task: None,
             mux_attached: true,
+            mux_parked: Vec::new(),
+            mux_overlay_index: 0,
+            mux_next_session_index: 1,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -1010,6 +1024,9 @@ impl AppModel {
                 self.status = "Mux: paste uses copy-mode buffer in M7.6.".to_string();
             }
             mux_command_ids::DETACH => self.mux_toggle_detach(),
+            mux_command_ids::NEW_SESSION => self.mux_new_session(),
+            mux_command_ids::NEXT_SESSION => self.mux_cycle_session(1),
+            mux_command_ids::PREVIOUS_SESSION => self.mux_cycle_session(-1),
             other => {
                 if let Some(index) = mux_select_window_index(other) {
                     self.mux_select_window(index);
@@ -1096,6 +1113,7 @@ impl AppModel {
     fn mux_toggle_detach(&mut self) {
         if self.mux_attached {
             self.mux_attached = false;
+            self.mux_overlay_index = 0;
             let name = self.mux_session.name.clone();
             self.status = format!("Mux: detached from session `{name}`. Press Enter to reattach.");
         } else {
@@ -1103,6 +1121,106 @@ impl AppModel {
             let name = self.mux_session.name.clone();
             self.status = format!("Mux: re-attached to session `{name}`.");
         }
+    }
+
+    /// Park the active session and activate a freshly created one (v0.7 M7.5
+    /// `mux.session.new`). Pane ids in the new session start from a disjoint
+    /// stride so PTYs from parked sessions stay valid.
+    fn mux_new_session(&mut self) {
+        let next_index = self.mux_next_session_index;
+        self.mux_next_session_index = self.mux_next_session_index.saturating_add(1);
+        let name = format!("session-{next_index}");
+        let fresh = MuxSession::with_id_base(name.clone(), next_index * MUX_SESSION_STRIDE);
+
+        let parked = std::mem::replace(&mut self.mux_session, fresh);
+        self.mux_parked.push(parked);
+        self.mux_attached = true;
+        self.status = format!(
+            "Mux: new session `{name}`. ({} parked)",
+            self.mux_parked.len()
+        );
+    }
+
+    /// Cycle to the next / previous parked session (v0.7 M7.5
+    /// `mux.session.next` / `mux.session.previous`). The current session is
+    /// pushed onto the parked stack so it survives the swap.
+    fn mux_cycle_session(&mut self, delta: isize) {
+        if self.mux_parked.is_empty() {
+            self.status = "Mux: only one session — nothing to cycle to.".to_string();
+            return;
+        }
+        let index = if delta >= 0 {
+            0
+        } else {
+            self.mux_parked.len() - 1
+        };
+        let parked = self.mux_parked.remove(index);
+        let previous = std::mem::replace(&mut self.mux_session, parked);
+        if delta >= 0 {
+            self.mux_parked.push(previous);
+        } else {
+            self.mux_parked.insert(0, previous);
+        }
+        self.mux_attached = true;
+        self.status = format!(
+            "Mux: attached to session `{}`. ({} parked)",
+            self.mux_session.name,
+            self.mux_parked.len()
+        );
+    }
+
+    /// Total number of mux sessions cockpit knows about (visible + parked).
+    fn mux_session_count(&self) -> usize {
+        1 + self.mux_parked.len()
+    }
+
+    /// Drive the detached overlay (Up/Down to choose, Enter to attach).
+    fn handle_mux_overlay_key(&mut self, chord: &KeyChord) {
+        let count = self.mux_session_count();
+        if chord == &KeyChord::single("ArrowDown", Modifiers::NONE)
+            || chord == &KeyChord::single("j", Modifiers::NONE)
+        {
+            if self.mux_overlay_index + 1 < count {
+                self.mux_overlay_index += 1;
+            }
+        } else if chord == &KeyChord::single("ArrowUp", Modifiers::NONE)
+            || chord == &KeyChord::single("k", Modifiers::NONE)
+        {
+            self.mux_overlay_index = self.mux_overlay_index.saturating_sub(1);
+        } else if chord == &KeyChord::single("Enter", Modifiers::NONE) {
+            self.mux_attach_overlay_selection();
+        }
+    }
+
+    /// Activate the highlighted overlay session and re-attach the workspace.
+    fn mux_attach_overlay_selection(&mut self) {
+        let count = self.mux_session_count();
+        if self.mux_overlay_index >= count {
+            self.mux_overlay_index = count.saturating_sub(1);
+        }
+        if self.mux_overlay_index == 0 {
+            // Active session — just re-attach.
+            self.mux_attached = true;
+            let name = self.mux_session.name.clone();
+            self.status = format!("Mux: re-attached to session `{name}`.");
+            return;
+        }
+        let parked_index = self.mux_overlay_index - 1;
+        if parked_index >= self.mux_parked.len() {
+            self.mux_attached = true;
+            return;
+        }
+        // Swap the picked parked session with the active one, then re-attach.
+        let picked = self.mux_parked.remove(parked_index);
+        let previous = std::mem::replace(&mut self.mux_session, picked);
+        self.mux_parked.push(previous);
+        self.mux_overlay_index = 0;
+        self.mux_attached = true;
+        let name = self.mux_session.name.clone();
+        self.status = format!(
+            "Mux: attached to session `{name}`. ({} parked)",
+            self.mux_parked.len()
+        );
     }
 
     fn mux_new_window(&mut self) {
@@ -1734,14 +1852,13 @@ impl AppModel {
     /// Forward a chord to the PTY when the terminal pane is focused.
     fn handle_terminal_key(&mut self, chord: &KeyChord) {
         // When detached, the prefix path still works (so `Ctrl+b d` toggles
-        // back), but Enter is the explicit reattach key for the overlay.
+        // back); arrows navigate the overlay session list and Enter
+        // attaches to the highlighted entry.
         if !self.mux_attached {
             if self.handle_mux_prefix(chord) {
                 return;
             }
-            if chord == &KeyChord::single("Enter", Modifiers::NONE) {
-                self.mux_toggle_detach();
-            }
+            self.handle_mux_overlay_key(chord);
             return;
         }
         if self.handle_mux_prefix(chord) {
@@ -3830,33 +3947,52 @@ impl AppModel {
         self.paint_mux_status_line(canvas, content.x, status_y, content.w, status_h);
     }
 
-    /// Paint the "detached — Enter to reattach" overlay (v0.7 M7.5)
-    /// inside the terminal pane area, leaving the mode-line strip
-    /// untouched for the caller.
+    /// Paint the "detached — pick a session" overlay (v0.7 M7.5) inside
+    /// the terminal pane area, leaving the mode-line strip untouched.
     fn paint_mux_detached_overlay(
         &self,
         canvas: &mut Canvas<'_>,
         content: &ContentRect,
         pane_area_h: f32,
     ) {
-        let name = &self.mux_session.name;
-        let lines = [
-            "Detached".to_string(),
-            format!("Session: {name}"),
-            String::new(),
-            "Press Enter to re-attach, or Ctrl+b d to toggle.".to_string(),
+        let mut lines: Vec<(String, Color)> = vec![
+            ("Detached".to_string(), self.theme.text),
+            (String::new(), self.theme.text),
+            ("Sessions:".to_string(), self.theme.text),
         ];
+        for (i, name) in self.mux_overlay_session_names().iter().enumerate() {
+            let marker = if i == self.mux_overlay_index {
+                '▸'
+            } else {
+                ' '
+            };
+            lines.push((format!("  {marker} {i}: {name}"), self.theme.text));
+        }
+        lines.push((String::new(), self.theme.text));
+        lines.push((
+            "↑/↓ to choose, Enter to attach, Ctrl+b d to toggle.".to_string(),
+            self.theme.text,
+        ));
+
         let total_h = lines.len() as f32 * ROW_H;
         let start_y = content.y + (pane_area_h - total_h).max(0.0) * 0.5 + FONT;
-        for (i, line) in lines.iter().enumerate() {
+        for (i, (line, color)) in lines.iter().enumerate() {
             canvas.text(
                 content.x + PAD,
                 start_y + i as f32 * ROW_H,
-                line,
-                self.theme.text,
+                line.clone(),
+                *color,
                 FONT,
             );
         }
+    }
+
+    /// All registered session names in overlay order: active first, then
+    /// parked sessions in stack order.
+    fn mux_overlay_session_names(&self) -> Vec<String> {
+        let mut names = vec![self.mux_session.name.clone()];
+        names.extend(self.mux_parked.iter().map(|session| session.name.clone()));
+        names
     }
 
     /// Paint the native mux mode-line at the bottom of the terminal area
@@ -4594,6 +4730,10 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(mux_command_ids::SWAP_PANE_NEXT, "Mux: Swap Pane Next"),
         PaletteEntry::new(mux_command_ids::ZOOM_PANE, "Mux: Zoom Pane"),
         PaletteEntry::new(mux_command_ids::COPY_MODE, "Mux: Enter Copy Mode"),
+        PaletteEntry::new(mux_command_ids::DETACH, "Mux: Detach / Re-attach"),
+        PaletteEntry::new(mux_command_ids::NEW_SESSION, "Mux: New Session"),
+        PaletteEntry::new(mux_command_ids::NEXT_SESSION, "Mux: Next Session"),
+        PaletteEntry::new(mux_command_ids::PREVIOUS_SESSION, "Mux: Previous Session"),
         PaletteEntry::new(mux_command_ids::FOCUS_UP, "Mux: Focus Up"),
         PaletteEntry::new(mux_command_ids::FOCUS_DOWN, "Mux: Focus Down"),
         PaletteEntry::new(mux_command_ids::FOCUS_LEFT, "Mux: Focus Left"),
@@ -5471,6 +5611,56 @@ cockpit_layout = "missing.kdl"
             texts.iter().any(|t| t == "Detached"),
             "expected detached overlay, got {texts:?}"
         );
+    }
+
+    #[test]
+    fn mux_new_session_parks_the_previous_session_and_activates_a_fresh_one() {
+        let mut model = model();
+        let original_name = model.mux_session.name.clone();
+
+        model.run_command(mux_command_ids::NEW_SESSION);
+        assert_eq!(model.mux_session_count(), 2);
+        assert_ne!(model.mux_session.name, original_name);
+        assert_eq!(model.mux_parked.len(), 1);
+        assert_eq!(model.mux_parked[0].name, original_name);
+
+        // Pane ids of the new session are disjoint from the parked one.
+        let active_pane = model.mux_session.active_pane().id.get();
+        assert!(active_pane >= MUX_SESSION_STRIDE, "got {active_pane}");
+    }
+
+    #[test]
+    fn mux_next_session_cycles_back_to_the_parked_session() {
+        let mut model = model();
+        let original_name = model.mux_session.name.clone();
+        model.run_command(mux_command_ids::NEW_SESSION);
+        let new_name = model.mux_session.name.clone();
+
+        model.run_command(mux_command_ids::NEXT_SESSION);
+        assert_eq!(model.mux_session.name, original_name);
+        assert_eq!(model.mux_parked.len(), 1);
+        assert_eq!(model.mux_parked[0].name, new_name);
+    }
+
+    #[test]
+    fn mux_overlay_arrow_keys_and_enter_attach_to_a_parked_session() {
+        let mut model = model();
+        let original_name = model.mux_session.name.clone();
+        model.run_command(mux_command_ids::NEW_SESSION);
+        let new_name = model.mux_session.name.clone();
+        model.run_command(mux_command_ids::DETACH);
+        assert!(!model.mux_attached);
+
+        model.layout.focus(PaneId::Terminal);
+        // Highlight index 1 (the parked original) and press Enter to attach.
+        model.dispatch(chord("ArrowDown"));
+        assert_eq!(model.mux_overlay_index, 1);
+        model.dispatch(chord("Enter"));
+
+        assert!(model.mux_attached);
+        assert_eq!(model.mux_session.name, original_name);
+        assert_eq!(model.mux_parked.len(), 1);
+        assert_eq!(model.mux_parked[0].name, new_name);
     }
 
     #[test]
