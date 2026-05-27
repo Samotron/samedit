@@ -301,6 +301,13 @@ pub struct AppModel {
     /// Tracks `<leader>c` in the editor pane so `<leader>ca` can dispatch the
     /// quick-fix command without adding a parallel command path.
     editor_pending_leader: u8,
+    /// Tracks a pending `g` while in mux copy mode so `gg` can jump to the
+    /// top of the scrollback (M7.6).
+    mux_copy_pending_g: bool,
+    /// Buffer holding text yanked from the most recent copy-mode selection
+    /// (M7.6). Clipboard wiring is a follow-up; the buffer surfaces in the
+    /// status line so the workflow is usable today.
+    mux_copy_yank: Option<String>,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -405,6 +412,8 @@ impl AppModel {
             analytics: None,
             editor_pending_g: false,
             editor_pending_leader: 0,
+            mux_copy_pending_g: false,
+            mux_copy_yank: None,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -1670,7 +1679,16 @@ impl AppModel {
         if self.mux_session.active_pane().mode != PaneMode::Copy {
             return false;
         }
+
+        // Search-input substate captures every printable key for the query.
+        if self.mux_session.copy_search_query().is_some() {
+            self.handle_mux_copy_mode_search_input(chord);
+            return true;
+        }
+
         let (max_row, max_col) = self.copy_mode_grid_bounds();
+        let row_text = self.copy_mode_row_text(self.mux_session.active_pane().copy_cursor.row);
+        let pending_g = std::mem::take(&mut self.mux_copy_pending_g);
 
         if chord == &KeyChord::single("Escape", Modifiers::NONE) {
             let pane = self.mux_session.exit_copy_mode();
@@ -1709,8 +1727,113 @@ impl AppModel {
                 ),
                 None => "Mux: copy selection cleared.".to_string(),
             };
+        } else if chord == &KeyChord::single("w", Modifiers::NONE) {
+            if let Some(cursor) = self.mux_session.copy_word_forward(&row_text, max_col) {
+                self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+            }
+        } else if chord == &KeyChord::single("b", Modifiers::NONE) {
+            if let Some(cursor) = self.mux_session.copy_word_backward(&row_text) {
+                self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+            }
+        } else if chord == &KeyChord::single("g", Modifiers::NONE) {
+            if pending_g {
+                if let Some(offset) = self.mux_session.copy_top_of_scrollback(usize::MAX) {
+                    self.status = format!("Mux: copy mode offset {offset}.");
+                }
+            } else {
+                self.mux_copy_pending_g = true;
+            }
+        } else if is_shift_letter_chord(chord, 'g') {
+            if let Some(offset) = self.mux_session.copy_bottom_of_scrollback() {
+                self.status = format!("Mux: copy mode offset {offset}.");
+            }
+        } else if chord == &KeyChord::single("y", Modifiers::NONE) {
+            self.mux_copy_yank_selection();
+        } else if chord == &KeyChord::single("/", Modifiers::NONE) {
+            self.mux_session.begin_copy_search();
+            self.status = "Mux: copy search /".to_string();
+        } else if chord == &KeyChord::single("n", Modifiers::NONE) {
+            let rows = self.copy_mode_visible_rows();
+            let row_refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            if let Some(cursor) = self.mux_session.repeat_copy_search_forward(&row_refs) {
+                self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+            } else {
+                self.status = "Mux: copy search — no more matches.".to_string();
+            }
         }
         true
+    }
+
+    /// Drive the active pane's pending search input from a single chord.
+    fn handle_mux_copy_mode_search_input(&mut self, chord: &KeyChord) {
+        self.mux_copy_pending_g = false;
+        if chord == &KeyChord::single("Escape", Modifiers::NONE) {
+            self.mux_session.cancel_copy_search();
+            self.status = "Mux: copy search cancelled.".to_string();
+            return;
+        }
+        if chord == &KeyChord::single("Enter", Modifiers::NONE) {
+            let rows = self.copy_mode_visible_rows();
+            let row_refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            match self.mux_session.finish_copy_search(&row_refs) {
+                Some(cursor) => {
+                    self.status = format!("Mux: copy search → {}:{}.", cursor.row, cursor.col);
+                }
+                None => {
+                    self.status = "Mux: copy search — no match.".to_string();
+                }
+            }
+            return;
+        }
+        if chord == &KeyChord::single("Backspace", Modifiers::NONE) {
+            self.mux_session.pop_copy_search_char();
+            self.status = format!(
+                "Mux: copy search /{}",
+                self.mux_session.copy_search_query().unwrap_or("")
+            );
+            return;
+        }
+        if let Some(ch) = chord_to_char(chord) {
+            self.mux_session.push_copy_search_char(ch);
+            self.status = format!(
+                "Mux: copy search /{}",
+                self.mux_session.copy_search_query().unwrap_or("")
+            );
+        }
+    }
+
+    /// Capture the active pane's selection into the yank buffer (M7.6 `y`).
+    fn mux_copy_yank_selection(&mut self) {
+        let rows = self.copy_mode_visible_rows();
+        let row_refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let Some(text) = self.mux_session.copy_selection_text(&row_refs) else {
+            self.status = "Mux: copy mode — no selection to yank.".to_string();
+            return;
+        };
+        let chars = text.chars().count();
+        self.mux_copy_yank = Some(text);
+        let pane = self.mux_session.exit_copy_mode();
+        self.status = format!("Mux: yanked {chars} characters from {pane}.");
+    }
+
+    /// Snapshot of the visible terminal grid rows for the active pane. Used
+    /// as the text content for copy-mode motions, selection, and search.
+    fn copy_mode_visible_rows(&self) -> Vec<String> {
+        let Some(terminal) = self.active_terminal() else {
+            return Vec::new();
+        };
+        let grid = terminal.snapshot().grid;
+        (0..grid.height())
+            .map(|row| grid.row_text(row).unwrap_or_default())
+            .collect()
+    }
+
+    /// Fetch the row text at `row` from the active pane's terminal grid.
+    fn copy_mode_row_text(&self, row: usize) -> String {
+        let Some(terminal) = self.active_terminal() else {
+            return String::new();
+        };
+        terminal.snapshot().grid.row_text(row).unwrap_or_default()
     }
 
     fn copy_mode_grid_bounds(&self) -> (usize, usize) {
@@ -3828,6 +3951,37 @@ fn mux_rect_contains(rect: MuxRect, position: PointerPosition) -> bool {
 /// True when `chord` is a single unmodified press of `key`.
 fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
+}
+
+/// True when `chord` is `Shift+<letter>`. winit emits the lower-case key plus
+/// the shift modifier (see `cockpit_render::key_event`), but parsed text
+/// chords (`"G"`) come through as the upper-case key with no modifier.
+fn is_shift_letter_chord(chord: &KeyChord, lower: char) -> bool {
+    let Some(stroke) = chord.strokes().first() else {
+        return false;
+    };
+    if chord.strokes().len() != 1 {
+        return false;
+    }
+    let modifiers = stroke.modifiers();
+    if modifiers.ctrl || modifiers.alt || modifiers.meta {
+        return false;
+    }
+    let key = stroke.key();
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    if first == lower.to_ascii_uppercase() && !modifiers.shift {
+        return true;
+    }
+    if first == lower && modifiers.shift {
+        return true;
+    }
+    false
 }
 
 /// Translate a single-stroke key chord into a Vim state-machine key.
@@ -6065,6 +6219,95 @@ mod tests {
         model.dispatch(chord("Escape"));
         assert_eq!(model.mux_session.active_pane().mode, PaneMode::Live);
         assert!(model.status.contains("copy mode exited for pane-0"));
+    }
+
+    #[test]
+    fn mux_copy_mode_gg_jumps_to_the_top_of_the_scrollback() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        // First `g` is recorded as pending — scrollback stays put.
+        model.dispatch(chord("g"));
+        assert_eq!(model.mux_session.active_pane().scrollback_offset, 0);
+
+        // Second `g` completes `gg` and jumps to the top of the scrollback.
+        model.dispatch(chord("g"));
+        assert_eq!(
+            model.mux_session.active_pane().scrollback_offset,
+            usize::MAX
+        );
+
+        // Capital `G` snaps back to the live edge.
+        model.dispatch(chord("Shift+g"));
+        assert_eq!(model.mux_session.active_pane().scrollback_offset, 0);
+    }
+
+    #[test]
+    fn mux_copy_mode_yank_exits_copy_mode_and_stashes_the_selection() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        // Anchor a selection in headless mode by talking to the session
+        // directly — the visible rows source returns empty without a real
+        // terminal, but the selection state still exercises the chord wiring.
+        model.mux_session.move_copy_cursor(0, 0, 0, 0);
+        model.mux_session.toggle_copy_selection();
+        model.dispatch(chord("y"));
+
+        assert_eq!(model.mux_session.active_pane().mode, PaneMode::Live);
+        assert_eq!(model.mux_copy_yank.as_deref(), Some(""));
+        assert!(model.status.contains("yanked"));
+    }
+
+    #[test]
+    fn mux_copy_mode_yank_without_selection_keeps_copy_mode_active() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        model.dispatch(chord("y"));
+
+        assert_eq!(model.mux_session.active_pane().mode, PaneMode::Copy);
+        assert!(model.mux_copy_yank.is_none());
+        assert!(model.status.contains("no selection to yank"));
+    }
+
+    #[test]
+    fn mux_copy_mode_search_input_captures_chars_until_enter() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        model.dispatch(chord("/"));
+        model.dispatch(chord("f"));
+        model.dispatch(chord("o"));
+        model.dispatch(chord("o"));
+        assert_eq!(model.mux_session.copy_search_query(), Some("foo"));
+
+        // Backspace pops, Enter finishes — with no visible rows the search
+        // simply yields "no match" and clears the pending query.
+        model.dispatch(chord("Backspace"));
+        assert_eq!(model.mux_session.copy_search_query(), Some("fo"));
+
+        model.dispatch(chord("Enter"));
+        assert_eq!(model.mux_session.copy_search_query(), None);
+        assert!(model.status.contains("no match"));
+    }
+
+    #[test]
+    fn mux_copy_mode_search_escape_cancels_the_pending_query() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        model.dispatch(chord("/"));
+        model.dispatch(chord("a"));
+        model.dispatch(chord("Escape"));
+
+        assert_eq!(model.mux_session.copy_search_query(), None);
+        assert!(model.status.contains("search cancelled"));
     }
 
     #[test]

@@ -302,6 +302,12 @@ pub struct CopySelection {
     pub anchor: CopyCursor,
 }
 
+/// Pending copy-mode forward search state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopySearch {
+    pub query: String,
+}
+
 /// One terminal pane. Real PTY handles live in `cockpit-terminal`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pane {
@@ -312,6 +318,10 @@ pub struct Pane {
     pub copy_cursor: CopyCursor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_selection: Option<CopySelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_search: Option<CopySearch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_search: Option<String>,
 }
 
 impl Pane {
@@ -322,6 +332,8 @@ impl Pane {
             mode: PaneMode::Live,
             copy_cursor: CopyCursor::default(),
             copy_selection: None,
+            copy_search: None,
+            last_search: None,
         }
     }
 
@@ -706,6 +718,8 @@ impl Session {
         pane.scrollback_offset = 0;
         pane.copy_cursor = CopyCursor::default();
         pane.copy_selection = None;
+        pane.copy_search = None;
+        pane.last_search = None;
         pane_id
     }
 
@@ -717,6 +731,8 @@ impl Session {
         pane.scrollback_offset = 0;
         pane.copy_cursor = CopyCursor::default();
         pane.copy_selection = None;
+        pane.copy_search = None;
+        pane.last_search = None;
         pane_id
     }
 
@@ -776,6 +792,148 @@ impl Session {
             }),
         };
         Some(pane.copy_selection)
+    }
+
+    /// Jump the copy-mode viewport to the top of the scrollback (vim `gg`).
+    pub fn copy_top_of_scrollback(&mut self, max_offset: usize) -> Option<usize> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        pane.scrollback_offset = max_offset;
+        Some(pane.scrollback_offset)
+    }
+
+    /// Jump the copy-mode viewport to the live edge (vim `G` in tmux copy-mode-vi).
+    pub fn copy_bottom_of_scrollback(&mut self) -> Option<usize> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        pane.scrollback_offset = 0;
+        Some(pane.scrollback_offset)
+    }
+
+    /// Move the active copy-mode cursor to the next word start on `row_text`
+    /// (vim `w`).
+    pub fn copy_word_forward(&mut self, row_text: &str, max_col: usize) -> Option<CopyCursor> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        pane.copy_cursor.col = next_word_col(row_text, pane.copy_cursor.col).min(max_col);
+        Some(pane.copy_cursor)
+    }
+
+    /// Move the active copy-mode cursor to the previous word start on
+    /// `row_text` (vim `b`).
+    pub fn copy_word_backward(&mut self, row_text: &str) -> Option<CopyCursor> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        pane.copy_cursor.col = prev_word_col(row_text, pane.copy_cursor.col);
+        Some(pane.copy_cursor)
+    }
+
+    /// Extract the active pane's currently selected text from `rows`. Each
+    /// entry in `rows` is one display line, top-to-bottom in the viewport.
+    /// Selection is inclusive of both endpoints (matches tmux copy-mode-vi
+    /// yank semantics).
+    pub fn copy_selection_text(&self, rows: &[&str]) -> Option<String> {
+        let pane = self.active_pane();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        let (start, end) = pane.copy_selection_range()?;
+        Some(extract_selection_text(rows, start, end))
+    }
+
+    /// Begin a copy-mode forward search. Returns `false` if the active pane
+    /// is not in copy mode.
+    pub fn begin_copy_search(&mut self) -> bool {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return false;
+        }
+        pane.copy_search = Some(CopySearch::default());
+        true
+    }
+
+    /// Append `ch` to the active pane's pending search query. No-op when no
+    /// search is in progress.
+    pub fn push_copy_search_char(&mut self, ch: char) -> Option<String> {
+        let pane = self.active_pane_mut();
+        let search = pane.copy_search.as_mut()?;
+        search.query.push(ch);
+        Some(search.query.clone())
+    }
+
+    /// Drop the last char from the pending search query. Cancels the search
+    /// once the query becomes empty.
+    pub fn pop_copy_search_char(&mut self) -> Option<String> {
+        let pane = self.active_pane_mut();
+        let search = pane.copy_search.as_mut()?;
+        search.query.pop();
+        if search.query.is_empty() {
+            pane.copy_search = None;
+            return Some(String::new());
+        }
+        Some(search.query.clone())
+    }
+
+    /// Abandon the pending copy-mode search.
+    pub fn cancel_copy_search(&mut self) -> bool {
+        let pane = self.active_pane_mut();
+        if pane.copy_search.is_none() {
+            return false;
+        }
+        pane.copy_search = None;
+        true
+    }
+
+    /// Snapshot of the pending copy-mode search query, if any.
+    pub fn copy_search_query(&self) -> Option<&str> {
+        let pane = self.active_pane();
+        pane.copy_search
+            .as_ref()
+            .map(|search| search.query.as_str())
+    }
+
+    /// Run the pending copy-mode search forward across `rows`. On match,
+    /// moves the cursor to the first hit at or after the current cursor
+    /// position and stores the query as the pane's last completed search.
+    /// On no-match leaves the cursor where it was. Returns the resulting
+    /// match position when found.
+    pub fn finish_copy_search(&mut self, rows: &[&str]) -> Option<CopyCursor> {
+        let pane = self.active_pane_mut();
+        let query = pane
+            .copy_search
+            .as_ref()
+            .map(|search| search.query.clone())?;
+        pane.copy_search = None;
+        if query.is_empty() {
+            return None;
+        }
+        let start = pane.copy_cursor;
+        let hit = find_match_forward(rows, &query, start)?;
+        pane.copy_cursor = hit;
+        pane.last_search = Some(query);
+        Some(hit)
+    }
+
+    /// Jump to the next match of the last completed search (`n` in tmux
+    /// copy-mode-vi).
+    pub fn repeat_copy_search_forward(&mut self, rows: &[&str]) -> Option<CopyCursor> {
+        let pane = self.active_pane_mut();
+        if pane.mode != PaneMode::Copy {
+            return None;
+        }
+        let query = pane.last_search.clone()?;
+        let after = next_position(pane.copy_cursor, rows);
+        let hit = find_match_forward(rows, &query, after)?;
+        pane.copy_cursor = hit;
+        Some(hit)
     }
 
     /// Resize the split that directly contains the active pane.
@@ -993,6 +1151,126 @@ fn normalize_selection(left: CopyCursor, right: CopyCursor) -> (CopyCursor, Copy
         (left, right)
     } else {
         (right, left)
+    }
+}
+
+/// Column of the next word start on or after `col` in `text`. Whitespace-only
+/// tails saturate at the line length so the caller can clamp against its own
+/// max column.
+fn next_word_col(text: &str, col: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return 0;
+    }
+    let mut i = col.min(chars.len());
+    if i < chars.len() && !chars[i].is_whitespace() {
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+    }
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Column of the previous word start before `col` in `text`.
+fn prev_word_col(text: &str, col: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    if col == 0 || chars.is_empty() {
+        return 0;
+    }
+    let mut i = col.saturating_sub(1).min(chars.len().saturating_sub(1));
+    while i > 0 && chars[i].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+/// Extract selection text from `rows`, inclusive of both endpoints.
+fn extract_selection_text(rows: &[&str], start: CopyCursor, end: CopyCursor) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    if start.row == end.row {
+        return slice_row(
+            rows.get(start.row).copied().unwrap_or(""),
+            start.col,
+            end.col + 1,
+        );
+    }
+    let mut out = String::new();
+    for row_idx in start.row..=end.row {
+        let line = rows.get(row_idx).copied().unwrap_or("");
+        if row_idx == start.row {
+            let chars: Vec<char> = line.chars().collect();
+            let from = start.col.min(chars.len());
+            out.extend(&chars[from..]);
+        } else if row_idx == end.row {
+            let chars: Vec<char> = line.chars().collect();
+            let to = (end.col + 1).min(chars.len());
+            out.extend(&chars[..to]);
+        } else {
+            out.push_str(line);
+        }
+        if row_idx < end.row {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Substring of `line` between char-index columns `start..end`, clamped.
+fn slice_row(line: &str, start: usize, end: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let from = start.min(chars.len());
+    let to = end.min(chars.len()).max(from);
+    chars[from..to].iter().collect()
+}
+
+/// Find the first match of `needle` in `rows` at or after `from`. Returns the
+/// matching cursor position (row + char column).
+fn find_match_forward(rows: &[&str], needle: &str, from: CopyCursor) -> Option<CopyCursor> {
+    if needle.is_empty() {
+        return None;
+    }
+    for (row_idx, line) in rows.iter().enumerate().skip(from.row) {
+        let chars: Vec<char> = line.chars().collect();
+        let start_col = if row_idx == from.row { from.col } else { 0 };
+        if start_col > chars.len() {
+            continue;
+        }
+        let haystack: String = chars[start_col..].iter().collect();
+        if let Some(byte_idx) = haystack.find(needle) {
+            let char_offset = haystack[..byte_idx].chars().count();
+            return Some(CopyCursor {
+                row: row_idx,
+                col: start_col + char_offset,
+            });
+        }
+    }
+    None
+}
+
+/// One position past `cursor` so search-next doesn't re-match the current hit.
+fn next_position(cursor: CopyCursor, rows: &[&str]) -> CopyCursor {
+    let line_len = rows
+        .get(cursor.row)
+        .map(|line| line.chars().count())
+        .unwrap_or(0);
+    if cursor.col < line_len {
+        CopyCursor {
+            row: cursor.row,
+            col: cursor.col + 1,
+        }
+    } else {
+        CopyCursor {
+            row: cursor.row + 1,
+            col: 0,
+        }
     }
 }
 
@@ -1599,6 +1877,220 @@ mod tests {
         session.exit_copy_mode();
         assert_eq!(session.active_pane().mode, PaneMode::Live);
         assert_eq!(session.active_pane().copy_selection, None);
+    }
+
+    #[test]
+    fn copy_mode_gg_and_g_capital_jump_to_scrollback_extents() {
+        let mut session = Session::new("dev");
+        assert_eq!(session.copy_top_of_scrollback(40), None);
+        session.enter_copy_mode();
+
+        assert_eq!(session.copy_top_of_scrollback(40), Some(40));
+        assert_eq!(session.active_pane().scrollback_offset, 40);
+        assert_eq!(session.copy_bottom_of_scrollback(), Some(0));
+        assert_eq!(session.active_pane().scrollback_offset, 0);
+    }
+
+    #[test]
+    fn copy_mode_word_motions_walk_to_the_next_and_previous_word() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+
+        // "hello world cockpit"
+        //  0     6     12
+        assert_eq!(
+            session.copy_word_forward("hello world cockpit", 80),
+            Some(CopyCursor { row: 0, col: 6 })
+        );
+        assert_eq!(
+            session.copy_word_forward("hello world cockpit", 80),
+            Some(CopyCursor { row: 0, col: 12 })
+        );
+        // Saturates at line end (whitespace-tail clamps).
+        assert_eq!(
+            session.copy_word_forward("hello world cockpit", 80),
+            Some(CopyCursor { row: 0, col: 19 })
+        );
+
+        assert_eq!(
+            session.copy_word_backward("hello world cockpit"),
+            Some(CopyCursor { row: 0, col: 12 })
+        );
+        assert_eq!(
+            session.copy_word_backward("hello world cockpit"),
+            Some(CopyCursor { row: 0, col: 6 })
+        );
+        assert_eq!(
+            session.copy_word_backward("hello world cockpit"),
+            Some(CopyCursor { row: 0, col: 0 })
+        );
+    }
+
+    #[test]
+    fn copy_mode_word_motions_clamp_to_max_col() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+
+        assert_eq!(
+            session.copy_word_forward("alpha beta gamma", 7),
+            Some(CopyCursor { row: 0, col: 6 })
+        );
+        assert_eq!(
+            session.copy_word_forward("alpha beta gamma", 7),
+            Some(CopyCursor { row: 0, col: 7 })
+        );
+    }
+
+    #[test]
+    fn copy_mode_word_motions_no_op_outside_copy_mode() {
+        let mut session = Session::new("dev");
+        assert_eq!(session.copy_word_forward("hello world", 80), None);
+        assert_eq!(session.copy_word_backward("hello world"), None);
+    }
+
+    #[test]
+    fn copy_mode_selection_text_extracts_a_single_line() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+        session.move_copy_cursor(0, 6, 5, 80);
+        session.toggle_copy_selection();
+        session.move_copy_cursor(0, 4, 5, 80);
+
+        assert_eq!(
+            session.copy_selection_text(&["hello world cockpit"]),
+            Some("world".to_string())
+        );
+    }
+
+    #[test]
+    fn copy_mode_selection_text_spans_multiple_rows() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+        // Anchor at (0, 2); selection cursor at (2, 1) — inclusive of both ends.
+        session.move_copy_cursor(0, 2, 5, 80);
+        session.toggle_copy_selection();
+        session.move_copy_cursor(2, -1, 5, 80);
+
+        let rows = ["abcdef", "ghijkl", "mnopqr", "stuvwx"];
+        assert_eq!(
+            session.copy_selection_text(&rows),
+            Some("cdef\nghijkl\nmn".to_string())
+        );
+    }
+
+    #[test]
+    fn copy_mode_selection_text_returns_none_without_a_selection() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+        assert_eq!(session.copy_selection_text(&["a", "b"]), None);
+    }
+
+    #[test]
+    fn copy_mode_search_input_records_query_and_supports_backspace() {
+        let mut session = Session::new("dev");
+        assert!(!session.begin_copy_search());
+
+        session.enter_copy_mode();
+        assert!(session.begin_copy_search());
+        assert_eq!(session.copy_search_query(), Some(""));
+
+        assert_eq!(session.push_copy_search_char('f'), Some("f".to_string()));
+        assert_eq!(session.push_copy_search_char('o'), Some("fo".to_string()));
+        assert_eq!(session.push_copy_search_char('o'), Some("foo".to_string()));
+        assert_eq!(session.copy_search_query(), Some("foo"));
+
+        assert_eq!(session.pop_copy_search_char(), Some("fo".to_string()));
+        assert_eq!(session.copy_search_query(), Some("fo"));
+    }
+
+    #[test]
+    fn copy_mode_search_pop_clears_the_query_when_empty() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+        session.begin_copy_search();
+        session.push_copy_search_char('a');
+
+        assert_eq!(session.pop_copy_search_char(), Some(String::new()));
+        assert_eq!(session.copy_search_query(), None);
+    }
+
+    #[test]
+    fn copy_mode_search_cancel_drops_the_pending_query() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+        session.begin_copy_search();
+        session.push_copy_search_char('x');
+
+        assert!(session.cancel_copy_search());
+        assert_eq!(session.copy_search_query(), None);
+        assert!(!session.cancel_copy_search());
+    }
+
+    #[test]
+    fn copy_mode_search_finishes_by_jumping_to_the_first_match() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+        session.begin_copy_search();
+        for ch in "world".chars() {
+            session.push_copy_search_char(ch);
+        }
+
+        let rows = ["hello world", "cockpit world"];
+        let hit = session.finish_copy_search(&rows);
+        assert_eq!(hit, Some(CopyCursor { row: 0, col: 6 }));
+        assert_eq!(
+            session.active_pane().copy_cursor,
+            CopyCursor { row: 0, col: 6 }
+        );
+        assert_eq!(session.copy_search_query(), None);
+        assert_eq!(session.active_pane().last_search.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn copy_mode_search_finish_leaves_cursor_when_no_match() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+        session.move_copy_cursor(1, 2, 5, 10);
+        session.begin_copy_search();
+        for ch in "nope".chars() {
+            session.push_copy_search_char(ch);
+        }
+
+        let rows = ["hello world", "cockpit world"];
+        assert_eq!(session.finish_copy_search(&rows), None);
+        assert_eq!(
+            session.active_pane().copy_cursor,
+            CopyCursor { row: 1, col: 2 }
+        );
+        assert_eq!(session.copy_search_query(), None);
+        assert!(session.active_pane().last_search.is_none());
+    }
+
+    #[test]
+    fn copy_mode_repeat_search_walks_to_the_next_match() {
+        let mut session = Session::new("dev");
+        session.enter_copy_mode();
+        session.begin_copy_search();
+        for ch in "world".chars() {
+            session.push_copy_search_char(ch);
+        }
+
+        let rows = ["hello world", "cockpit world", "world again"];
+        session.finish_copy_search(&rows);
+        assert_eq!(
+            session.active_pane().copy_cursor,
+            CopyCursor { row: 0, col: 6 }
+        );
+
+        assert_eq!(
+            session.repeat_copy_search_forward(&rows),
+            Some(CopyCursor { row: 1, col: 8 })
+        );
+        assert_eq!(
+            session.repeat_copy_search_forward(&rows),
+            Some(CopyCursor { row: 2, col: 0 })
+        );
+        assert_eq!(session.repeat_copy_search_forward(&rows), None);
     }
 
     #[test]

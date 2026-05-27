@@ -891,7 +891,22 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
     scrollback-ring renderer a stable viewport, cursor, and selection
     state. Copy-mode panes render their mode, offset, cursor position,
     and selection range in the mux pane label, and the command is also
-    exposed through the palette. Search/yank remain the next M7.6 layer.
+    exposed through the palette.
+  - Motions layer: `gg` / `G` jump to the top of the scrollback /
+    live edge; `w` / `b` walk word boundaries on the active line using
+    the visible grid row text. The chord handler tracks a single-key
+    `g` pending flag so the second `g` completes `gg` without a parallel
+    FSM. Word motions clamp to the same max column used by `h/l/0/$`.
+  - Yank + search layer: `y` extracts the current selection text from
+    the visible terminal grid and stashes it in `AppModel::mux_copy_yank`
+    (clipboard plumbing is the next sub-task — wiring goes through
+    `cockpit-render` since `winit` doesn't expose clipboard directly,
+    so a small `arboard` integration will likely land alongside the
+    UI-side wire-up). `/` enters a search-input substate; characters
+    accumulate into the pane's `CopySearch::query`, Backspace pops,
+    Escape cancels, and Enter runs the forward search across the
+    visible rows and jumps the cursor to the first match. `n` repeats
+    the last completed search forward from the cursor.
 - Tests: golden of the rendered selection after a recorded key script
   on a fixture scrollback.
 
