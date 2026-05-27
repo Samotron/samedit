@@ -533,7 +533,14 @@ pub struct Session {
 impl Session {
     /// Create a session with one window and one live pane.
     pub fn new(name: impl Into<String>) -> Self {
-        let mut ids = Ids::default();
+        Self::with_id_base(name, 0)
+    }
+
+    /// Create a session with one window and one live pane whose window /
+    /// pane id counters start from `id_base`. Used by [`SessionRegistry`]
+    /// so concurrent sessions hand out non-overlapping ids (v0.7 M7.5).
+    pub fn with_id_base(name: impl Into<String>, id_base: u64) -> Self {
+        let mut ids = Ids::starting_at(id_base);
         let first_window = ids.window();
         let first_pane = Pane::new(ids.pane());
         Self {
@@ -1084,6 +1091,12 @@ impl Session {
     }
 }
 
+/// Per-session id stride for pane/window allocation. Keeps sessions from
+/// colliding when the registry hands out ids across multiple in-flight
+/// sessions (v0.7 M7.5). One million ids per session is more than any real
+/// user-driven workflow will hit.
+pub const SESSION_ID_STRIDE: u64 = 1_000_000;
+
 /// Multi-session registry for the native multiplexer (v0.7 M7.5).
 ///
 /// Cockpit keeps every detached session running in-process: a detach flips
@@ -1152,10 +1165,11 @@ impl SessionRegistry {
     }
 
     /// Create a new session, register it, and activate it. The session
-    /// inherits a single live pane.
+    /// inherits a single live pane. Window/pane ids start from a fresh
+    /// stride so they never collide with already-registered sessions.
     pub fn create(&mut self, name: impl Into<String>) -> SessionId {
-        let mut session = Session::new(name);
         let id = self.alloc_session_id();
+        let mut session = Session::with_id_base(name, id.0 * SESSION_ID_STRIDE);
         session.id = id;
         self.sessions.push(session);
         self.active = id;
@@ -1356,6 +1370,13 @@ struct Ids {
 }
 
 impl Ids {
+    fn starting_at(base: u64) -> Self {
+        Self {
+            next_window: base,
+            next_pane: base,
+        }
+    }
+
     fn window(&mut self) -> WindowId {
         let id = WindowId(self.next_window);
         self.next_window += 1;
@@ -2679,6 +2700,31 @@ mod tests {
             MuxError::CannotKillLastSession
         );
         assert_eq!(registry.sessions().len(), 1);
+    }
+
+    #[test]
+    fn session_registry_create_allocates_pane_ids_in_a_disjoint_range() {
+        let mut registry = SessionRegistry::new(Session::new("dev"));
+        // First session was created with base 0 — pane and window both
+        // start there.
+        let first_pane = registry.active().active_pane().id;
+        assert_eq!(first_pane, PaneId(0));
+
+        registry.create("scratch");
+        // Newly created session owns ids >= SESSION_ID_STRIDE.
+        let scratch_pane = registry.active().active_pane().id;
+        assert!(
+            scratch_pane.get() >= SESSION_ID_STRIDE,
+            "expected non-overlapping pane id, got {scratch_pane}"
+        );
+
+        // Splitting the new session continues to allocate inside its own
+        // stride window.
+        let split = registry
+            .active_mut()
+            .split_active(SplitDirection::Horizontal);
+        assert!(split.get() >= SESSION_ID_STRIDE);
+        assert!(split.get() < SESSION_ID_STRIDE * 3);
     }
 
     #[test]

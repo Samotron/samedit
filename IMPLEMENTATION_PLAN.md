@@ -875,8 +875,12 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   is attached, allocates fresh session ids on `create` / `add`, and
   exposes `detach` / `attach(id)` / `kill(id)` operations.
   `Session::set_name` is the rename hook the overlay will drive.
-  Cross-session pane-id allocation, the actual `Ctrl+b d` /
-  session-list overlay UI, and PTY-key rewiring are the next sub-task.
+  Cross-session pane-id collisions are resolved by handing each
+  registry-created session a disjoint id stride
+  (`SESSION_ID_STRIDE = 1_000_000`) via the new
+  `Session::with_id_base` constructor — splits inside that session keep
+  allocating within its own range. The actual `Ctrl+b d` /
+  session-list overlay UI and PTY-key rewiring are the next sub-task.
 - Tests: scripted detach → attach round-trip preserves the layout tree
   and pane focus.
 
