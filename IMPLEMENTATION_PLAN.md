@@ -1145,8 +1145,21 @@ running upstream CLIs the user already has. That is the whole point.
   hard rule #5). `AppModel::apply_user_config` snapshots
   `config.panes.tools` into `AppModel::tool_recipes`; the palette
   `open` path appends the dynamic recipe entries to the static set.
-  Triggering a recipe today sends the command string to the active
-  terminal pane.
+- ✅ Detection: `run_tool_recipe` probes `recipe.detect_binary()`
+  against the project's mise `[tools]` list and the host `$PATH` and
+  refuses to dispatch with a "`<binary>` not found. `mise use
+  <binary>@latest`?" toast (AGENTS §2 hard rule #6).
+- ✅ Floating-pane primitive: `cockpit-mux::Session::open_floating`,
+  `toggle_floating`, `show_floating`, `hide_floating`, `close_floating`
+  manage a single overlay per session. `Session::floating_rect`
+  projects an 80% × 80% centred rectangle for the painter, which now
+  draws the overlay above the regular split tree.
+  `mux.floating.toggle` / `mux.floating.close` palette commands manage
+  the slot; tool recipes with `layout = "floating"` open into it. A
+  repeat dispatch with `toggle = true` hides the overlay while the
+  PTY keeps running; the third press resumes it without respawning.
+- Side-right and bottom slotted layouts still type the command into
+  the active pane today — dedicated docked panes are a follow-up.
 - Mux gains two primitives on top of M7.4's split tree:
   - **Floating pane** — overlay rectangle centred over the project,
     sized 80% × 80%, drawn above the regular layout. Single floating

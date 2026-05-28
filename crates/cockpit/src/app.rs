@@ -1088,6 +1088,8 @@ impl AppModel {
             mux_command_ids::NEW_SESSION => self.mux_new_session(),
             mux_command_ids::NEXT_SESSION => self.mux_cycle_session(1),
             mux_command_ids::PREVIOUS_SESSION => self.mux_cycle_session(-1),
+            mux_command_ids::FLOATING_TOGGLE => self.mux_toggle_floating(),
+            mux_command_ids::FLOATING_CLOSE => self.mux_close_floating(),
             other => {
                 if let Some(index) = mux_select_window_index(other) {
                     self.mux_select_window(index);
@@ -1339,11 +1341,13 @@ impl AppModel {
         self.status = format!("Mux: selected {preset:?} layout.");
     }
 
-    /// Run a tool-pane recipe by name (v0.8 M8.2). The recipe's command is
-    /// sent to the active terminal pane, with the layout slot tracked in the
-    /// status line. Floating-pane and side-pane spawn behaviour land in a
-    /// follow-up. Missing binaries surface a friendly toast rather than
-    /// auto-installing (AGENTS §2 hard rule #6).
+    /// Run a tool-pane recipe by name (v0.8 M8.2). Floating recipes
+    /// open a centred overlay (single overlay per session, toggled by a
+    /// repeat keybind when `recipe.toggle` is true). Other layouts
+    /// still send the command into the active pane today — side-right
+    /// and bottom slotted spawn behaviour lands in a follow-up. Missing
+    /// binaries surface a friendly toast rather than auto-installing
+    /// (AGENTS §2 hard rule #6).
     fn run_tool_recipe(&mut self, name: &str) {
         let Some(recipe) = self.tool_recipes.get(name).cloned() else {
             self.status = format!("Tool `{name}` not configured.");
@@ -1356,6 +1360,12 @@ impl AppModel {
             );
             return;
         }
+
+        if recipe.layout == cockpit_config::ToolPaneLayout::Floating {
+            self.open_floating_tool_recipe(name, &recipe);
+            return;
+        }
+
         self.ensure_terminal();
         let payload = format!("{}\r", recipe.command);
         match self.active_terminal_mut() {
@@ -1370,6 +1380,68 @@ impl AppModel {
                 Err(err) => self.status = format!("Tool `{name}` failed: {err}"),
             },
             None => self.status = format!("Tool `{name}` — terminal unavailable."),
+        }
+    }
+
+    /// Open / toggle a floating tool-pane (v0.8 M8.2). Re-running the
+    /// same recipe while it's already floating toggles visibility when
+    /// `recipe.toggle` is set; otherwise it replaces the floating pane
+    /// and respawns the PTY.
+    fn open_floating_tool_recipe(&mut self, name: &str, recipe: &cockpit_config::ToolPaneRecipe) {
+        let already_visible = self
+            .mux_session
+            .floating
+            .as_ref()
+            .is_some_and(|floating| floating.label == name && floating.visible);
+        if already_visible && recipe.toggle {
+            self.mux_session.hide_floating();
+            self.layout.focus(PaneId::Terminal);
+            self.status = format!("Tool: `{name}` hidden.");
+            return;
+        }
+        // Re-show a hidden pane for the same recipe without respawning.
+        let resumed = self
+            .mux_session
+            .floating
+            .as_ref()
+            .is_some_and(|floating| floating.label == name && !floating.visible);
+        if resumed {
+            if let Some(pane) = self.mux_session.show_floating() {
+                self.layout.focus(PaneId::Terminal);
+                self.status = format!("Tool: `{name}` resumed in {pane}.");
+            }
+            return;
+        }
+        // Otherwise: close the previous overlay (if any) and open a fresh one.
+        if let Some(previous) = self.mux_session.close_floating() {
+            self.terminals.remove(&previous);
+        }
+        let pane = self.mux_session.open_floating(name);
+        self.mux_pane_commands.insert(pane, recipe.command.clone());
+        self.ensure_terminal_for_pane(pane);
+        self.layout.focus(PaneId::Terminal);
+        self.status = format!("Tool: `{name}` floating in {pane}.");
+    }
+
+    /// Toggle the active floating pane's visibility (v0.8 M8.2). PTY
+    /// keeps running while hidden.
+    fn mux_toggle_floating(&mut self) {
+        match self.mux_session.toggle_floating() {
+            Some(true) => self.status = "Mux: floating pane shown.".to_string(),
+            Some(false) => self.status = "Mux: floating pane hidden.".to_string(),
+            None => self.status = "Mux: no floating pane.".to_string(),
+        }
+    }
+
+    /// Close + drop the floating pane PTY (v0.8 M8.2).
+    fn mux_close_floating(&mut self) {
+        match self.mux_session.close_floating() {
+            Some(pane) => {
+                self.terminals.remove(&pane);
+                self.mux_pane_commands.remove(&pane);
+                self.status = format!("Mux: floating pane {pane} closed.");
+            }
+            None => self.status = "Mux: no floating pane to close.".to_string(),
         }
     }
 
@@ -1916,6 +1988,14 @@ impl AppModel {
     /// Spawn the active mux pane's terminal session on first use.
     fn ensure_terminal(&mut self) {
         let pane = self.mux_session.active_window().active;
+        self.ensure_terminal_for_pane(pane);
+    }
+
+    /// Spawn a PTY for `pane` if one isn't already live (v0.8 M8.2).
+    /// Generalises the v0.7 `ensure_terminal` so floating tool-panes
+    /// can spawn against their own pane id without affecting the
+    /// regular split tree's active pane.
+    fn ensure_terminal_for_pane(&mut self, pane: cockpit_mux::PaneId) {
         if self.terminals.contains_key(&pane) {
             return;
         }
@@ -4053,6 +4133,29 @@ impl AppModel {
             }
         }
 
+        // v0.8 M8.2 floating overlay: a single centred rectangle drawn
+        // above the regular split tree. PTYs for floating panes live in
+        // the same `terminals` map keyed by their pane id (the stride
+        // allocator keeps the ids distinct from regular leaves).
+        let mux_pane_bounds = MuxRect::new(
+            content.x.max(0.0) as u32,
+            content.y.max(0.0) as u32,
+            content.w.max(0.0) as u32,
+            pane_area_h.max(0.0) as u32,
+        );
+        if let Some((pane_id, rect)) = self.mux_session.floating_rect(mux_pane_bounds) {
+            let pane = cockpit_mux::PaneRect {
+                pane: pane_id,
+                rect,
+                active: true,
+            };
+            self.paint_mux_pane_frame(canvas, pane, true);
+            match self.terminals.get(&pane_id) {
+                Some(terminal) => self.paint_terminal_grid(canvas, pane, terminal, focused),
+                None => self.paint_mux_placeholder(canvas, pane, "pending PTY"),
+            }
+        }
+
         // M7.7 mode-line: bottom strip across the full pane width.
         let status_y = content.y + content.h - status_h;
         self.paint_mux_status_line(canvas, content.x, status_y, content.w, status_h);
@@ -4933,6 +5036,11 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(mux_command_ids::SWAP_PANE_NEXT, "Mux: Swap Pane Next"),
         PaletteEntry::new(mux_command_ids::ZOOM_PANE, "Mux: Zoom Pane"),
         PaletteEntry::new(mux_command_ids::COPY_MODE, "Mux: Enter Copy Mode"),
+        PaletteEntry::new(
+            mux_command_ids::FLOATING_TOGGLE,
+            "Mux: Toggle Floating Pane",
+        ),
+        PaletteEntry::new(mux_command_ids::FLOATING_CLOSE, "Mux: Close Floating Pane"),
         PaletteEntry::new(mux_command_ids::DETACH, "Mux: Detach / Re-attach"),
         PaletteEntry::new(mux_command_ids::NEW_SESSION, "Mux: New Session"),
         PaletteEntry::new(mux_command_ids::NEXT_SESSION, "Mux: Next Session"),
@@ -5839,6 +5947,68 @@ cockpit_layout = "missing.kdl"
             "status: {}",
             model.status,
         );
+    }
+
+    #[test]
+    fn tool_recipe_floating_opens_overlay_and_toggle_hides_it() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.clear();
+        config.panes.tools.insert(
+            "made-up".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "echo".to_string(),
+                detect: "echo".to_string(),
+                layout: cockpit_config::ToolPaneLayout::Floating,
+                toggle: true,
+                keybind: String::new(),
+            },
+        );
+        model.apply_user_config(&config);
+
+        // First dispatch opens a floating pane.
+        model.run_command("tool.made-up");
+        let floating = model
+            .mux_session
+            .floating
+            .as_ref()
+            .expect("floating opened");
+        assert_eq!(floating.label, "made-up");
+        assert!(floating.visible);
+
+        // Second dispatch hides it (toggle).
+        model.run_command("tool.made-up");
+        assert!(!model.mux_session.floating_visible());
+        assert!(
+            model.mux_session.floating.is_some(),
+            "PTY stays alive when hidden",
+        );
+
+        // Third dispatch re-shows the same overlay without respawning.
+        model.run_command("tool.made-up");
+        assert!(model.mux_session.floating_visible());
+    }
+
+    #[test]
+    fn mux_floating_close_drops_the_overlay() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.clear();
+        config.panes.tools.insert(
+            "made-up".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "echo".to_string(),
+                detect: "echo".to_string(),
+                layout: cockpit_config::ToolPaneLayout::Floating,
+                ..Default::default()
+            },
+        );
+        model.apply_user_config(&config);
+        model.run_command("tool.made-up");
+        assert!(model.mux_session.floating.is_some());
+
+        model.run_command(mux_command_ids::FLOATING_CLOSE);
+        assert!(model.mux_session.floating.is_none());
     }
 
     #[test]

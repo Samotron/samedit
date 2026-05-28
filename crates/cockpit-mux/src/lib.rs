@@ -46,6 +46,8 @@ pub mod command_ids {
     pub const NEXT_LAYOUT: &str = "mux.layout.next";
     pub const COPY_MODE: &str = "mux.copy_mode.enter";
     pub const PASTE: &str = "mux.paste";
+    pub const FLOATING_TOGGLE: &str = "mux.floating.toggle";
+    pub const FLOATING_CLOSE: &str = "mux.floating.close";
     pub const DETACH: &str = "mux.session.detach";
     pub const NEW_SESSION: &str = "mux.session.new";
     pub const NEXT_SESSION: &str = "mux.session.next";
@@ -522,6 +524,21 @@ impl Window {
     }
 }
 
+/// Floating tool-pane overlay (v0.8 M8.2). A session has at most one
+/// floating pane; opening another replaces it. Hidden floating panes
+/// keep their PTY running so the toggle keybind brings them back with
+/// scrollback intact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloatingPane {
+    pub pane: PaneId,
+    /// Name of the tool that owns this pane (`lazygit`, `claude-code`, …).
+    /// Surfaced in the overlay so the user knows what they're looking at.
+    pub label: String,
+    /// Visible flag — toggled by the keybind. When false the pane's PTY
+    /// keeps running but the painter skips drawing it.
+    pub visible: bool,
+}
+
 /// Complete in-process mux session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
@@ -529,6 +546,8 @@ pub struct Session {
     pub name: String,
     pub windows: Vec<Window>,
     pub active: WindowId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floating: Option<FloatingPane>,
     next_window: u64,
     next_pane: u64,
 }
@@ -551,6 +570,7 @@ impl Session {
             name: name.into(),
             windows: vec![Window::new(first_window, "0", first_pane)],
             active: first_window,
+            floating: None,
             next_window: ids.next_window,
             next_pane: ids.next_pane,
         }
@@ -1036,6 +1056,7 @@ impl Session {
             name: name.into(),
             windows: vec![window],
             active: first_window_id,
+            floating: None,
             next_window: ids.next_window,
             next_pane: ids.next_pane,
         };
@@ -1079,6 +1100,77 @@ impl Session {
     /// Rename this session.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = name.into();
+    }
+
+    /// Open a floating tool-pane (v0.8 M8.2). If a floating pane already
+    /// exists it is replaced — the caller is responsible for shutting
+    /// down the previous PTY when the returned `PaneId` differs from
+    /// the previous one. Returns the new floating pane id.
+    pub fn open_floating(&mut self, label: impl Into<String>) -> PaneId {
+        let pane = self.alloc_pane();
+        self.floating = Some(FloatingPane {
+            pane,
+            label: label.into(),
+            visible: true,
+        });
+        pane
+    }
+
+    /// Toggle the active floating pane's visibility. Returns the new
+    /// visibility, or `None` when no floating pane is registered.
+    pub fn toggle_floating(&mut self) -> Option<bool> {
+        let floating = self.floating.as_mut()?;
+        floating.visible = !floating.visible;
+        Some(floating.visible)
+    }
+
+    /// Show the floating pane (no-op if already visible / absent).
+    pub fn show_floating(&mut self) -> Option<PaneId> {
+        let floating = self.floating.as_mut()?;
+        floating.visible = true;
+        Some(floating.pane)
+    }
+
+    /// Hide the floating pane without dropping it (no-op if already
+    /// hidden / absent).
+    pub fn hide_floating(&mut self) -> Option<PaneId> {
+        let floating = self.floating.as_mut()?;
+        floating.visible = false;
+        Some(floating.pane)
+    }
+
+    /// Close and forget the floating pane, returning its id so the
+    /// caller can shut the PTY down.
+    pub fn close_floating(&mut self) -> Option<PaneId> {
+        self.floating.take().map(|floating| floating.pane)
+    }
+
+    /// True when the floating pane is registered and visible.
+    pub fn floating_visible(&self) -> bool {
+        self.floating
+            .as_ref()
+            .map(|floating| floating.visible)
+            .unwrap_or(false)
+    }
+
+    /// Project the floating overlay into a rectangle centred over
+    /// `bounds`, sized roughly 80% × 80%. Returns `None` when no
+    /// floating pane is registered or when it is hidden.
+    pub fn floating_rect(&self, bounds: Rect) -> Option<(PaneId, Rect)> {
+        let floating = self.floating.as_ref()?;
+        if !floating.visible {
+            return None;
+        }
+        if bounds.width == 0 || bounds.height == 0 {
+            return Some((floating.pane, bounds));
+        }
+        let width = (bounds.width as f32 * 0.8) as u32;
+        let height = (bounds.height as f32 * 0.8) as u32;
+        let width = width.max(1).min(bounds.width);
+        let height = height.max(1).min(bounds.height);
+        let x = bounds.x + (bounds.width - width) / 2;
+        let y = bounds.y + (bounds.height - height) / 2;
+        Some((floating.pane, Rect::new(x, y, width, height)))
     }
 
     fn alloc_window(&mut self) -> WindowId {
@@ -2746,6 +2838,65 @@ mod tests {
         registry.kill(dev).unwrap();
         assert_eq!(registry.sessions().len(), 1);
         assert_eq!(registry.active().name, "vim");
+    }
+
+    #[test]
+    fn floating_pane_opens_with_a_fresh_id_and_is_visible_by_default() {
+        let mut session = Session::new("dev");
+        let pane = session.open_floating("lazygit");
+        assert!(session.floating_visible());
+        let floating = session.floating.as_ref().expect("floating set");
+        assert_eq!(floating.pane, pane);
+        assert_eq!(floating.label, "lazygit");
+        assert!(floating.visible);
+    }
+
+    #[test]
+    fn floating_pane_toggle_keeps_pane_and_flips_visibility() {
+        let mut session = Session::new("dev");
+        session.open_floating("lazygit");
+
+        assert_eq!(session.toggle_floating(), Some(false));
+        assert!(!session.floating_visible());
+        assert!(session.floating.is_some(), "PTY stays alive while hidden");
+
+        assert_eq!(session.toggle_floating(), Some(true));
+        assert!(session.floating_visible());
+    }
+
+    #[test]
+    fn floating_pane_open_replaces_the_previous_pane() {
+        let mut session = Session::new("dev");
+        let first = session.open_floating("lazygit");
+        let second = session.open_floating("claude");
+        assert_ne!(first, second);
+        let floating = session.floating.as_ref().unwrap();
+        assert_eq!(floating.pane, second);
+        assert_eq!(floating.label, "claude");
+    }
+
+    #[test]
+    fn floating_pane_close_returns_the_pane_id_and_clears_the_slot() {
+        let mut session = Session::new("dev");
+        let pane = session.open_floating("lazygit");
+        assert_eq!(session.close_floating(), Some(pane));
+        assert!(session.floating.is_none());
+        assert_eq!(session.close_floating(), None);
+    }
+
+    #[test]
+    fn floating_rect_centres_an_80_percent_overlay() {
+        let mut session = Session::new("dev");
+        session.open_floating("lazygit");
+        let bounds = Rect::new(0, 0, 100, 100);
+        let (_pane, rect) = session.floating_rect(bounds).expect("visible overlay");
+        assert_eq!(rect.width, 80);
+        assert_eq!(rect.height, 80);
+        assert_eq!(rect.x, 10);
+        assert_eq!(rect.y, 10);
+
+        session.hide_floating();
+        assert_eq!(session.floating_rect(bounds), None);
     }
 
     #[test]
