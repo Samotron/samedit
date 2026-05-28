@@ -565,8 +565,14 @@ impl AppModel {
         // v0.8 M8.2: capture tool-pane recipes. Each registered recipe
         // shows up in the palette as `Tool: <name>` and dispatches to
         // `run_tool_recipe`. Spawn semantics (floating overlay vs side
-        // pane) land in follow-up sub-tasks.
+        // pane) land in follow-up sub-tasks. Recipes that ship a real
+        // `KeyChord` (e.g. `Ctrl+Shift+G`) get bound on the global
+        // keymap so the chord and palette dispatch share the same
+        // command spine (AGENTS §2 hard rule #5). `<leader>…` notation
+        // isn't yet supported by the chord parser; those bindings stay
+        // palette-only with a tracing warning.
         self.tool_recipes = config.panes.tools.clone();
+        self.bind_tool_recipe_chords();
 
         // v0.7 M7.7: pick up the configured mode-line format. An empty
         // template falls back to the default so users never see a blank
@@ -1472,6 +1478,37 @@ impl AppModel {
             return true;
         }
         FormatPathLookup.exists(binary)
+    }
+
+    /// Bind every registered tool-pane recipe's `keybind` to its
+    /// `tool.<name>` command id on the global keymap (v0.8 M8.2). Bindings
+    /// that fail to parse (e.g. the placeholder `<leader>g` notation) are
+    /// skipped with a `tracing::debug!` — palette dispatch still works.
+    fn bind_tool_recipe_chords(&mut self) {
+        let bindings: Vec<(String, String)> = self
+            .tool_recipes
+            .iter()
+            .filter_map(|(name, recipe)| {
+                if recipe.keybind.is_empty() {
+                    None
+                } else {
+                    Some((
+                        recipe.keybind.clone(),
+                        format!("{TOOL_RECIPE_PREFIX}{name}"),
+                    ))
+                }
+            })
+            .collect();
+        for (chord, command) in bindings {
+            if let Err(err) = self.router.bind_extra_chord(&chord, command.clone()) {
+                tracing::debug!(
+                    ?err,
+                    chord = %chord,
+                    command = %command,
+                    "tool recipe keybind not bound (parser/conflict)",
+                );
+            }
+        }
     }
 
     /// Palette entries derived from the registered tool-pane recipes.
@@ -5949,6 +5986,41 @@ cockpit_layout = "missing.kdl"
         );
         let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
         assert!(titles.contains(&"Tool: lazygit"));
+    }
+
+    #[test]
+    fn tool_recipe_with_parseable_chord_binds_into_the_global_keymap() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.clear();
+        config.panes.tools.insert(
+            "lazygit".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "lazygit".to_string(),
+                detect: "lazygit".to_string(),
+                keybind: "Ctrl+Shift+g".to_string(),
+                ..Default::default()
+            },
+        );
+        // Placeholder `<leader>…` notation has no chord parser today and
+        // should be silently skipped without bringing the whole apply
+        // path down.
+        config.panes.tools.insert(
+            "claude-code".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "claude".to_string(),
+                detect: "claude".to_string(),
+                keybind: "<leader>aa".to_string(),
+                ..Default::default()
+            },
+        );
+        model.apply_user_config(&config);
+
+        let chord = "Ctrl+Shift+g".parse().unwrap();
+        match model.router.route(PaneId::Editor, chord) {
+            RoutedInput::Command(id) => assert_eq!(id.as_str(), "tool.lazygit"),
+            other => panic!("expected tool.lazygit, got {other:?}"),
+        }
     }
 
     #[test]
