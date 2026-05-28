@@ -1114,9 +1114,12 @@ running upstream CLIs the user already has. That is the whole point.
   `Theme::from_name`. Unknown names log a `tracing::warn!` and leave
   the active theme alone — typo'd configs never crash the cockpit.
 - ✅ `Theme: Switch <Flavour>` palette commands hot-swap the active
-  theme immediately. The follow-up write-back to user-config (via
-  `toml_edit`, preserving comments + order) is parked for the next
-  sub-task.
+  theme immediately and persist the choice via
+  `cockpit_config::write_ui_theme`, which round-trips the user config
+  through `toml_edit` so comments / ordering / surrounding whitespace
+  survive. The cockpit binary records the resolved user-config path
+  in `AppModel::user_config_path` during hydration so the write-back
+  doesn't re-resolve the platform config dir on every dispatch.
 - ✅ Tests cover hex decoding, `from_name` aliasing + unknowns,
   per-flavour opacity, and the brightness ordering
   Mocha < Macchiato < Frappé < Latte (catches palette typos). The

@@ -59,6 +59,39 @@ pub fn user_config_path() -> Option<std::path::PathBuf> {
         .map(|dirs| dirs.config_dir().join("config.toml"))
 }
 
+/// Write `theme = "<name>"` into the `[ui]` section of `path`, preserving
+/// comments / ordering / surrounding whitespace via `toml_edit`. Creates
+/// the file if it doesn't exist; creates the `[ui]` table if absent.
+///
+/// Returns the produced TOML so tests can inspect the result without
+/// reading from disk again.
+pub fn write_ui_theme(path: &Path, theme: &str) -> Result<String, ConfigError> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(ConfigError::Read(err)),
+    };
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .map_err(|err: toml_edit::TomlError| ConfigError::EditParse(err.to_string()))?;
+
+    let ui = doc
+        .entry("ui")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError::EditParse("expected `[ui]` to be a table".to_string()))?;
+    ui["theme"] = toml_edit::value(theme.to_string());
+
+    let rendered = doc.to_string();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(ConfigError::Read)?;
+    }
+    fs::write(path, &rendered).map_err(ConfigError::Read)?;
+    Ok(rendered)
+}
+
 /// UI settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -395,6 +428,8 @@ pub enum ConfigError {
     Parse(#[source] toml::de::Error),
     #[error("invalid cockpit layout: {0}")]
     CockpitLayout(String),
+    #[error("failed to edit config: {0}")]
+    EditParse(String),
 }
 
 #[cfg(test)]
@@ -588,6 +623,45 @@ detect  = "cargo"
         // The TOML-parsed empty config takes the same defaults.
         let parsed = Config::from_toml("").unwrap();
         assert_eq!(parsed.panes.tools.len(), 3);
+    }
+
+    #[test]
+    fn write_ui_theme_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let rendered = write_ui_theme(&path, "mocha").unwrap();
+        assert!(rendered.contains("[ui]"));
+        assert!(rendered.contains(r#"theme = "mocha""#));
+
+        let config = Config::from_toml(&rendered).unwrap();
+        assert_eq!(config.ui.theme, "mocha");
+    }
+
+    #[test]
+    fn write_ui_theme_preserves_surrounding_comments_and_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# user config
+[ui]
+# pick your flavour
+theme = "dark"
+font  = "JetBrains Mono"
+
+[editor]
+format_on_save = true
+"#,
+        )
+        .unwrap();
+
+        let rendered = write_ui_theme(&path, "latte").unwrap();
+        assert!(rendered.contains("# user config"), "rendered: {rendered}");
+        assert!(rendered.contains("# pick your flavour"));
+        assert!(rendered.contains(r#"theme = "latte""#));
+        assert!(rendered.contains(r#"font  = "JetBrains Mono""#));
+        assert!(rendered.contains("format_on_save = true"));
     }
 
     #[test]

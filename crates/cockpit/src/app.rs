@@ -356,6 +356,10 @@ pub struct AppModel {
     /// `terminal.status.format` template used for the mux mode-line
     /// (v0.7 M7.7).
     status_format: String,
+    /// Resolved user-config path used by theme write-back (v0.8 M8.1).
+    /// Defaults to `cockpit_config::user_config_path()` when None; tests
+    /// inject a temp path via [`AppModel::set_user_config_path`].
+    user_config_path: Option<std::path::PathBuf>,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -470,6 +474,7 @@ impl AppModel {
             mux_next_session_index: 1,
             tool_recipes: std::collections::BTreeMap::new(),
             status_format: cockpit_config::TerminalStatusConfig::default().format,
+            user_config_path: None,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -522,6 +527,13 @@ impl AppModel {
         let cache = ProjectCache::load(&path).unwrap_or_default();
         self.cache_path = Some(path);
         self.apply_cache(cache);
+    }
+
+    /// Remember the user-config path so subsequent palette commands
+    /// (`Theme: Switch…`) can write back to it without re-resolving the
+    /// platform config directory (v0.8 M8.1).
+    pub fn set_user_config_path(&mut self, path: std::path::PathBuf) {
+        self.user_config_path = Some(path);
     }
 
     /// Apply a loaded user [`cockpit_config::Config`] onto the model.
@@ -1660,15 +1672,39 @@ impl AppModel {
     /// Hot-swap the active theme (v0.8 M8.1). Unknown names are a
     /// programmer error here — every wired palette entry passes a name
     /// `Theme::from_name` recognises — but we still degrade to a status
-    /// message rather than panicking.
+    /// message rather than panicking. Also persists the choice to the
+    /// user config via `cockpit_config::write_ui_theme` so it survives
+    /// a restart.
     fn switch_theme(&mut self, name: &str) {
         match Theme::from_name(name) {
             Some(theme) => {
                 self.theme = theme;
-                self.status = format!("Theme: switched to `{name}`.");
+                self.persist_theme_choice(name);
             }
             None => {
                 self.status = format!("Theme: unknown `{name}`.");
+            }
+        }
+    }
+
+    /// Write the active theme name back to the user config. Failures
+    /// degrade to a status warning — the in-memory swap stays
+    /// authoritative for the current session.
+    fn persist_theme_choice(&mut self, name: &str) {
+        let Some(path) = self
+            .user_config_path
+            .clone()
+            .or_else(cockpit_config::user_config_path)
+        else {
+            self.status =
+                format!("Theme: switched to `{name}` (no user config path; not persisted).",);
+            return;
+        };
+        match cockpit_config::write_ui_theme(&path, name) {
+            Ok(_) => self.status = format!("Theme: switched to `{name}` (persisted)."),
+            Err(err) => {
+                tracing::warn!(?err, theme = name, "theme persist failed");
+                self.status = format!("Theme: switched to `{name}` ({err}).");
             }
         }
     }
@@ -6068,6 +6104,41 @@ cockpit_layout = "missing.kdl"
 
         model.run_command(THEME_SWITCH_MOCHA);
         assert_eq!(model.theme, cockpit_render::Theme::catppuccin_mocha());
+    }
+
+    #[test]
+    fn theme_switch_persists_to_user_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# user prefs
+[ui]
+theme = "dark"
+font  = "JetBrains Mono"
+"#,
+        )
+        .unwrap();
+
+        let mut model = model();
+        model.set_user_config_path(path.clone());
+        model.run_command(THEME_SWITCH_MOCHA);
+
+        let rendered = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            rendered.contains(r#"theme = "mocha""#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("# user prefs"),
+            "comment preserved: {rendered}"
+        );
+        assert!(rendered.contains(r#"font  = "JetBrains Mono""#));
+        assert!(
+            model.status.contains("persisted"),
+            "status: {}",
+            model.status
+        );
     }
 
     #[test]
