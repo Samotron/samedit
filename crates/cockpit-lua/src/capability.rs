@@ -27,6 +27,11 @@ pub enum Capability {
     ClipboardRead,
     /// `clipboard.write` — write to the OS clipboard.
     ClipboardWrite,
+    /// `http.scripts` — run `script:lua-pre-request` /
+    /// `script:lua-post-response` blocks attached to a `.bru` request
+    /// (v0.11 M11.6). Default-deny; user grants per collection in
+    /// `~/.config/cockpit/extensions.toml`.
+    HttpScripts,
 }
 
 impl Capability {
@@ -37,6 +42,7 @@ impl Capability {
             Self::Process => "process",
             Self::ClipboardRead => "clipboard.read",
             Self::ClipboardWrite => "clipboard.write",
+            Self::HttpScripts => "http.scripts",
         }
     }
 
@@ -48,6 +54,7 @@ impl Capability {
             "process" => Some(Self::Process),
             "clipboard.read" => Some(Self::ClipboardRead),
             "clipboard.write" => Some(Self::ClipboardWrite),
+            "http.scripts" => Some(Self::HttpScripts),
             _ => None,
         }
     }

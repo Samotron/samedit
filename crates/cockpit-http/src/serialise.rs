@@ -26,8 +26,25 @@ pub fn serialise_request(request: &Request) -> String {
     serialise_kv_block(&mut out, "query", &request.query);
     serialise_body(&mut out, &request.body);
     serialise_auth(&mut out, &request.auth);
+    serialise_scripts(&mut out, request);
     serialise_docs(&mut out, request);
     out
+}
+
+/// Emit `script:lua-pre-request` and `script:lua-post-response` blocks
+/// (v0.11 M11.6). Mirrors `serialise_body` — indent the body so a `}`
+/// inside the Lua source can't terminate the block early.
+fn serialise_scripts(out: &mut String, request: &Request) {
+    if let Some(source) = &request.pre_script {
+        out.push_str("script:lua-pre-request {\n");
+        write_indented_body(out, source);
+        out.push_str("}\n\n");
+    }
+    if let Some(source) = &request.post_script {
+        out.push_str("script:lua-post-response {\n");
+        write_indented_body(out, source);
+        out.push_str("}\n\n");
+    }
 }
 
 fn serialise_meta(out: &mut String, request: &Request) {
@@ -187,6 +204,7 @@ mod tests {
                 token: "{{authToken}}".to_string(),
             }),
             docs: Some("Lists every user.".to_string()),
+            ..Request::empty()
         };
         assert_canonical_round_trip(&request);
     }
@@ -210,8 +228,39 @@ mod tests {
                 password: "hunter2".to_string(),
             }),
             docs: None,
+            ..Request::empty()
         };
         assert_canonical_round_trip(&request);
+    }
+
+    #[test]
+    fn lua_scripts_round_trip() {
+        let mut request = Request::empty();
+        request.url = "https://api.example.com/users".to_string();
+        request.pre_script = Some("cockpit.http.set_var('token', 'abc')".to_string());
+        request.post_script =
+            Some("if cockpit.http.response().status >= 400 then error('failed') end".to_string());
+        assert_canonical_round_trip(&request);
+    }
+
+    #[test]
+    fn parser_flags_bruno_js_scripts_as_skipped() {
+        let source = "get {\n  url: https://x\n  body: none\n  auth: none\n}\n\n\
+            script:js-pre-request {\n  // would run in bruno but not in cockpit\n}\n";
+        let request = parse_request(source).expect("parse");
+        assert!(request.has_js_scripts);
+        assert!(request.pre_script.is_none());
+    }
+
+    #[test]
+    fn parser_keeps_unknown_script_variants_around_silently() {
+        let source = "get {\n  url: https://x\n  body: none\n  auth: none\n}\n\n\
+            script:lua-something-future {\n  -- ignored\n}\n";
+        let request = parse_request(source).expect("parse");
+        // Neither pre/post Lua slot filled; not flagged as JS either.
+        assert!(request.pre_script.is_none());
+        assert!(request.post_script.is_none());
+        assert!(!request.has_js_scripts);
     }
 
     #[test]

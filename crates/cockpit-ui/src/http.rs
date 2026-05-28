@@ -651,6 +651,38 @@ pub mod command_ids {
     pub const TAB_RAW: &str = "http.tab.raw";
 }
 
+/// Surface script-related warnings for the currently selected request
+/// (v0.11 M11.6). Returned strings are user-facing one-liners ready to
+/// drop into the status bar. Used by the binary on `Http: Send Request`
+/// so the user is told once per send that:
+///
+/// - The request carries Bruno-style JS scripts that cockpit will not run.
+/// - The request carries cockpit Lua scripts but the `http.scripts`
+///   capability has not been granted (default-deny). The flag is set by
+///   the caller because the capability set lives in `cockpit-lua`,
+///   which `cockpit-ui` does not depend on — we keep the policy decision
+///   in the binary and let this helper just format the message.
+///
+/// Returns an empty `Vec` when the request has no scripts or all gates
+/// pass.
+pub fn script_warnings(view: &HttpView, http_scripts_granted: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(req) = view.selected_request() else {
+        return warnings;
+    };
+    if req.has_js_scripts {
+        warnings.push("Lua scripting only; JS scripts skipped. See docs/http.md.".to_string());
+    }
+    let has_lua = req.pre_script.is_some() || req.post_script.is_some();
+    if has_lua && !http_scripts_granted {
+        warnings.push(
+            "Lua scripts present but `http.scripts` capability not granted; scripts skipped."
+                .to_string(),
+        );
+    }
+    warnings
+}
+
 /// Default key chords for the M11.5 HTTP commands, as `(chord, command_id)`
 /// pairs ready to feed `InputRouter::bind_extra_chord`. Kept here so the
 /// binary doesn't hardcode chord strings — config layers (M11.5.x) can
@@ -1076,6 +1108,68 @@ mod tests {
         let view = HttpView::new(collection_with(Vec::new(), Vec::new()));
         let err = copy_selected_as_curl(&view).unwrap_err();
         assert!(matches!(err, SendError::NoSelection));
+    }
+
+    #[test]
+    fn script_warnings_flags_js_scripts_with_a_toast() {
+        let collection = collection_with(
+            vec![{
+                let mut r = request("a", "https://x");
+                r.has_js_scripts = true;
+                r
+            }],
+            Vec::new(),
+        );
+        let view = HttpView::new(collection);
+        let warnings = script_warnings(&view, true);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("JS scripts skipped"));
+    }
+
+    #[test]
+    fn script_warnings_flags_ungranted_lua_scripts() {
+        let collection = collection_with(
+            vec![{
+                let mut r = request("a", "https://x");
+                r.pre_script = Some("cockpit.http.set_var('x', '1')".into());
+                r
+            }],
+            Vec::new(),
+        );
+        let view = HttpView::new(collection);
+        let warnings = script_warnings(&view, false);
+        assert!(
+            warnings.iter().any(|w| w.contains("`http.scripts`")),
+            "{:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn script_warnings_is_empty_when_no_scripts_present() {
+        let collection = collection_with(vec![request("a", "https://x")], Vec::new());
+        let view = HttpView::new(collection);
+        let warnings = script_warnings(&view, false);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn script_warnings_omits_lua_warning_when_capability_granted() {
+        let collection = collection_with(
+            vec![{
+                let mut r = request("a", "https://x");
+                r.post_script = Some("-- log".into());
+                r
+            }],
+            Vec::new(),
+        );
+        let view = HttpView::new(collection);
+        let warnings = script_warnings(&view, true);
+        assert!(
+            warnings.iter().all(|w| !w.contains("`http.scripts`")),
+            "{:?}",
+            warnings
+        );
     }
 
     #[test]

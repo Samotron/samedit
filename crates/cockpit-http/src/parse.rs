@@ -52,6 +52,22 @@ pub fn parse_request(input: &str) -> Result<Request, ParseError> {
             other if let Some(kind) = other.strip_prefix("auth:") => {
                 request.auth = parse_auth(kind, body, block.start_line)?;
             }
+            other if let Some(kind) = other.strip_prefix("script:") => {
+                match kind {
+                    "lua-pre-request" => request.pre_script = Some(dedent_body(body)),
+                    "lua-post-response" => request.post_script = Some(dedent_body(body)),
+                    "js-pre-request" | "js-post-response" | "pre-request" | "post-response" => {
+                        // Bruno's JS scripts — cockpit substitutes Lua
+                        // (M11.6). Flag the request so the view-model
+                        // can surface a one-time toast pointing users
+                        // at `script:lua-*`.
+                        request.has_js_scripts = true;
+                    }
+                    _ => {
+                        // Unknown script variant — round-trip untouched.
+                    }
+                }
+            }
             _ => {
                 // Silently ignore unknown blocks for forward-compat. The
                 // M11.4 view-model will surface them as preserved-but-

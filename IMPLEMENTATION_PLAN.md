@@ -1962,7 +1962,7 @@ Registered in `cockpit-commands`:
   To File` — those need the painter's pane-context to know which
   folder the cursor is in.
 
-### M11.6 — Scripts (Lua, capability-gated)
+### M11.6 — Scripts (Lua, capability-gated)  ◐ (parse, capability, warnings; Lua execution deferred to M11.6.1)
 
 - Bruno's JS pre/post scripts don't run; cockpit substitutes
   **Lua** scripts (reuses M9.x sandbox + capability model).
@@ -1976,6 +1976,25 @@ Registered in `cockpit-commands`:
 - **Out of scope:** JavaScript runtime, full Bruno script
   compatibility. Users with JS scripts get a clear toast: *"Lua
   scripting only; JS scripts skipped. See docs/http.md."*
+- **Shipped behaviour vs plan:** the parser recognises
+  `script:lua-pre-request` and `script:lua-post-response` blocks and
+  pulls them into `Request::{pre_script, post_script}` (both
+  `Option<String>`); the serialiser emits them back so round-trip
+  stays semantic. `script:js-pre-request` / `script:js-post-response`
+  (and the unprefixed `pre-request` / `post-response` Bruno spellings)
+  set the new `Request::has_js_scripts` flag instead of dropping
+  silently. `cockpit_lua::Capability::HttpScripts` is registered with
+  token `http.scripts`, so user `extensions.toml` grants and the
+  `parse_requires_header` parser already accept it. `cockpit_ui::http::script_warnings(view,
+  http_scripts_granted)` emits the toast lines — the JS-skipped
+  message and the default-deny Lua skip — and the binary's
+  `Http: Send Request` handler logs them via `tracing::warn!` before
+  dispatching. Actual Lua execution (running the pre-script against a
+  mutable env, the post-script against a read-only response) lands
+  with M11.6.1 — needs a per-collection capability store and a Lua
+  bridge into `cockpit-http`'s `Environment`. 5 new tests in
+  cockpit-http (round-trip + JS-flag + unknown-variant) + 4 new in
+  cockpit-ui (script_warnings matrix).
 
 ### M11.7 — Docs
 

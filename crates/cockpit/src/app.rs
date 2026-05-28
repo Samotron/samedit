@@ -3991,6 +3991,19 @@ impl AppModel {
                     return;
                 }
             };
+        // v0.11 M11.6: emit one-time toasts for JS scripts we don't run
+        // and for ungranted Lua scripts. Logged via `tracing` because
+        // the status line is about to advertise the in-flight send;
+        // `tracing` keeps the warning visible via Debug: Show Command Log.
+        for warning in cockpit_ui::http::script_warnings(
+            self.http.as_ref().expect("guarded above"),
+            // The `http.scripts` capability lives in cockpit-lua's set.
+            // We don't have a per-collection grant store yet (M11.6.1),
+            // so default-deny: pass `false` and the warning fires.
+            false,
+        ) {
+            tracing::warn!(http_script_warning = %warning);
+        }
         let summary = cockpit_ui::http::SentSummary {
             method: prepared.method,
             url: prepared.url.clone(),

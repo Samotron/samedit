@@ -19,7 +19,8 @@ pub use file_finder::{FuzzyFinder, FuzzyMatch};
 pub use http::{
     HttpView, RequestRun, ResponseTab, ResponseView, SendError, SendStatus, SentSummary,
     SplitLayout, UnknownEnvironment, copy_selected_as_curl,
-    default_keybindings as http_default_keybindings, prepare_selected, send_selected,
+    default_keybindings as http_default_keybindings, prepare_selected, script_warnings,
+    send_selected,
 };
 pub use hydration::{CompletedPhase, HydrationPhase, HydrationProgress};
 pub use launcher::{Launcher, LauncherAction, LauncherIntent, LauncherSelection, RecentProject};

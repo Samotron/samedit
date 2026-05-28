@@ -26,6 +26,23 @@ pub struct Request {
     pub body: Body,
     pub auth: Auth,
     pub docs: Option<String>,
+    /// Cockpit-Lua pre-request script (`script:lua-pre-request` block,
+    /// v0.11 M11.6). Runs before [`prepare_request`] each send; mutates
+    /// environment variables through the sandboxed `cockpit.http.*`
+    /// surface. `None` when no such block is present.
+    #[serde(default)]
+    pub pre_script: Option<String>,
+    /// Cockpit-Lua post-response script (`script:lua-post-response`
+    /// block, v0.11 M11.6). Runs after the engine returns; sees a
+    /// read-only snapshot of the response.
+    #[serde(default)]
+    pub post_script: Option<String>,
+    /// `true` when the source file declared `script:js-pre-request` or
+    /// `script:js-post-response`. Cockpit does not run JS — the M11.6
+    /// view-model surfaces a toast on first run so the user knows their
+    /// Bruno-format script is being skipped.
+    #[serde(default)]
+    pub has_js_scripts: bool,
 }
 
 impl Request {
@@ -42,6 +59,9 @@ impl Request {
             body: Body::None,
             auth: Auth::None,
             docs: None,
+            pre_script: None,
+            post_script: None,
+            has_js_scripts: false,
         }
     }
 }
