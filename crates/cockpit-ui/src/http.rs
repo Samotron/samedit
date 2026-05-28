@@ -633,6 +633,9 @@ pub mod command_ids {
     pub const COPY_AS_CURL: &str = "http.copy_as_curl";
     /// `Http: Save Response To File`.
     pub const SAVE_RESPONSE: &str = "http.save_response";
+    /// `Http: Cancel In-flight Request` — trips the cancel handle on the
+    /// most recent send. No-op if nothing is in flight.
+    pub const CANCEL: &str = "http.cancel";
     /// `Http: Next Response Tab` — drives the cycling form of the tab
     /// switcher; per-tab direct selects (`http.tab.body` etc.) below.
     pub const NEXT_TAB: &str = "http.next_tab";

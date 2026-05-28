@@ -82,6 +82,12 @@ pub const CHAR_W_RATIO: f32 = 0.6;
 
 /// Command id for "quit the application" — handled directly by the shell.
 const APP_QUIT: &str = "app.quit";
+
+/// Sentinel id used by the `Http: Switch Environment` palette to
+/// represent the "no environment" choice. Picked so it can't clash
+/// with a real environment name (those are file stems —
+/// alphanumeric).
+const HTTP_ENVIRONMENT_NONE_ID: &str = "(none)";
 /// Command id for "pick and run a mise task".
 const MISE_RUN_TASK: &str = "mise.run_task";
 /// Command id for "open a file path from the terminal output".
@@ -183,6 +189,10 @@ enum PaletteMode {
     MiseTasks,
     /// Entries are `path:line:col` references opened in the editor.
     TerminalPaths,
+    /// Entries are Bruno environment names (id is `<env-name>` or `(none)`).
+    /// Selecting one switches the active environment on the open
+    /// [`HttpView`]. v0.11 M11.5.2.
+    HttpEnvironments,
 }
 
 /// The document open in the editor pane: an [`Editor`] plus its file path.
@@ -190,6 +200,21 @@ struct OpenDocument {
     editor: Editor,
     path: PathBuf,
     name: String,
+}
+
+/// One in-flight `Http: Send Request` worker (v0.11 M11.5.2).
+///
+/// Spawned by [`AppModel::http_send_request`]: the worker thread calls
+/// `engine.send` on the [`PreparedRequest`] and posts the
+/// `Result<Response, HttpError>` back through `rx`. The UI thread checks
+/// the channel each `tick()` and applies the result to the active
+/// [`HttpView`]. The clonable `cancel` handle lets the UI trip the
+/// engine's cooperative-cancel path (e.g. on Esc).
+struct HttpInFlight {
+    rx: std::sync::mpsc::Receiver<Result<cockpit_http::Response, cockpit_http::HttpError>>,
+    cancel: cockpit_http::CancelHandle,
+    /// Logged for the status bar so the user sees what's still pending.
+    summary: cockpit_ui::http::SentSummary,
 }
 
 /// What an in-flight LSP request was asking for, so its [`Response`] can be
@@ -327,6 +352,14 @@ pub struct AppModel {
     /// Bruno HTTP collection view (v0.11 M11.4). Populated when the
     /// open document is a `.bru` request file; cleared on close.
     http: Option<HttpView>,
+    /// HTTP engine — lazily built on first `Http: Send Request`. Held as
+    /// a shared `Arc` so the worker thread spawned for each send can
+    /// clone its handle without taking ownership. v0.11 M11.5.2.
+    http_engine: Option<std::sync::Arc<dyn cockpit_http::HttpEngine + Send + Sync>>,
+    /// Currently in-flight send, if any. Polled each `tick()` until the
+    /// channel resolves; cleared back to `None` once the result has
+    /// been applied to [`Self::http`]. v0.11 M11.5.2.
+    http_in_flight: Option<HttpInFlight>,
     /// Detected analytics project (v0.5 M5.6 wire-up). Built once during
     /// [`new`] when a `models/` directory is present and refreshed by
     /// `Models: Build All`.
@@ -512,6 +545,8 @@ impl AppModel {
             format_on_save: false,
             notebook: None,
             http: None,
+            http_engine: None,
+            http_in_flight: None,
             analytics: None,
             editor_pending_g: false,
             editor_pending_leader: 0,
@@ -1300,14 +1335,11 @@ impl AppModel {
             http_command_ids::TAB_RAW => self.http_set_tab(ResponseTab::Raw),
             http_command_ids::NEXT_TAB => self.http_cycle_tab(true),
             http_command_ids::PREV_TAB => self.http_cycle_tab(false),
-            http_command_ids::SEND_REQUEST
-            | http_command_ids::SEND_ALL_IN_FOLDER
-            | http_command_ids::SWITCH_ENVIRONMENT
-            | http_command_ids::SAVE_RESPONSE => {
-                self.status = format!(
-                    "{} — wiring lands with M11.5.2 (async engine + sub-palette).",
-                    id
-                );
+            http_command_ids::SEND_REQUEST => self.http_send_request(),
+            http_command_ids::SWITCH_ENVIRONMENT => self.http_switch_environment(),
+            http_command_ids::CANCEL => self.http_cancel_inflight(),
+            http_command_ids::SEND_ALL_IN_FOLDER | http_command_ids::SAVE_RESPONSE => {
+                self.status = format!("{} — wiring lands with the M11.4.1 painter.", id);
             }
             MODELS_BUILD_ALL => self.run_build_all_models(),
             MODELS_SHOW_DAG => self.show_dag_summary(),
@@ -2351,6 +2383,9 @@ impl AppModel {
                 (Some(id), PaletteMode::Commands) => self.run_command(id.as_str()),
                 (Some(id), PaletteMode::MiseTasks) => self.run_mise_task(id.as_str()),
                 (Some(id), PaletteMode::TerminalPaths) => self.open_path_reference(id.as_str()),
+                (Some(id), PaletteMode::HttpEnvironments) => {
+                    self.apply_http_environment(id.as_str())
+                }
                 (None, _) => self.status = "Nothing selected.".to_string(),
             }
             return;
@@ -3928,6 +3963,199 @@ impl AppModel {
             view.prev_tab();
         }
         self.status = format!("Http: showing {} tab.", view.response_tab().label());
+    }
+
+    /// `Http: Send Request` (v0.11 M11.5.2). Spawns a worker thread
+    /// that drives the (synchronous) [`HttpEngine`] off the UI thread;
+    /// the result lands on `self.http` in [`tick`](Self::poll_http_inflight)
+    /// once the channel resolves. If a send is already in flight the
+    /// command no-ops with a status — the user can hit Esc on the
+    /// editor pane to trip the cancel handle.
+    fn http_send_request(&mut self) {
+        if self.http_in_flight.is_some() {
+            self.status = "Http: a send is already in flight (Esc to cancel).".to_string();
+            return;
+        }
+        if self.http.is_none() {
+            self.status = "Http: open a .bru file before sending.".to_string();
+            return;
+        }
+        // Prepare before touching the engine — preparation only needs an
+        // immutable borrow on `self.http`, and we want to surface
+        // missing-var errors before paying the engine-init cost.
+        let prepared =
+            match cockpit_ui::http::prepare_selected(self.http.as_ref().expect("guarded above")) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    self.status = format!("Http: cannot send — {err}");
+                    return;
+                }
+            };
+        let summary = cockpit_ui::http::SentSummary {
+            method: prepared.method,
+            url: prepared.url.clone(),
+        };
+        let engine = match self.http_engine() {
+            Ok(engine) => engine,
+            Err(err) => {
+                self.status = format!("Http: engine init failed — {err}");
+                return;
+            }
+        };
+        self.http.as_mut().expect("guarded above").mark_sending();
+        let cancel = cockpit_http::CancelHandle::new();
+        let cancel_for_worker = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let redraw = self.redraw.clone();
+        match std::thread::Builder::new()
+            .name("cockpit-http-send".into())
+            .spawn(move || {
+                let result = engine.send(prepared, &cancel_for_worker);
+                let _ = tx.send(result);
+                // Nudge the event loop so `tick()` polls the channel
+                // promptly instead of waiting for the next user input.
+                if let Some(handle) = redraw {
+                    handle.request();
+                }
+            }) {
+            Ok(_) => {
+                self.status = format!(
+                    "Http: sending {} {} …",
+                    summary.method.block_name().to_uppercase(),
+                    summary.url
+                );
+                self.http_in_flight = Some(HttpInFlight {
+                    rx,
+                    cancel,
+                    summary,
+                });
+            }
+            Err(err) => {
+                self.status = format!("Http: spawn failed — {err}");
+            }
+        }
+    }
+
+    /// Lazy [`HttpEngine`] accessor. Constructed on first send so we
+    /// don't pay reqwest's TLS init cost during cold start — the
+    /// notebook / editor flows don't need it.
+    fn http_engine(
+        &mut self,
+    ) -> Result<std::sync::Arc<dyn cockpit_http::HttpEngine + Send + Sync>, cockpit_http::HttpError>
+    {
+        if let Some(engine) = &self.http_engine {
+            return Ok(engine.clone());
+        }
+        let engine = cockpit_http::ReqwestEngine::new()?;
+        let engine: std::sync::Arc<dyn cockpit_http::HttpEngine + Send + Sync> =
+            std::sync::Arc::new(engine);
+        self.http_engine = Some(engine.clone());
+        Ok(engine)
+    }
+
+    /// Channel poll for the in-flight send. Called from [`tick`] each
+    /// frame so the UI thread never blocks waiting on reqwest.
+    fn poll_http_inflight(&mut self) {
+        let Some(pending) = self.http_in_flight.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.status = "Http: worker disconnected without a response.".to_string();
+                self.http_in_flight = None;
+                return;
+            }
+        };
+        let summary = self.http_in_flight.take().map(|p| p.summary);
+        if let Some(view) = self.http.as_mut() {
+            view.apply_result(result.clone());
+        }
+        self.status = match (&summary, &result) {
+            (Some(summary), Ok(response)) => format!(
+                "Http: {} {} → {} in {} ms",
+                summary.method.block_name().to_uppercase(),
+                summary.url,
+                response.status,
+                response.elapsed.as_millis()
+            ),
+            (Some(summary), Err(err)) => format!(
+                "Http: {} {} failed — {err}",
+                summary.method.block_name().to_uppercase(),
+                summary.url
+            ),
+            (None, Ok(response)) => format!("Http: response {} arrived.", response.status),
+            (None, Err(err)) => format!("Http: send failed — {err}"),
+        };
+    }
+
+    /// `Http: Switch Environment` (v0.11 M11.5.2). Opens the palette
+    /// pre-loaded with the collection's environments plus a "(none)"
+    /// entry; selection lands in [`Self::apply_http_environment`].
+    fn http_switch_environment(&mut self) {
+        let Some(view) = self.http.as_ref() else {
+            self.status = "Http: open a .bru file to switch environments.".to_string();
+            return;
+        };
+        if view.collection().environments.is_empty() {
+            self.status = "Http: no environments — add files under environments/".to_string();
+            return;
+        }
+        let mut entries = vec![PaletteEntry::new(
+            HTTP_ENVIRONMENT_NONE_ID,
+            "Http: No environment",
+        )];
+        for env in &view.collection().environments {
+            let label = format!("Http: env {}", env.name);
+            entries.push(PaletteEntry::new(env.name.as_str(), label));
+        }
+        self.palette_mode = PaletteMode::HttpEnvironments;
+        self.palette = Some(Palette::new(entries));
+        self.status =
+            "Switch environment — type to filter, Enter to switch, Esc to close.".to_string();
+    }
+
+    /// `Http: Cancel In-flight Request` (v0.11 M11.5.2). Trips the
+    /// cancel handle on the active worker; the engine's caller loop
+    /// observes the flag on its next 50 ms poll and returns
+    /// [`cockpit_http::HttpError::Cancelled`], which lands as
+    /// [`cockpit_ui::http::SendStatus::Cancelled`] on the view.
+    fn http_cancel_inflight(&mut self) {
+        match self.http_in_flight.as_ref() {
+            Some(pending) => {
+                pending.cancel.cancel();
+                self.status = format!(
+                    "Http: cancel requested for {} {} …",
+                    pending.summary.method.block_name().to_uppercase(),
+                    pending.summary.url
+                );
+            }
+            None => self.status = "Http: nothing in flight to cancel.".to_string(),
+        }
+    }
+
+    /// Apply the user's environment pick from the
+    /// [`PaletteMode::HttpEnvironments`] sub-palette.
+    fn apply_http_environment(&mut self, name: &str) {
+        let Some(view) = self.http.as_mut() else {
+            self.status = "Http: no .bru file open.".to_string();
+            return;
+        };
+        let pick = if name == HTTP_ENVIRONMENT_NONE_ID {
+            None
+        } else {
+            Some(name)
+        };
+        match view.switch_environment(pick) {
+            Ok(()) => {
+                self.status = match view.active_environment_name() {
+                    Some(env) => format!("Http: active environment → {env}"),
+                    None => "Http: no active environment.".to_string(),
+                };
+            }
+            Err(err) => self.status = format!("Http: {err}"),
+        }
     }
 
     /// Re-detect the analytics project (if any) and run every
@@ -5785,6 +6013,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
             http_command_ids::SEND_ALL_IN_FOLDER,
             "Http: Send All In Folder",
         ),
+        PaletteEntry::new(http_command_ids::CANCEL, "Http: Cancel In-flight Request"),
         PaletteEntry::new(
             http_command_ids::SWITCH_ENVIRONMENT,
             "Http: Switch Environment",
@@ -6316,6 +6545,9 @@ impl CockpitApp for AppShell {
                 // v0.9 M9.5: hot-reload pulse — pick up any extension
                 // files the user just saved.
                 model.poll_lua_watcher();
+                // v0.11 M11.5.2: pick up any HTTP send that completed
+                // since the last frame.
+                model.poll_http_inflight();
             }
             _ => {}
         }
@@ -9302,6 +9534,152 @@ format_on_save = true
         let view = recognise_http_request(&path, project.path()).expect("view");
         assert!(view.collection().requests.is_empty());
         assert!(view.selected_request().is_none());
+    }
+
+    /// Build a fixture HttpView with one request and inject it on `model`,
+    /// alongside a FakeHttpEngine the test can script.
+    fn install_fake_http(model: &mut AppModel) -> std::sync::Arc<cockpit_http::FakeHttpEngine> {
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.meta.name = Some("get-users".into());
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req
+            }],
+            environments: vec![cockpit_http::Environment {
+                name: "dev".into(),
+                vars: Default::default(),
+            }],
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+        let engine = std::sync::Arc::new(cockpit_http::FakeHttpEngine::new());
+        model.http_engine = Some(engine.clone());
+        engine
+    }
+
+    fn pump_until<F: FnMut(&mut AppModel) -> bool>(model: &mut AppModel, mut done: F) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            model.poll_http_inflight();
+            if done(model) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("pump_until: deadline expired (status = {})", model.status);
+    }
+
+    #[test]
+    fn http_send_request_drives_engine_and_lands_response_on_view() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: b"{\"ok\":true}".to_vec(),
+            elapsed: std::time::Duration::from_millis(7),
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let run = model.http.as_ref().unwrap().selected_run().unwrap();
+        assert_eq!(run.status, cockpit_ui::http::SendStatus::Ok);
+        assert_eq!(run.response.as_ref().unwrap().status, 200);
+        assert!(
+            model
+                .status
+                .starts_with("Http: GET https://api.test/users → 200"),
+            "status = {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn http_send_request_records_engine_failure_with_method_and_url() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_error(cockpit_http::HttpError::Network("EHOSTUNREACH".into()));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let run = model.http.as_ref().unwrap().selected_run().unwrap();
+        assert_eq!(run.status, cockpit_ui::http::SendStatus::Failed);
+        assert!(
+            model.status.contains("EHOSTUNREACH"),
+            "status = {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn http_send_request_rejects_a_second_send_while_one_is_in_flight() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        // Second send before the worker resolves — engine might race,
+        // but the in_flight slot is set synchronously by http_send_request
+        // before the worker can finish, so as long as we don't pump_until
+        // first the second call sees Some(_) and bails.
+        model.run_command(http_command_ids::SEND_REQUEST);
+        assert!(
+            model.status.contains("already in flight"),
+            "status = {}",
+            model.status
+        );
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+    }
+
+    #[test]
+    fn http_switch_environment_opens_palette_with_env_entries_plus_none() {
+        let mut model = model();
+        install_fake_http(&mut model);
+
+        model.run_command(http_command_ids::SWITCH_ENVIRONMENT);
+        assert_eq!(model.palette_mode, PaletteMode::HttpEnvironments);
+        let palette = model.palette.as_ref().expect("palette");
+        let ids: Vec<&str> = palette.entries().iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&HTTP_ENVIRONMENT_NONE_ID));
+        assert!(ids.contains(&"dev"));
+    }
+
+    #[test]
+    fn apply_http_environment_switches_active_env() {
+        let mut model = model();
+        install_fake_http(&mut model);
+
+        model.apply_http_environment("dev");
+        assert_eq!(
+            model.http.as_ref().unwrap().active_environment_name(),
+            Some("dev")
+        );
+        model.apply_http_environment(HTTP_ENVIRONMENT_NONE_ID);
+        assert_eq!(model.http.as_ref().unwrap().active_environment_name(), None);
+    }
+
+    #[test]
+    fn http_cancel_inflight_with_nothing_pending_is_a_noop_with_status() {
+        let mut model = model();
+        model.run_command(http_command_ids::CANCEL);
+        assert!(
+            model.status.contains("nothing in flight"),
+            "{}",
+            model.status
+        );
     }
 }
 

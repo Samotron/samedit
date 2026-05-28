@@ -1939,6 +1939,28 @@ Registered in `cockpit-commands`:
   `Http: Save Response To File` register and surface a status
   pointing at M11.5.2 — they need the async-engine thread + a
   sub-palette and land with the M11.4.1 painter.
+- **M11.5.2 update (async send + env sub-palette):** the binary now
+  owns a lazily-built `Arc<dyn HttpEngine + Send + Sync>` and an
+  `HttpInFlight` slot (channel `Receiver<Result<Response, HttpError>>`
+  + `CancelHandle` + `SentSummary`). `Http: Send Request` spawns a
+  named `cockpit-http-send` worker that calls `engine.send` off the
+  UI thread, nudges the `RedrawHandle` on completion, and stores the
+  receiver; `tick()` calls `poll_http_inflight` each frame, applies
+  the result to the active `HttpView`, and updates the status with
+  the round-trip time. `Http: Cancel In-flight Request`
+  (`http.cancel`) trips the cancel handle. `Http: Switch Environment`
+  opens `PaletteMode::HttpEnvironments` — a sub-palette listing every
+  parsed environment plus a `(none)` entry; selection routes through
+  `apply_http_environment` (uses the `(none)` sentinel since
+  environment names are file stems and never `(none)`). A second
+  Send while one is in flight bails with a status pointing at the
+  cancel command. Six new tests in `app::tests` (drive via
+  `FakeHttpEngine` end-to-end, both success and failure paths, env
+  palette population, the in-flight guard, and the cancel no-op).
+  Remaining for M11.4.1: the painter (mouse-drag split handle + tab
+  strip glyphs) and `Http: Send All In Folder` / `Http: Save Response
+  To File` — those need the painter's pane-context to know which
+  folder the cursor is in.
 
 ### M11.6 — Scripts (Lua, capability-gated)
 
