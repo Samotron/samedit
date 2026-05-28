@@ -681,6 +681,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-http"
+version = "0.0.1"
+dependencies = [
+ "insta",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cockpit-lsp"
 version = "0.0.1"
 dependencies = [

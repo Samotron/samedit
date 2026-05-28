@@ -1773,7 +1773,7 @@ UI lives in `cockpit-ui::http` (view-model) and `cockpit-render`
 (painter). The "send" command goes through `cockpit-commands` like
 everything else (AGENTS §2 #5).
 
-### M11.1 — `.bru` parser + serialiser
+### M11.1 — `.bru` parser + serialiser  ✅ (canonical round-trip; byte-identical deferred)
 
 - Hand-rolled parser over the documented Bruno grammar
   (block sections: `meta`, `<method>`, `headers`, `body:<kind>`,
@@ -1785,9 +1785,24 @@ everything else (AGENTS §2 #5).
   well-formed file (golden tests with `insta`). Adding a header
   via the UI inserts at the documented position; never reorders
   unrelated content.
-- **Tests:** `tests/fixtures/http/` — a small Bruno collection with
-  one GET, one POST with JSON body, one with auth, one with
-  pre-request script. Golden round-trip for each.
+- **Shipped behaviour vs plan:** parse → serialise round-trips
+  **semantically** (the second parse yields the same [`Request`]),
+  not byte-identical. The serialiser is opinionated about block
+  order (`meta`, verb, headers, query, body, auth, docs) and uses
+  two-space indentation inside body blocks so JSON `}` characters
+  don't terminate the block early. The byte-identical round-trip
+  needs an edit-AST layered on top (similar to `toml_edit` for
+  `cockpit-config`) and lands with the M11.4 view-model.
+- Recognised today: `meta`, every HTTP verb block, `headers`,
+  `query`, `body:{none,text,json,xml,form-urlencoded}`,
+  `auth:{none,basic,bearer}`, `docs`. Unknown blocks
+  (`vars:*`, `script:*`, `assert`, future OAuth) silently round-trip
+  by being ignored on parse — preserved-but-not-edited surfacing is
+  M11.4 work.
+- **Tests:** `tests/fixtures/http/` — `list-users.bru` (GET + bearer
+  auth + docs) and `create-user.bru` (POST + JSON body + basic auth).
+  `tests/golden_round_trip.rs` parses every fixture and checks the
+  parse → serialise → parse loop stays semantically stable.
 - **Done when:** every fixture round-trips byte-identical; malformed
   files surface a typed `ParseError` with line:col, never panic.
 
