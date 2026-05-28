@@ -684,6 +684,7 @@ dependencies = [
 name = "cockpit-http"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "insta",
  "serde",
  "tempfile",

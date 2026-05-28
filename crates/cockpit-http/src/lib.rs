@@ -19,16 +19,23 @@
 //! network, no async runtime, no UI dependencies.
 
 pub mod collection;
+pub mod engine;
 pub mod model;
 pub mod parse;
+pub mod prepare;
 pub mod serialise;
 
 pub use collection::{
     COLLECTION_DIR, COLLECTION_MARKER, CollectionError, CollectionRoot, ENVIRONMENTS_DIR,
     InterpolateError, detect_collection_root, interpolate, load_collection,
 };
+pub use engine::{
+    CancelHandle, FakeHttpEngine, HttpEngine, HttpError, PreparedBody, PreparedRequest,
+    RedirectHop, Response,
+};
 pub use model::{
     Auth, BasicAuth, BearerAuth, Body, Collection, Environment, HttpMethod, Meta, Request,
 };
 pub use parse::{ParseError, parse_request};
+pub use prepare::{PrepareError, prepare_request};
 pub use serialise::serialise_request;
