@@ -13,6 +13,7 @@ ui-smoke = []
 [dependencies]
 cockpit-commands.workspace = true
 cockpit-config.workspace = true
+cockpit-http.workspace = true
 cockpit-project.workspace = true
 nucleo-matcher = "0.3.1"
 

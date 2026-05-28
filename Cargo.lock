@@ -806,6 +806,7 @@ version = "0.0.1"
 dependencies = [
  "cockpit-commands",
  "cockpit-config",
+ "cockpit-http",
  "cockpit-project",
  "cockpit-testkit",
  "insta",

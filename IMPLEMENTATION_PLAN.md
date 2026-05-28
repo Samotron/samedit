@@ -1868,7 +1868,7 @@ everything else (AGENTS §2 #5).
   CI runs them on Ubuntu/macOS/Windows via the existing `integration`
   job; mirrored in `mise run test-integration`.
 
-### M11.4 — View-model + render
+### M11.4 — View-model + render  ◐ (view-model + tabs + send pipeline; painter wiring deferred to M11.4.1)
 
 - `cockpit-ui::http`: `HttpView` holds the active collection,
   selected request, in-progress send state, latest response. Mirrors
@@ -1883,6 +1883,22 @@ everything else (AGENTS §2 #5).
     **Headers**, **Timing**, **Raw**. Switching tabs is a palette
     command (default `<leader>h1..h4`).
 - Resize the split with the existing M4.7 mouse-drag plumbing.
+- **Shipped behaviour vs plan:** the headless view-model is in —
+  `HttpView` (collection + selected request + per-request `RequestRun`
+  + active environment + `SplitLayout` ratio with `[0.15, 0.85]`
+  clamp), `ResponseTab` (Body / Headers / Timing / Raw with `next` /
+  `prev` cycle + direct setters), `ResponseView` (per-tab headless
+  render including hand-rolled JSON pretty-printer that preserves key
+  order without a serde round-trip), and the `send_selected` /
+  `prepare_selected` helpers that bind `HttpView` to any `HttpEngine`
+  impl (real `ReqwestEngine` or scripted `FakeHttpEngine`). 22 unit
+  tests cover the state machine, JSON pretty-printer, tab cycle,
+  split clamps, environment switching with unknown-name guard, and
+  the engine round-trip. The actual painter wiring inside
+  `cockpit-render` (mouse-drag resize handle, tab strip rendering,
+  `cockpit::hydration` recognising `.bru` files and constructing
+  `HttpView` on open) lands in M11.4.1 — same pattern as how the
+  notebook view-model shipped before its painter.
 - **Done when:** opening a `.bru` file shows the split; running
   the request populates the response panel; tab switching works.
 

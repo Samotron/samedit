@@ -36,7 +36,7 @@ pub use engine::{
 };
 pub use engine_reqwest::ReqwestEngine;
 pub use model::{
-    Auth, BasicAuth, BearerAuth, Body, Collection, Environment, HttpMethod, Meta, Request,
+    Auth, BasicAuth, BearerAuth, Body, Collection, Environment, HttpMethod, KeyValue, Meta, Request,
 };
 pub use parse::{ParseError, parse_request};
 pub use prepare::{PrepareError, prepare_request};
