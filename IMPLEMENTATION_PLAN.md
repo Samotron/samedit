@@ -1914,12 +1914,27 @@ it's the long pole.
 
 ---
 
-## 8h. v0.12 — Ambient services + persistent jot  (NEW — post-spec)
+## 8h. v0.12 — Ambient services + Org-mode jot  (NEW — post-spec)
 
-Goal: a tasks-and-notes surface that's reachable **even when the cockpit
-window is minimised or closed**, plus the shared infrastructure that the
-v0.13 launcher reuses. This is the first v0.x to ship a sibling binary
-with its own process, system-tray icon, and global hotkey.
+Goal: an Emacs-Org-compatible task/note surface that's reachable **even
+when the cockpit window is minimised or closed**, plus the shared
+infrastructure that the v0.13 launcher reuses. Users point cockpit at a
+folder of `.org` files (default `~/org/`); the same files open
+unchanged in Emacs, Logseq, Beorg, Orgzly, or any other Org tool. This
+is the first v0.x to ship a sibling binary with its own process,
+system-tray icon, and global hotkey.
+
+### Why Org-mode
+
+- Same pattern as v0.11's Bruno-compat: the **files on disk are the
+  source of truth**, in a format other tools already speak. No
+  proprietary store, no schema migrations to fear, no lock-in.
+- Org is decades-stable, plain-text, diff-friendly, and the agenda /
+  capture / scheduling vocabulary is already what most note-and-task
+  systems eventually converge on.
+- Storage is "a folder" — works with any sync layer the user already
+  runs (Syncthing, git, Dropbox, iCloud Drive). Sync is the user's
+  problem, not ours.
 
 ### Why a sibling binary
 
@@ -1934,7 +1949,7 @@ with its own process, system-tray icon, and global hotkey.
   two binaries that talk via a documented Unix socket / Windows named
   pipe protocol.
 
-### Architectural pieces (shared between v0.12 and v0.13)
+### Architectural pieces
 
 | Piece                            | New crate / location                  |
 |----------------------------------|----------------------------------------|
@@ -1942,10 +1957,38 @@ with its own process, system-tray icon, and global hotkey.
 | Global hotkey registration       | `cockpit-hotkey` (wraps `global-hotkey`)|
 | IPC protocol + serde types       | `cockpit-ipc` (Unix socket + named pipe)|
 | Frameless floating window shell  | `cockpit-popover` (winit + glow, headless-tested view-models elsewhere) |
+| Org-mode parser + index          | `cockpit-org` (wraps `orgize`)         |
+| Capture template engine          | `cockpit-org::capture`                 |
+| Agenda query engine              | `cockpit-org::agenda`                  |
 
-These four crates are **shared infrastructure**. v0.12 implements them
-plus the jot app on top; v0.13 reuses them for the launcher. No
-duplication.
+The first four crates are **shared infrastructure** — v0.13 reuses
+them for the launcher. The `cockpit-org` crate is jot-specific and
+the only entirely new domain crate in v0.12.
+
+### Org-mode subset shipped in v0.12
+
+In scope:
+
+- Hierarchical headlines (`*`, `**`, `***`…) with title, tags
+  (`:work:urgent:`), and TODO keyword.
+- TODO state cycling on the default `TODO | DONE` workflow.
+  Custom workflows (`TODO | NEXT | WAIT | DONE`) are v0.12.x.
+- `SCHEDULED:` and `DEADLINE:` timestamps with the standard
+  `<2026-06-01 Mon>` / `<2026-06-01 Mon 09:00>` / repeater
+  (`+1w`, `++1d`) syntax.
+- Active vs inactive timestamps (`<...>` vs `[...]`).
+- Plain-text body paragraphs and lists.
+
+Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
+
+- `:PROPERTIES:` / `:END:` drawers, custom TODO workflows,
+  effort estimates, archive files.
+- Babel executable code blocks, org tables + table calc,
+  clocking (`CLOCK:` / time tracking), org-roam-style note
+  graphs, LaTeX/math rendering.
+- Emacs-style link resolution (`[[file:foo.org::Headline]]`).
+  External URLs render as links; org-internal links render as
+  inert text in v0.12.
 
 ### M12.1 — `cockpit-ipc`: protocol + transport
 
@@ -2003,40 +2046,171 @@ duplication.
 - **Tests:** unit on `PopoverContent` impls (headless); smoke on
   the real window behind `ui-smoke`.
 
-### M12.5 — `cockpit-jot`: storage + view-model
+### M12.5 — `cockpit-org`: parser, store, view-model
 
-- New crate. Domain types:
-  - `Task { id, title, status, priority, project, tags, created_at,
-    updated_at }`.
-  - `Note { id, body_markdown, project, tags, created_at,
-    updated_at, links: Vec<Link> }`.
-- Storage: SQLite via `rusqlite` (small, embeddable, no daemon, single
-  file) at `$XDG_DATA_HOME/cockpit/jot.db`. Schema migrations live in
-  the crate; on first launch the DB is created and seeded with a
-  welcome task.
-- **Why SQLite over flat files:** query speed (filter by project +
-  status + tag) matters for the tray UX; sync via `git-annex`-style
-  diff-friendly exports is a v0.12.1 follow-up if asked.
-- View-models in `cockpit-ui::jot` (reusable from both the main
-  cockpit and the popover) — same shape used by notebooks (M5.3).
-- **Tests:** SQLite migrations golden (the schema is checked in);
-  CRUD round-trips against a tempdir DB.
+- New crate. Wraps `orgize` (`0.10`+) for parsing. Domain types
+  are thin layers over orgize's AST so we don't fight the upstream
+  model:
+  - `OrgFile { path, content_hash, headings: Vec<Heading> }`.
+  - `Heading { level, title, todo_state, tags, scheduled,
+    deadline, body, children, line_range }`.
+  - `Timestamp { date, time, repeater, is_active }`.
+  - `OrgRoot { root_dir, files: BTreeMap<PathBuf, OrgFile> }`.
+- **Round-trip preservation is non-negotiable.** Same constraint
+  as v0.11 / M8.1: parse → mutate → serialise leaves untouched
+  blocks byte-identical (whitespace, comments, blank lines). We
+  edit by **line-range replacement** on the original source
+  buffer, never by re-emitting the full AST. Golden round-trips
+  guard this on every fixture.
+- Storage: a single user-configured root folder, default `~/org/`.
+  Cockpit walks the folder once on start, watches it via `notify`
+  (already a dep — M9.5) for live updates, and keeps every
+  `.org` file's parsed form in memory. **No database.** No
+  separate "cockpit metadata" sidecar files — anything cockpit
+  needs is encoded in standard Org syntax.
+- Default folder layout written on first launch (only if the root
+  is empty, never overwrites):
+  ```
+  ~/org/
+    inbox.org       # capture default lands here
+    tasks.org       # project work, scheduled items
+    notes.org       # zettel-style notes
+    journal.org     # date-tree, one heading per day
+  ```
+  Users can repoint anywhere — the layout is a default, not a
+  requirement. A folder full of pre-existing `.org` files Just
+  Works.
+- View-models in `cockpit-ui::org` (reusable from both the main
+  cockpit and the popover): `OrgListView`, `AgendaView`,
+  `CaptureView`. All pure data — same shape used by notebooks
+  (M5.3).
+- **Tests:** `orgize` round-trip on a corpus of Emacs-authored
+  fixtures (committed in `tests/fixtures/org/`); headline
+  enumeration; timestamp parsing for every form documented in
+  the Org manual (active/inactive/date-only/with-time/repeater);
+  line-range edit preserves siblings byte-identical.
+
+### M12.5a — Capture templates
+
+- A capture template is a typed slot the user fills in once and
+  commits to a specific destination file + heading. The templates
+  themselves live in `~/.config/cockpit/org.toml`:
+  ```toml
+  [org]
+  root        = "~/org"
+  default_todo_keywords = ["TODO", "DONE"]
+
+  [[org.capture]]
+  key      = "t"
+  name     = "Todo"
+  target   = { file = "inbox.org", under = "Tasks" }
+  template = """
+  * TODO %?
+    :PROPERTIES:
+    :CREATED: %U
+    :END:
+  """
+
+  [[org.capture]]
+  key      = "n"
+  name     = "Note"
+  target   = { file = "notes.org", under = "Inbox" }
+  template = "* %? :note:\n  Captured %U from %a"
+
+  [[org.capture]]
+  key      = "j"
+  name     = "Journal"
+  target   = { file = "journal.org", datetree = true }
+  template = "* %U %?"
+  ```
+- Substitution tokens (mirrors Emacs `org-capture-templates`):
+  - `%?` — cursor position after expansion.
+  - `%U` / `%u` — inactive / active timestamp of now.
+  - `%t` / `%T` — active date / date-time.
+  - `%a` — annotation: the editor's `path:line` if a buffer is
+    active, otherwise empty. (Cockpit's contribution beyond
+    Emacs's `%a`: when capture fires from a launcher action that
+    carries context, the context becomes the annotation.)
+  - `%i` — initial content: the current selection if any.
+  - `%(lua-expr)` — Lua expression evaluated under the v0.9
+    sandbox (capability `org.capture.lua`, default-granted).
+- `target.datetree = true` slots the entry under
+  `* 2026` → `** 2026-05` → `*** 2026-05-28 Thu`, creating
+  missing levels.
+- **Tests:** each token's substitution against frozen-clock fakes
+  (the M4.10 `Clock` trait); date-tree insertion in an empty file
+  and in one with existing date headings; capture preserves
+  unrelated headings byte-identical.
+
+### M12.5b — Agenda
+
+- Agenda view aggregates SCHEDULED / DEADLINE items across every
+  org file under the root. View modes:
+  - **Today** — items due / scheduled for the current day,
+    overdue items (DEADLINE in the past, still TODO).
+  - **Next 7 days** — calendar-style week view, one block per
+    day.
+  - **TODO list** — every headline in a TODO state, grouped by
+    file, ignoring dates.
+- Filtering: by tag (`+work-personal`), by TODO keyword, by file.
+  The query syntax is a small subset of Org's agenda search
+  syntax — full Org agenda filtering is out of scope; ship the
+  common cases and let users fall through to in-cockpit search
+  for the rest.
+- Repeater handling: a repeating headline (`SCHEDULED: <2026-06-01
+  Mon +1w>`) marked DONE in cockpit bumps the timestamp forward
+  one period, exactly as Emacs does. Tested against a corpus of
+  repeater forms (`+1d`, `+1w`, `++1m`, `.+2d`).
+- Performance: agenda is computed from the in-memory `OrgRoot`,
+  not from disk on every paint. Re-index on `notify` events.
+  For 10k headlines across 100 files (a reasonable upper bound),
+  the agenda must render in < 50 ms — asserted in the bench leg
+  (M6.1's harness, new `agenda_perf` test).
+- **Tests:** agenda content for a fixture root containing every
+  scheduling permutation; today-view against a frozen clock;
+  repeater bump on DONE.
 
 ### M12.6 — Sibling binary `cockpit-jot`
 
 - New binary in the workspace. Standalone.
 - Owns: tray icon (M12.2), global hotkey (M12.3), popover (M12.4)
-  hosting the jot view-model (M12.5), IPC server (M12.1) exposing
-  the `jot` service so the main cockpit can drive the same store.
-- **Default hotkey:** `Ctrl+Alt+J` (configurable in
-  `~/.config/cockpit/jot.toml`).
-- Tray menu: *Open jot*, *Quick task*, *Quick note*, *Settings*,
-  *Quit*.
-- Quick task / quick note: popover appears in "quick add" mode —
-  single input field, Enter saves, focus returns to wherever it
-  was. Sub-100 ms from hotkey to focus-in-field is the target.
+  hosting the Org view-models (M12.5/.5a/.5b), IPC server (M12.1)
+  exposing the `org` service so the main cockpit can drive the
+  same `OrgRoot`.
+- **Default hotkeys** (configurable in `~/.config/cockpit/org.toml`):
+  - `Ctrl+O` — **capture** (opens the capture-template picker;
+    pressing the template key triggers immediate quick-entry).
+  - `Ctrl+Alt+A` — **agenda** (opens the popover on today's
+    agenda).
+  - `Ctrl+Alt+O` — **org overview** (opens the popover on the
+    list-of-files view).
+
+  All three chords run through `cockpit-hotkey`'s conflict
+  detection (M12.3). `Ctrl+O` collides with "Open file" inside
+  most editors / browsers — the conflict detector flags this at
+  register time, and the docs explicitly call out that the
+  global override means apps lose their local `Ctrl+O`. Users
+  who don't want that pick a different chord.
+- Tray menu: *Capture…*, *Agenda*, *Open inbox*, *Open root in
+  cockpit*, *Settings*, *Quit*.
+- Capture flow:
+  1. Hotkey fires; popover opens on the template picker
+     (`t` Todo / `n` Note / `j` Journal / …).
+  2. User picks a key; the popover swaps to a single-field
+     editor with the template pre-expanded and the cursor at the
+     `%?` slot.
+  3. `Ctrl+Enter` commits — writes the entry to the right file
+     under the right heading, dismisses the popover, returns
+     focus to wherever it was. Sub-100 ms hotkey-to-focus-in-field
+     is the target (asserted under `--features bench`).
+- Agenda flow: popover opens on the Today view; arrow keys move
+  the cursor between headlines; `Enter` jumps into the
+  cockpit (via IPC) and opens the underlying `.org` file at the
+  right line. `Tab` cycles Today / Next-7 / TODO list. `/` filters.
 - Background behaviour: process keeps running after the popover
-  dismisses; tray icon is the only persistent surface.
+  dismisses; tray icon + `notify` watcher are the only persistent
+  surfaces. The in-memory `OrgRoot` survives across popover
+  dismissals — re-opening agenda is instant.
 - Autostart: opt-in. Provide platform install scripts:
   - Linux: `~/.config/autostart/cockpit-jot.desktop`.
   - macOS: `~/Library/LaunchAgents/dev.cockpit.jot.plist`.
@@ -2047,44 +2221,88 @@ duplication.
 
 ### M12.7 — Main-cockpit integration
 
-- In-cockpit jot pane (floating, reuses M8.2 floating-pane primitive)
-  shows the same data as the tray app via the `jot` IPC service.
+- The cockpit already paints `.org` files via the editor (no new
+  language for the buffer — Org gets a `Language::Org` highlight
+  arm here, following the v0.10 pattern for Go: `tree-sitter-org`
+  for highlight, `cockpit-org` for structural ops).
+- New in-cockpit pane: **Agenda** (floating, reuses M8.2 floating-
+  pane primitive) shows the same view-model as the tray app via
+  the `org` IPC service.
 - Palette commands:
-  - `Jot: Open` (`<leader>j`) — floating pane.
-  - `Jot: Quick Task` (`<leader>jt`).
-  - `Jot: Quick Note` (`<leader>jn`).
-  - `Jot: Toggle Project Filter` — scopes the list to the current
-    project.
+  - `Org: Capture` (`<leader>oc`) — template picker, same flow
+    as `Ctrl+O` from the tray.
+  - `Org: Agenda` (`<leader>oa`) — floating agenda.
+  - `Org: Jump To Inbox` (`<leader>oi`).
+  - `Org: Refile` — move the headline under the cursor to a
+    chosen target (file + parent heading).
+  - `Org: Toggle TODO State` (`<leader>ot`) — cycles
+    TODO → DONE → no-keyword on the cursor's headline. Pure
+    editor-buffer operation; respects line-range round-trip rule.
+  - `Org: Schedule` / `Org: Deadline` — prompt for a date,
+    insert/update the timestamp on the cursor's headline.
+  - `Org: Toggle Project Filter` — scopes the agenda to org
+    files tagged with the current project's name. (Optional;
+    Org isn't intrinsically project-scoped the way the SQLite
+    plan was.)
 - When `cockpit-jot` isn't running, the cockpit reads/writes the
-  SQLite file directly (single-writer semantics: SQLite WAL +
-  `BUSY_TIMEOUT`). When it is, the cockpit uses IPC so both views
-  stay live.
+  `.org` files directly. When it is, edits go through IPC so the
+  tray app's in-memory `OrgRoot` stays live and `notify` doesn't
+  trigger a redundant re-parse. Either path produces byte-
+  identical file contents — they share the M12.5 line-range
+  edit primitives.
 - **Tests:** in-cockpit pane scripted edits; IPC + direct-write
-  parity on the same fixture.
+  parity on the same fixture; round-trip preservation under
+  TOGGLE-TODO + SCHEDULE on a fixture authored in Emacs.
 
-### M12.8 — Sync (best-effort, v0.12.1)
+### M12.8 — Sync (effectively free)
 
-- **Out of scope for v0.12.** Document that the SQLite DB is the
-  source of truth and lives on one machine.
-- v0.12.1 adds a `jot: Export` palette command that writes Markdown
-  files to a chosen directory and a `jot: Import` that reads them
-  back. Users who want sync wire the export directory into their
-  own git/Syncthing/Dropbox. We do not ship a sync engine.
+- The org root is a folder of plain-text files. Sync is the
+  user's existing solution: git, Syncthing, iCloud Drive,
+  Dropbox, NextCloud — all work without cockpit doing anything.
+- Cockpit ships **no** sync engine. We document the patterns in
+  `docs/org.md`:
+  - **git** — point a working copy at the root; `git pull` /
+    `git push` from the cockpit's mux terminal (or via the v0.8
+    Lazygit recipe). Merge conflicts are resolved in the editor
+    like any other text file.
+  - **Syncthing / iCloud / Dropbox** — point the sync folder at
+    the org root. The `notify` watcher picks up remote writes
+    and re-indexes within ~1 s.
+- The only cockpit-side concern is graceful handling of
+  concurrent writes (remote sync touches a file while cockpit
+  has it open). Mitigation: every edit reloads the file's
+  on-disk content first, checks the recorded content hash, and
+  if it changed surfaces a *"file changed on disk; reload?"*
+  toast instead of clobbering. Same model the editor already
+  uses for external buffer changes.
 
 ### v0.12 exit checklist
 
 - [ ] `cockpit-jot` runs as a separate process; tray icon present
       on all three OSes.
-- [ ] `Ctrl+Alt+J` opens the popover from any focused window in <
-      150 ms (cold) or < 50 ms (warm) on a low-end Linux laptop.
-- [ ] Quick task input adds a task that's immediately visible in the
-      main cockpit's jot pane via IPC.
+- [ ] `Ctrl+O` from any focused window opens the capture-template
+      picker in < 150 ms cold / < 50 ms warm on a low-end Linux
+      laptop.
+- [ ] Picking the `t` template, typing a title, and pressing
+      `Ctrl+Enter` appends a `* TODO ...` heading to `inbox.org`
+      under the configured parent heading; the file is immediately
+      readable in Emacs / Logseq with no syntax surprises.
+- [ ] `Ctrl+Alt+A` opens the agenda; SCHEDULED items for today and
+      DEADLINE items in the next 7 days appear in the correct
+      buckets; repeater on DONE bumps the timestamp.
+- [ ] Editing a `.org` file in the main cockpit shows up in the
+      tray app's in-memory `OrgRoot` within ~1 s (notify watcher).
+- [ ] An Emacs-authored `.org` file containing every fixture's
+      syntax (headlines, tags, TODO states, SCHEDULED/DEADLINE
+      with repeaters, active/inactive timestamps) round-trips
+      byte-identical through cockpit's edit-then-save path.
 - [ ] Closing the main cockpit does not disturb the tray app;
-      reopening picks up the latest tasks/notes.
+      reopening picks up the same org root.
 - [ ] Autostart command writes the right file and survives a
       reboot.
 - [ ] `mise run ci` green; new `ipc-smoke` CI leg exercises the
-      IPC protocol per OS.
+      IPC protocol per OS; new `org_roundtrip` bench test gates
+      agenda perf (< 50 ms on a 10k-headline corpus).
 
 ### Sequencing
 
@@ -2093,24 +2311,32 @@ M12.1 (ipc) ───┐
 M12.2 (tray) ──┼──▶ M12.4 (popover) ──┐
 M12.3 (hotkey)─┘                       │
                                        ▼
-                  M12.5 (jot model) ──▶ M12.6 (jot bin) ──▶ M12.7 (cockpit wire-up)
+                  M12.5 (org parse) ──▶ M12.5a (capture) ──▶ M12.5b (agenda)
+                                                                  │
+                                                                  ▼
+                                                M12.6 (jot bin) ──▶ M12.7 (cockpit) ──▶ M12.8 (sync docs)
 ```
 
 M12.1–M12.3 ship as a single "infrastructure" PR — they're the v0.13
-launcher's foundation too. M12.4 + M12.5 are independent. M12.6 +
-M12.7 close the loop.
+launcher's foundation too. M12.4 + M12.5 are independent of the infra
+PR. M12.5a builds on M12.5; M12.5b can run in parallel with M12.5a
+once M12.5 is in. M12.6 + M12.7 close the loop.
 
 ### Risk notes
 
 | Risk                                          | Mitigation                                              |
 |-----------------------------------------------|---------------------------------------------------------|
-| `tray-icon` quirks per OS                     | Stick to the API surface Tauri uses; CI smoke per OS catches regressions. Tray menu kept minimal — 4 items, no nested submenus. |
-| `global-hotkey` chord conflicts               | Detect at register; surface clearly; suggest alternatives in the toast. Never grab a chord behind the user's back. |
-| Two writers to SQLite (jot + cockpit)         | SQLite WAL mode + retry-with-backoff on `BUSY`. Long-term: route all writes through `cockpit-jot` over IPC when it's running. |
+| `tray-icon` quirks per OS                     | Stick to the API surface Tauri uses; CI smoke per OS catches regressions. Tray menu kept minimal — 6 items, no nested submenus. |
+| `global-hotkey` chord conflicts               | Detect at register; surface clearly; suggest alternatives in the toast. Never grab a chord behind the user's back. `Ctrl+O` collision with browser/editor "Open file" is documented loudly; users can remap. |
+| `orgize` API drift                            | Pin to a specific minor version; integration tests run against a fixture corpus that triggers every supported feature. Major-version bumps are a milestone-level change. |
+| Round-trip byte-identical edits drift         | Line-range replacement on the original source buffer (never AST re-emit) + golden fixture corpus authored in Emacs. Property test: parse → mutate-no-op → serialise == input on a generator of fuzzy `.org` strings. |
+| Two writers to the same `.org` file          | The editor's "file changed on disk" toast catches the race; cockpit reloads before overwriting. Plain-text + git-friendly format means worst case is a 3-way merge, not data loss. |
 | Process supervision (jot crashes)             | Tray app is intentionally simple; if it crashes the user notices because the tray icon vanishes. No respawner in v0.12 — out of scope, adds surface for very rare failure. |
-| Users want cloud sync                         | v0.12 documents the export/import path. Real sync is v0.12.1 + and lives on the user's existing sync solution (Syncthing / Dropbox / git). |
+| Users want cloud sync                         | v0.12 documents the patterns. Plain-text org files mean any sync solution works without cockpit code. |
+| Agenda perf on large vaults                   | Bench leg asserts < 50 ms on 10k headlines. If perf regresses, the agenda index becomes a separate `BTreeMap<Date, Vec<HeadlineRef>>` recomputed on `notify` rather than per-paint. |
 | Two binaries means two release artifacts      | The release workflow already packages per-OS; add a `--bins cockpit cockpit-jot` flag. Document in `docs/install.md`. |
 | Bonus binary breaks `mise run run`            | `mise.toml` task list grows: `run` keeps launching the main cockpit, new `run-jot` launches the sibling, `run-all` starts both. |
+| Org user expects full Emacs parity            | Document the v0.12 subset loudly in `docs/org.md`. Out-of-scope features listed up front, with the "open in Emacs for X" escape hatch made explicit. |
 
 ---
 
@@ -2234,6 +2460,13 @@ New crates:
   in `$BROWSER`.
 - `Switch Theme` — same as the in-cockpit `Theme: Switch …`
   palette, but dispatched over IPC.
+- `Org Capture: <Template>` — one launcher entry per template
+  configured in v0.12's `org.toml`. Hitting Enter routes through
+  the `org` IPC service to trigger the same capture flow the
+  tray app uses. Means the launcher's universal hotkey is a
+  second entry point to capture, complementing `Ctrl+O`.
+- `Org Agenda` — opens the agenda popover via the `org` IPC
+  service (or launches the tray app if it isn't running).
 
 ### M13.5 — `cockpit-quick`: sibling binary
 
