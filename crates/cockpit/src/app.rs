@@ -15,7 +15,7 @@ use cockpit_analytics::{
     AnalyticsProject, BuildPlan, Materialisation, build_plan, detect_analytics_project,
 };
 use cockpit_commands::{KeyChord, Modifiers};
-use cockpit_config::{GlobalKeys, ZellijLayout};
+use cockpit_config::GlobalKeys;
 use cockpit_editor::vim::{Key as VimKey, Mode};
 use cockpit_editor::{
     Editor, EditorSignal, HighlightKind, HighlightSpan, Language, nearest_test_name,
@@ -25,14 +25,14 @@ use cockpit_lsp::{
     ServerConfig,
 };
 use cockpit_mux::{
-    PaneMode, PrefixDispatcher, Rect as MuxRect, Session as MuxSession, SplitDirection,
-    command_ids as mux_command_ids,
+    PaneMode, PrefixDispatcher, Rect as MuxRect, SESSION_ID_STRIDE as MUX_SESSION_STRIDE,
+    Session as MuxSession, SplitDirection, command_ids as mux_command_ids,
 };
 use cockpit_notebook::{
     CellKind, Notebook, is_notebook_source, parse_notebook, parse_quarto, quarto_render_spec,
 };
 use cockpit_project::{
-    FileNodeKind, FileSystem, FileTree, FormatPlan, KnownFormatter,
+    BinaryLookup, FileNodeKind, FileSystem, FileTree, FormatPlan, KnownFormatter,
     PathBinaryLookup as FormatPathLookup, ProcessRunner, ProcessSpec, ProjectCache,
     ProjectDetection, StdFileSystem, StdProcessRunner, mise_exec_command, plan_format,
     project_cache_path, render_format_task_snippet, walk_project_files,
@@ -48,7 +48,10 @@ use cockpit_terminal::live::{LiveTerminal, WakeFn};
 use cockpit_terminal::path_detect::detect_paths;
 use cockpit_terminal::pty::PtyDimensions;
 use cockpit_terminal::session::TerminalStatus;
-use cockpit_terminal::zellij::{LaunchPlan, PathBinaryLookup, ShellProfile, plan_launch};
+// Zellij launch planning is decommissioned (v0.7 M7.9). The native
+// multiplexer handles all spawn / split / window concerns; cockpit
+// pulls only `CommandSpec` (now at the crate root) from
+// `cockpit-terminal`.
 use cockpit_ui::{
     CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, FileBrowser, FileBrowserAction,
     FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput,
@@ -61,6 +64,9 @@ pub const HEADER_H: f32 = 24.0;
 pub const ROW_H: f32 = 20.0;
 pub const FONT: f32 = 13.0;
 pub const PAD: f32 = 8.0;
+/// Height of the native mux mode-line strip at the bottom of the terminal
+/// pane (v0.7 M7.7).
+pub const STATUS_LINE_H: f32 = 18.0;
 pub const GUTTER_W: f32 = 52.0;
 pub const INDENT_W: f32 = 14.0;
 /// Monospace advance estimate, as a fraction of the font size.
@@ -95,6 +101,18 @@ const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
 /// Command id for "summarise the recorded startup-phase trace"
 /// (v0.6 M6.7).
 const DEBUG_SHOW_STARTUP_TRACE: &str = "debug.show_startup_trace";
+/// Command id for "summarise the native mux mode-line" (v0.7 M7.7).
+const DEBUG_SHOW_MUX_STATUS: &str = "debug.show_mux_status";
+/// Command ids for switching the active theme (v0.8 M8.1). One per
+/// supported flavour so the palette can list them as discrete entries.
+const THEME_SWITCH_DARK: &str = "theme.switch.dark";
+const THEME_SWITCH_LATTE: &str = "theme.switch.latte";
+const THEME_SWITCH_FRAPPE: &str = "theme.switch.frappe";
+const THEME_SWITCH_MACCHIATO: &str = "theme.switch.macchiato";
+const THEME_SWITCH_MOCHA: &str = "theme.switch.mocha";
+/// Command id prefix for tool-pane recipes (v0.8 M8.2). The suffix is the
+/// recipe's `[panes.tools.<name>]` key.
+const TOOL_RECIPE_PREFIX: &str = "tool.";
 /// Command id for "go to the symbol's definition under the cursor" (M4.2).
 const LSP_GOTO_DEFINITION: &str = "lsp.goto_definition";
 /// Command id for "show hover information for the symbol under the cursor" (M4.2).
@@ -301,6 +319,55 @@ pub struct AppModel {
     /// Tracks `<leader>c` in the editor pane so `<leader>ca` can dispatch the
     /// quick-fix command without adding a parallel command path.
     editor_pending_leader: u8,
+    /// Tracks a pending `g` while in mux copy mode so `gg` can jump to the
+    /// top of the scrollback (M7.6).
+    mux_copy_pending_g: bool,
+    /// Buffer holding text yanked from the most recent copy-mode selection
+    /// (M7.6). Clipboard wiring is a follow-up; the buffer surfaces in the
+    /// status line so the workflow is usable today.
+    mux_copy_yank: Option<String>,
+    /// First-attach commands declared in the project's `cockpit_layout` KDL
+    /// (v0.7 M7.8). Consumed by [`ensure_terminal`] on the first time a
+    /// pane is brought up so the command runs directly in its PTY instead
+    /// of the default Zellij / shell fallback.
+    mux_pane_commands: HashMap<cockpit_mux::PaneId, String>,
+    /// Most recently kicked-off mise task (v0.7 M7.7 status line extra).
+    /// Surfaced as `task:<name>` in the mode-line.
+    last_mise_task: Option<String>,
+    /// True when the workspace is attached to the mux session; false after
+    /// `Ctrl+b d` until the user re-attaches via Enter on the session-list
+    /// overlay (v0.7 M7.5). PTYs keep running while detached.
+    mux_attached: bool,
+    /// Background sessions parked while a different one is active
+    /// (v0.7 M7.5). Pane ids stay globally unique thanks to
+    /// [`cockpit_mux::SESSION_ID_STRIDE`], so terminals from parked
+    /// sessions remain reachable through the shared `terminals` map.
+    mux_parked: Vec<MuxSession>,
+    /// Cursor inside the detached overlay's session list (v0.7 M7.5).
+    mux_overlay_index: usize,
+    /// Counter used to seed pane id strides on `mux.session.new`. Counts
+    /// across parked + active so freshly created sessions never collide
+    /// with already-running ones.
+    mux_next_session_index: u64,
+    /// User-configured tool-pane recipes (v0.8 M8.2). Each recipe maps to
+    /// a `tool.<name>` palette command that spawns the recipe's command
+    /// in the active terminal pane.
+    tool_recipes: std::collections::BTreeMap<String, cockpit_config::ToolPaneRecipe>,
+    /// `terminal.status.format` template used for the mux mode-line
+    /// (v0.7 M7.7).
+    status_format: String,
+    /// Resolved user-config path used by theme write-back (v0.8 M8.1).
+    /// Defaults to `cockpit_config::user_config_path()` when None; tests
+    /// inject a temp path via [`AppModel::set_user_config_path`].
+    user_config_path: Option<std::path::PathBuf>,
+    /// Configured leader chord (single stroke), used to substitute
+    /// `<leader>` in recipe keybinds and to detect leader presses
+    /// during dispatch (v0.8 M8.2).
+    leader_chord: Option<String>,
+    /// Buffered leader stroke captured by the previous keypress; the
+    /// next stroke is combined with this one and looked up as a
+    /// multi-stroke chord.
+    pending_leader: Option<cockpit_commands::KeyStroke>,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -371,7 +438,7 @@ impl AppModel {
     ) -> Result<Self, String> {
         let router = InputRouter::from_global_keys(&GlobalKeys::default())
             .map_err(|err| format!("input router setup failed: {err:?}"))?;
-        Ok(Self {
+        let mut model = Self {
             fs,
             process,
             browser: FileBrowser::new(tree),
@@ -405,6 +472,19 @@ impl AppModel {
             analytics: None,
             editor_pending_g: false,
             editor_pending_leader: 0,
+            mux_copy_pending_g: false,
+            mux_copy_yank: None,
+            mux_pane_commands: HashMap::new(),
+            last_mise_task: None,
+            mux_attached: true,
+            mux_parked: Vec::new(),
+            mux_overlay_index: 0,
+            mux_next_session_index: 1,
+            tool_recipes: std::collections::BTreeMap::new(),
+            status_format: cockpit_config::TerminalStatusConfig::default().format,
+            user_config_path: None,
+            leader_chord: None,
+            pending_leader: None,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -412,7 +492,39 @@ impl AppModel {
             editor_scroll: 0.0,
             exit: false,
             detection,
-        })
+        };
+        model.apply_cockpit_layout();
+        Ok(model)
+    }
+
+    /// Apply a project's configured `cockpit_layout` to the active mux
+    /// session (v0.7 M7.8). When metadata declares a layout path we replace
+    /// the default single-pane session with one built from the KDL tree and
+    /// stash the per-pane first-attach commands. Missing files or parse
+    /// errors are surfaced in the status line so the user sees them, but
+    /// the cockpit keeps running on the fallback session.
+    fn apply_cockpit_layout(&mut self) {
+        match crate::mux_layout::resolve_cockpit_layout(&self.detection) {
+            Ok(Some(resolved)) => {
+                let (session, pane_commands) = cockpit_mux::Session::from_layout(
+                    self.detection.display_name.clone(),
+                    &resolved.description,
+                );
+                self.mux_session = session;
+                self.mux_pane_commands = pane_commands
+                    .into_iter()
+                    .filter_map(|(id, command)| command.map(|cmd| (id, cmd)))
+                    .collect();
+                self.status = format!(
+                    "Mux layout loaded ({} panes).",
+                    self.mux_session.active_window().panes.len()
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.status = format!("cockpit_layout ignored: {err}");
+            }
+        }
     }
 
     /// Resolve this project's cache file and restore persisted state from it
@@ -427,6 +539,13 @@ impl AppModel {
         self.apply_cache(cache);
     }
 
+    /// Remember the user-config path so subsequent palette commands
+    /// (`Theme: Switch…`) can write back to it without re-resolving the
+    /// platform config directory (v0.8 M8.1).
+    pub fn set_user_config_path(&mut self, path: std::path::PathBuf) {
+        self.user_config_path = Some(path);
+    }
+
     /// Apply a loaded user [`cockpit_config::Config`] onto the model.
     /// Currently honours `editor.format_on_save` (M4.4) and the layout
     /// width preferences (`ui.left_width` / `ui.right_width`). Other
@@ -439,6 +558,40 @@ impl AppModel {
         prefs.left_width = config.ui.left_width.into();
         prefs.right_width = config.ui.right_width.into();
         self.layout.set_preferences(prefs);
+
+        // v0.8 M8.1: resolve `ui.theme` against the Catppuccin / default
+        // palette set. Unknown names log a warning and leave the current
+        // theme in place — never crash on a typo'd config.
+        match Theme::from_name(&config.ui.theme) {
+            Some(theme) => self.theme = theme,
+            None => {
+                tracing::warn!(
+                    theme = %config.ui.theme,
+                    "unknown ui.theme; keeping current theme",
+                );
+            }
+        }
+
+        // v0.8 M8.2: capture the leader chord and tool-pane recipes.
+        // `<leader>…` in recipe keybinds is substituted with the
+        // configured leader chord so the default Lazyvim-style
+        // bindings work out of the box.
+        self.leader_chord = if config.keys.global.leader.is_empty() {
+            None
+        } else {
+            Some(config.keys.global.leader.clone())
+        };
+        self.tool_recipes = config.panes.tools.clone();
+        self.bind_tool_recipe_chords();
+
+        // v0.7 M7.7: pick up the configured mode-line format. An empty
+        // template falls back to the default so users never see a blank
+        // strip.
+        self.status_format = if config.terminal.status.format.is_empty() {
+            cockpit_config::TerminalStatusConfig::default().format
+        } else {
+            config.terminal.status.format.clone()
+        };
     }
 
     /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
@@ -546,6 +699,32 @@ impl AppModel {
             return;
         }
         if focused == PaneId::Terminal && self.handle_mux_prefix(&chord) {
+            return;
+        }
+        // v0.8 M8.2: leader-key support. If the previous chord was the
+        // configured leader, combine it with the current chord to form
+        // a multi-stroke key and route the result. Resolved matches
+        // dispatch like a regular global; unresolved combos fall back
+        // to the current chord so the user doesn't lose the keystroke.
+        if let Some(leader) = self.pending_leader.take()
+            && let [stroke] = chord.strokes()
+        {
+            let combined = KeyChord::new(vec![leader, stroke.clone()]);
+            if let Some(command) = self.router.global_keymap().resolve(&combined) {
+                let id = command.clone();
+                self.status = "Leader chord dispatched.".to_string();
+                self.run_command(id.as_str());
+                return;
+            }
+            // No combo matched — drop the buffered leader silently and
+            // process the current chord normally.
+        }
+        if focused != PaneId::Terminal
+            && self.leader_chord.is_some()
+            && let Some(stroke) = leader_stroke_match(&chord, self.leader_chord.as_deref())
+        {
+            self.pending_leader = Some(stroke);
+            self.status = "Leader…".to_string();
             return;
         }
         match self.router.route(focused, chord) {
@@ -806,12 +985,15 @@ impl AppModel {
     }
 
     fn mux_pane_rects_for_terminal(&self, rect: UiRect) -> Vec<cockpit_mux::PaneRect> {
+        // Reserve the bottom mode-line strip (M7.7) so hit-tests and layout
+        // share the same pane bounds the painter uses.
+        let reserved = HEADER_H as u32 + STATUS_LINE_H as u32;
         self.mux_session.active_window().pane_rects(
             MuxRect::new(
                 rect.x,
                 rect.y + TOP_BAR_H as u32 + HEADER_H as u32,
                 rect.width,
-                rect.height.saturating_sub(HEADER_H as u32),
+                rect.height.saturating_sub(reserved),
             ),
             1,
         )
@@ -864,6 +1046,12 @@ impl AppModel {
             DEBUG_SHOW_PROJECT_STATE => self.debug_show_project_state(),
             DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
             DEBUG_SHOW_STARTUP_TRACE => self.debug_show_startup_trace(),
+            DEBUG_SHOW_MUX_STATUS => self.debug_show_mux_status(),
+            THEME_SWITCH_DARK => self.switch_theme("dark"),
+            THEME_SWITCH_LATTE => self.switch_theme("latte"),
+            THEME_SWITCH_FRAPPE => self.switch_theme("frappe"),
+            THEME_SWITCH_MACCHIATO => self.switch_theme("macchiato"),
+            THEME_SWITCH_MOCHA => self.switch_theme("mocha"),
             LSP_GOTO_DEFINITION => self.request_goto_definition(),
             LSP_SHOW_HOVER => self.request_show_hover(),
             LSP_RENAME => self.open_rename_input(),
@@ -879,6 +1067,10 @@ impl AppModel {
             MODELS_SHOW_DAG => self.show_dag_summary(),
             QUARTO_RENDER => self.render_quarto_document(),
             APP_QUIT => self.exit = true,
+            other if other.starts_with(TOOL_RECIPE_PREFIX) => {
+                let name = other[TOOL_RECIPE_PREFIX.len()..].to_string();
+                self.run_tool_recipe(&name);
+            }
             other => self.status = format!("Unhandled command `{other}`."),
         }
     }
@@ -886,7 +1078,9 @@ impl AppModel {
     /// Open the command palette over the workspace.
     fn open_palette(&mut self) {
         self.palette_mode = PaletteMode::Commands;
-        self.palette = Some(Palette::new(palette_entries()));
+        let mut entries = palette_entries();
+        entries.extend(self.tool_recipe_palette_entries());
+        self.palette = Some(Palette::new(entries));
         self.status = "Command palette — type to filter, Enter to run, Esc to close.".to_string();
     }
 
@@ -944,9 +1138,12 @@ impl AppModel {
             mux_command_ids::PASTE => {
                 self.status = "Mux: paste uses copy-mode buffer in M7.6.".to_string();
             }
-            mux_command_ids::DETACH => {
-                self.status = "Mux: detach/attach lands in M7.5.".to_string();
-            }
+            mux_command_ids::DETACH => self.mux_toggle_detach(),
+            mux_command_ids::NEW_SESSION => self.mux_new_session(),
+            mux_command_ids::NEXT_SESSION => self.mux_cycle_session(1),
+            mux_command_ids::PREVIOUS_SESSION => self.mux_cycle_session(-1),
+            mux_command_ids::FLOATING_TOGGLE => self.mux_toggle_floating(),
+            mux_command_ids::FLOATING_CLOSE => self.mux_close_floating(),
             other => {
                 if let Some(index) = mux_select_window_index(other) {
                     self.mux_select_window(index);
@@ -1027,6 +1224,122 @@ impl AppModel {
         self.status = format!("Mux: copy mode entered for {pane}.");
     }
 
+    /// Toggle the workspace attached-to-mux flag (v0.7 M7.5 `Ctrl+b d`).
+    /// PTYs keep running in the background while detached; the terminal
+    /// pane paints a session-list overlay instead of the grid.
+    fn mux_toggle_detach(&mut self) {
+        if self.mux_attached {
+            self.mux_attached = false;
+            self.mux_overlay_index = 0;
+            let name = self.mux_session.name.clone();
+            self.status = format!("Mux: detached from session `{name}`. Press Enter to reattach.");
+        } else {
+            self.mux_attached = true;
+            let name = self.mux_session.name.clone();
+            self.status = format!("Mux: re-attached to session `{name}`.");
+        }
+    }
+
+    /// Park the active session and activate a freshly created one (v0.7 M7.5
+    /// `mux.session.new`). Pane ids in the new session start from a disjoint
+    /// stride so PTYs from parked sessions stay valid.
+    fn mux_new_session(&mut self) {
+        let next_index = self.mux_next_session_index;
+        self.mux_next_session_index = self.mux_next_session_index.saturating_add(1);
+        let name = format!("session-{next_index}");
+        let fresh = MuxSession::with_id_base(name.clone(), next_index * MUX_SESSION_STRIDE);
+
+        let parked = std::mem::replace(&mut self.mux_session, fresh);
+        self.mux_parked.push(parked);
+        self.mux_attached = true;
+        self.status = format!(
+            "Mux: new session `{name}`. ({} parked)",
+            self.mux_parked.len()
+        );
+    }
+
+    /// Cycle to the next / previous parked session (v0.7 M7.5
+    /// `mux.session.next` / `mux.session.previous`). The current session is
+    /// pushed onto the parked stack so it survives the swap.
+    fn mux_cycle_session(&mut self, delta: isize) {
+        if self.mux_parked.is_empty() {
+            self.status = "Mux: only one session — nothing to cycle to.".to_string();
+            return;
+        }
+        let index = if delta >= 0 {
+            0
+        } else {
+            self.mux_parked.len() - 1
+        };
+        let parked = self.mux_parked.remove(index);
+        let previous = std::mem::replace(&mut self.mux_session, parked);
+        if delta >= 0 {
+            self.mux_parked.push(previous);
+        } else {
+            self.mux_parked.insert(0, previous);
+        }
+        self.mux_attached = true;
+        self.status = format!(
+            "Mux: attached to session `{}`. ({} parked)",
+            self.mux_session.name,
+            self.mux_parked.len()
+        );
+    }
+
+    /// Total number of mux sessions cockpit knows about (visible + parked).
+    fn mux_session_count(&self) -> usize {
+        1 + self.mux_parked.len()
+    }
+
+    /// Drive the detached overlay (Up/Down to choose, Enter to attach).
+    fn handle_mux_overlay_key(&mut self, chord: &KeyChord) {
+        let count = self.mux_session_count();
+        if chord == &KeyChord::single("ArrowDown", Modifiers::NONE)
+            || chord == &KeyChord::single("j", Modifiers::NONE)
+        {
+            if self.mux_overlay_index + 1 < count {
+                self.mux_overlay_index += 1;
+            }
+        } else if chord == &KeyChord::single("ArrowUp", Modifiers::NONE)
+            || chord == &KeyChord::single("k", Modifiers::NONE)
+        {
+            self.mux_overlay_index = self.mux_overlay_index.saturating_sub(1);
+        } else if chord == &KeyChord::single("Enter", Modifiers::NONE) {
+            self.mux_attach_overlay_selection();
+        }
+    }
+
+    /// Activate the highlighted overlay session and re-attach the workspace.
+    fn mux_attach_overlay_selection(&mut self) {
+        let count = self.mux_session_count();
+        if self.mux_overlay_index >= count {
+            self.mux_overlay_index = count.saturating_sub(1);
+        }
+        if self.mux_overlay_index == 0 {
+            // Active session — just re-attach.
+            self.mux_attached = true;
+            let name = self.mux_session.name.clone();
+            self.status = format!("Mux: re-attached to session `{name}`.");
+            return;
+        }
+        let parked_index = self.mux_overlay_index - 1;
+        if parked_index >= self.mux_parked.len() {
+            self.mux_attached = true;
+            return;
+        }
+        // Swap the picked parked session with the active one, then re-attach.
+        let picked = self.mux_parked.remove(parked_index);
+        let previous = std::mem::replace(&mut self.mux_session, picked);
+        self.mux_parked.push(previous);
+        self.mux_overlay_index = 0;
+        self.mux_attached = true;
+        let name = self.mux_session.name.clone();
+        self.status = format!(
+            "Mux: attached to session `{name}`. ({} parked)",
+            self.mux_parked.len()
+        );
+    }
+
     fn mux_new_window(&mut self) {
         let index = self.mux_session.windows.len();
         let id = self.mux_session.new_window(index.to_string());
@@ -1082,6 +1395,173 @@ impl AppModel {
         self.status = format!("Mux: selected {preset:?} layout.");
     }
 
+    /// Run a tool-pane recipe by name (v0.8 M8.2). Floating recipes
+    /// open a centred overlay (single overlay per session, toggled by a
+    /// repeat keybind when `recipe.toggle` is true). Other layouts
+    /// still send the command into the active pane today — side-right
+    /// and bottom slotted spawn behaviour lands in a follow-up. Missing
+    /// binaries surface a friendly toast rather than auto-installing
+    /// (AGENTS §2 hard rule #6).
+    fn run_tool_recipe(&mut self, name: &str) {
+        let Some(recipe) = self.tool_recipes.get(name).cloned() else {
+            self.status = format!("Tool `{name}` not configured.");
+            return;
+        };
+        let binary = recipe.detect_binary().to_string();
+        if !self.tool_binary_available(&binary) {
+            self.status = format!(
+                "Tool `{name}` — `{binary}` not found. Try `mise use {binary}@latest` or install it on PATH.",
+            );
+            return;
+        }
+
+        if recipe.layout == cockpit_config::ToolPaneLayout::Floating {
+            self.open_floating_tool_recipe(name, &recipe);
+            return;
+        }
+
+        self.ensure_terminal();
+        let payload = format!("{}\r", recipe.command);
+        match self.active_terminal_mut() {
+            Some(terminal) => match terminal.send_input(payload.as_bytes()) {
+                Ok(()) => {
+                    self.layout.focus(PaneId::Terminal);
+                    self.status = format!(
+                        "Tool: `{name}` → `{}` ({:?}).",
+                        recipe.command, recipe.layout
+                    );
+                }
+                Err(err) => self.status = format!("Tool `{name}` failed: {err}"),
+            },
+            None => self.status = format!("Tool `{name}` — terminal unavailable."),
+        }
+    }
+
+    /// Open / toggle a floating tool-pane (v0.8 M8.2). Re-running the
+    /// same recipe while it's already floating toggles visibility when
+    /// `recipe.toggle` is set; otherwise it replaces the floating pane
+    /// and respawns the PTY.
+    fn open_floating_tool_recipe(&mut self, name: &str, recipe: &cockpit_config::ToolPaneRecipe) {
+        let already_visible = self
+            .mux_session
+            .floating
+            .as_ref()
+            .is_some_and(|floating| floating.label == name && floating.visible);
+        if already_visible && recipe.toggle {
+            self.mux_session.hide_floating();
+            self.layout.focus(PaneId::Terminal);
+            self.status = format!("Tool: `{name}` hidden.");
+            return;
+        }
+        // Re-show a hidden pane for the same recipe without respawning.
+        let resumed = self
+            .mux_session
+            .floating
+            .as_ref()
+            .is_some_and(|floating| floating.label == name && !floating.visible);
+        if resumed {
+            if let Some(pane) = self.mux_session.show_floating() {
+                self.layout.focus(PaneId::Terminal);
+                self.status = format!("Tool: `{name}` resumed in {pane}.");
+            }
+            return;
+        }
+        // Otherwise: close the previous overlay (if any) and open a fresh one.
+        if let Some(previous) = self.mux_session.close_floating() {
+            self.terminals.remove(&previous);
+        }
+        let pane = self.mux_session.open_floating(name);
+        self.mux_pane_commands.insert(pane, recipe.command.clone());
+        self.ensure_terminal_for_pane(pane);
+        self.layout.focus(PaneId::Terminal);
+        self.status = format!("Tool: `{name}` floating in {pane}.");
+    }
+
+    /// Toggle the active floating pane's visibility (v0.8 M8.2). PTY
+    /// keeps running while hidden.
+    fn mux_toggle_floating(&mut self) {
+        match self.mux_session.toggle_floating() {
+            Some(true) => self.status = "Mux: floating pane shown.".to_string(),
+            Some(false) => self.status = "Mux: floating pane hidden.".to_string(),
+            None => self.status = "Mux: no floating pane.".to_string(),
+        }
+    }
+
+    /// Close + drop the floating pane PTY (v0.8 M8.2).
+    fn mux_close_floating(&mut self) {
+        match self.mux_session.close_floating() {
+            Some(pane) => {
+                self.terminals.remove(&pane);
+                self.mux_pane_commands.remove(&pane);
+                self.status = format!("Mux: floating pane {pane} closed.");
+            }
+            None => self.status = "Mux: no floating pane to close.".to_string(),
+        }
+    }
+
+    /// True when `binary` is reachable via the project's mise tools or
+    /// the host `$PATH` (v0.8 M8.2 detect path). The mise side is a name
+    /// match against `[tools]` — the actual `mise exec --` probe is
+    /// future work once a real user asks for it.
+    fn tool_binary_available(&self, binary: &str) -> bool {
+        if self
+            .detection
+            .mise
+            .tools
+            .iter()
+            .any(|tool| tool.name == binary)
+        {
+            return true;
+        }
+        FormatPathLookup.exists(binary)
+    }
+
+    /// Bind every registered tool-pane recipe's `keybind` to its
+    /// `tool.<name>` command id on the global keymap (v0.8 M8.2).
+    /// `<leader>` is replaced with the configured leader chord so
+    /// `<leader>g` becomes a two-stroke chord like `Space g`.
+    /// Bindings that still fail to parse are skipped with a
+    /// `tracing::debug!` — palette dispatch still works.
+    fn bind_tool_recipe_chords(&mut self) {
+        let leader = self.leader_chord.clone();
+        let bindings: Vec<(String, String)> = self
+            .tool_recipes
+            .iter()
+            .filter_map(|(name, recipe)| {
+                if recipe.keybind.is_empty() {
+                    None
+                } else {
+                    Some((
+                        substitute_leader(&recipe.keybind, leader.as_deref()),
+                        format!("{TOOL_RECIPE_PREFIX}{name}"),
+                    ))
+                }
+            })
+            .collect();
+        for (chord, command) in bindings {
+            if let Err(err) = self.router.bind_extra_chord(&chord, command.clone()) {
+                tracing::debug!(
+                    ?err,
+                    chord = %chord,
+                    command = %command,
+                    "tool recipe keybind not bound (parser/conflict)",
+                );
+            }
+        }
+    }
+
+    /// Palette entries derived from the registered tool-pane recipes.
+    fn tool_recipe_palette_entries(&self) -> Vec<PaletteEntry> {
+        self.tool_recipes
+            .keys()
+            .map(|name| {
+                let id = format!("{TOOL_RECIPE_PREFIX}{name}");
+                let title = format!("Tool: {name}");
+                PaletteEntry::new(id, title)
+            })
+            .collect()
+    }
+
     /// Send `mise run <task>` to the terminal session, starting it if needed.
     fn run_mise_task(&mut self, task: &str) {
         self.ensure_terminal();
@@ -1090,6 +1570,7 @@ impl AppModel {
             Some(terminal) => match terminal.send_input(command.as_bytes()) {
                 Ok(()) => {
                     self.layout.focus(PaneId::Terminal);
+                    self.last_mise_task = Some(task.to_string());
                     self.status = format!("Running mise task `{task}`.");
                 }
                 Err(err) => self.status = format!("Could not run `{task}`: {err}"),
@@ -1261,6 +1742,55 @@ impl AppModel {
         let snapshot = crate::startup::snapshot();
         let text = crate::startup::format_snapshot(&snapshot);
         tracing::info!(startup = %text, "debug: show startup trace");
+        self.status = text;
+    }
+
+    /// Hot-swap the active theme (v0.8 M8.1). Unknown names are a
+    /// programmer error here — every wired palette entry passes a name
+    /// `Theme::from_name` recognises — but we still degrade to a status
+    /// message rather than panicking. Also persists the choice to the
+    /// user config via `cockpit_config::write_ui_theme` so it survives
+    /// a restart.
+    fn switch_theme(&mut self, name: &str) {
+        match Theme::from_name(name) {
+            Some(theme) => {
+                self.theme = theme;
+                self.persist_theme_choice(name);
+            }
+            None => {
+                self.status = format!("Theme: unknown `{name}`.");
+            }
+        }
+    }
+
+    /// Write the active theme name back to the user config. Failures
+    /// degrade to a status warning — the in-memory swap stays
+    /// authoritative for the current session.
+    fn persist_theme_choice(&mut self, name: &str) {
+        let Some(path) = self
+            .user_config_path
+            .clone()
+            .or_else(cockpit_config::user_config_path)
+        else {
+            self.status =
+                format!("Theme: switched to `{name}` (no user config path; not persisted).",);
+            return;
+        };
+        match cockpit_config::write_ui_theme(&path, name) {
+            Ok(_) => self.status = format!("Theme: switched to `{name}` (persisted)."),
+            Err(err) => {
+                tracing::warn!(?err, theme = name, "theme persist failed");
+                self.status = format!("Theme: switched to `{name}` ({err}).");
+            }
+        }
+    }
+
+    /// Surface the native mux mode-line (v0.7 M7.7). Time and mise task
+    /// extras come from the optional task surface when one is known.
+    fn debug_show_mux_status(&mut self) {
+        let summary = self.mux_session.status_summary();
+        let text = summary.render(&[]);
+        tracing::info!(mux_status = %text, "debug: show mux status");
         self.status = text;
     }
 
@@ -1567,30 +2097,17 @@ impl AppModel {
         }
     }
 
-    /// Resolve the optional per-project Zellij layout file (spec §9 / §10 v0.3).
-    /// Returns the absolute path on a successful KDL parse; surfaces a status
-    /// warning and falls back to no-layout on read/parse errors so a broken
-    /// layout never blocks the terminal from launching.
-    fn resolve_zellij_layout(&mut self) -> Option<PathBuf> {
-        let configured = self
-            .detection
-            .mise
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.zellij_layout.as_deref())?;
-        let absolute = self.detection.root_path.join(configured);
-        match ZellijLayout::load(&absolute) {
-            Ok(layout) => Some(layout.path),
-            Err(err) => {
-                self.status = format!("Zellij layout {} ignored: {err}", configured.display(),);
-                None
-            }
-        }
-    }
-
     /// Spawn the active mux pane's terminal session on first use.
     fn ensure_terminal(&mut self) {
         let pane = self.mux_session.active_window().active;
+        self.ensure_terminal_for_pane(pane);
+    }
+
+    /// Spawn a PTY for `pane` if one isn't already live (v0.8 M8.2).
+    /// Generalises the v0.7 `ensure_terminal` so floating tool-panes
+    /// can spawn against their own pane id without affecting the
+    /// regular split tree's active pane.
+    fn ensure_terminal_for_pane(&mut self, pane: cockpit_mux::PaneId) {
         if self.terminals.contains_key(&pane) {
             return;
         }
@@ -1598,22 +2115,15 @@ impl AppModel {
             self.status = "Terminal unavailable — no redraw handle.".to_string();
             return;
         };
-        let layout = self.resolve_zellij_layout();
-        let plan = plan_launch(
-            &self.detection.display_name,
-            layout.as_deref(),
-            &PathBinaryLookup,
-            ShellProfile::host_default(),
-        );
-        let (command, label) = match plan {
-            LaunchPlan::Zellij(command) => {
-                let label = match layout.as_deref() {
-                    Some(path) => format!("zellij ({})", path.display()),
-                    None => "zellij".to_string(),
-                };
-                (command, label)
-            }
-            LaunchPlan::Fallback { command, reason } => (command, format!("shell — {reason:?}")),
+        let (command, label) = if let Some(layout_command) = self.mux_pane_commands.remove(&pane) {
+            let spec = shell_command_spec(&layout_command);
+            let label = format!("layout `{layout_command}`");
+            (spec, label)
+        } else {
+            // v0.7 M7.9: native multiplexer replaces Zellij. Default panes
+            // spawn the host shell directly — splits and windows are owned
+            // by `cockpit-mux`, not by an external workspace tool.
+            (host_shell_spec(), "shell".to_string())
         };
         let wake: WakeFn = Box::new(move || redraw.request());
         match LiveTerminal::spawn(&command, PtyDimensions::new(24, 80), wake) {
@@ -1637,6 +2147,16 @@ impl AppModel {
 
     /// Forward a chord to the PTY when the terminal pane is focused.
     fn handle_terminal_key(&mut self, chord: &KeyChord) {
+        // When detached, the prefix path still works (so `Ctrl+b d` toggles
+        // back); arrows navigate the overlay session list and Enter
+        // attaches to the highlighted entry.
+        if !self.mux_attached {
+            if self.handle_mux_prefix(chord) {
+                return;
+            }
+            self.handle_mux_overlay_key(chord);
+            return;
+        }
         if self.handle_mux_prefix(chord) {
             return;
         }
@@ -1670,7 +2190,16 @@ impl AppModel {
         if self.mux_session.active_pane().mode != PaneMode::Copy {
             return false;
         }
+
+        // Search-input substate captures every printable key for the query.
+        if self.mux_session.copy_search_query().is_some() {
+            self.handle_mux_copy_mode_search_input(chord);
+            return true;
+        }
+
         let (max_row, max_col) = self.copy_mode_grid_bounds();
+        let row_text = self.copy_mode_row_text(self.mux_session.active_pane().copy_cursor.row);
+        let pending_g = std::mem::take(&mut self.mux_copy_pending_g);
 
         if chord == &KeyChord::single("Escape", Modifiers::NONE) {
             let pane = self.mux_session.exit_copy_mode();
@@ -1709,8 +2238,120 @@ impl AppModel {
                 ),
                 None => "Mux: copy selection cleared.".to_string(),
             };
+        } else if chord == &KeyChord::single("w", Modifiers::NONE) {
+            if let Some(cursor) = self.mux_session.copy_word_forward(&row_text, max_col) {
+                self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+            }
+        } else if chord == &KeyChord::single("b", Modifiers::NONE) {
+            if let Some(cursor) = self.mux_session.copy_word_backward(&row_text) {
+                self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+            }
+        } else if chord == &KeyChord::single("g", Modifiers::NONE) {
+            if pending_g {
+                if let Some(offset) = self.mux_session.copy_top_of_scrollback(usize::MAX) {
+                    self.status = format!("Mux: copy mode offset {offset}.");
+                }
+            } else {
+                self.mux_copy_pending_g = true;
+            }
+        } else if is_shift_letter_chord(chord, 'g') {
+            if let Some(offset) = self.mux_session.copy_bottom_of_scrollback() {
+                self.status = format!("Mux: copy mode offset {offset}.");
+            }
+        } else if chord == &KeyChord::single("y", Modifiers::NONE) {
+            self.mux_copy_yank_selection();
+        } else if chord == &KeyChord::single("/", Modifiers::NONE) {
+            self.mux_session.begin_copy_search();
+            self.status = "Mux: copy search /".to_string();
+        } else if chord == &KeyChord::single("n", Modifiers::NONE) {
+            let rows = self.copy_mode_visible_rows();
+            let row_refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            if let Some(cursor) = self.mux_session.repeat_copy_search_forward(&row_refs) {
+                self.status = format!("Mux: copy cursor {}:{}.", cursor.row, cursor.col);
+            } else {
+                self.status = "Mux: copy search — no more matches.".to_string();
+            }
         }
         true
+    }
+
+    /// Drive the active pane's pending search input from a single chord.
+    fn handle_mux_copy_mode_search_input(&mut self, chord: &KeyChord) {
+        self.mux_copy_pending_g = false;
+        if chord == &KeyChord::single("Escape", Modifiers::NONE) {
+            self.mux_session.cancel_copy_search();
+            self.status = "Mux: copy search cancelled.".to_string();
+            return;
+        }
+        if chord == &KeyChord::single("Enter", Modifiers::NONE) {
+            let rows = self.copy_mode_visible_rows();
+            let row_refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            match self.mux_session.finish_copy_search(&row_refs) {
+                Some(cursor) => {
+                    self.status = format!("Mux: copy search → {}:{}.", cursor.row, cursor.col);
+                }
+                None => {
+                    self.status = "Mux: copy search — no match.".to_string();
+                }
+            }
+            return;
+        }
+        if chord == &KeyChord::single("Backspace", Modifiers::NONE) {
+            self.mux_session.pop_copy_search_char();
+            self.status = format!(
+                "Mux: copy search /{}",
+                self.mux_session.copy_search_query().unwrap_or("")
+            );
+            return;
+        }
+        if let Some(ch) = chord_to_char(chord) {
+            self.mux_session.push_copy_search_char(ch);
+            self.status = format!(
+                "Mux: copy search /{}",
+                self.mux_session.copy_search_query().unwrap_or("")
+            );
+        }
+    }
+
+    /// Capture the active pane's selection into the yank buffer (M7.6 `y`).
+    fn mux_copy_yank_selection(&mut self) {
+        let rows = self.copy_mode_visible_rows();
+        let row_refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let Some(text) = self.mux_session.copy_selection_text(&row_refs) else {
+            self.status = "Mux: copy mode — no selection to yank.".to_string();
+            return;
+        };
+        let chars = text.chars().count();
+        let clipboard_status = match copy_to_os_clipboard(&text) {
+            Ok(()) => "clipboard".to_string(),
+            Err(err) => {
+                tracing::warn!(?err, "mux copy yank: clipboard write failed");
+                "(clipboard unavailable)".to_string()
+            }
+        };
+        self.mux_copy_yank = Some(text);
+        let pane = self.mux_session.exit_copy_mode();
+        self.status = format!("Mux: yanked {chars} characters from {pane} → {clipboard_status}.");
+    }
+
+    /// Snapshot of the visible terminal grid rows for the active pane. Used
+    /// as the text content for copy-mode motions, selection, and search.
+    fn copy_mode_visible_rows(&self) -> Vec<String> {
+        let Some(terminal) = self.active_terminal() else {
+            return Vec::new();
+        };
+        let grid = terminal.snapshot().grid;
+        (0..grid.height())
+            .map(|row| grid.row_text(row).unwrap_or_default())
+            .collect()
+    }
+
+    /// Fetch the row text at `row` from the active pane's terminal grid.
+    fn copy_mode_row_text(&self, row: usize) -> String {
+        let Some(terminal) = self.active_terminal() else {
+            return String::new();
+        };
+        terminal.snapshot().grid.row_text(row).unwrap_or_default()
     }
 
     fn copy_mode_grid_bounds(&self) -> (usize, usize) {
@@ -3571,31 +4212,157 @@ impl AppModel {
 
     fn paint_terminal(&self, canvas: &mut Canvas<'_>, rect: UiRect, focused: bool) {
         let content = self.paint_pane(canvas, rect, "TERMINAL", focused);
+        let status_h = STATUS_LINE_H.min(content.h);
+        let pane_area_h = (content.h - status_h).max(0.0);
+        if !self.mux_attached {
+            self.paint_mux_detached_overlay(canvas, &content, pane_area_h);
+            let status_y = content.y + content.h - status_h;
+            self.paint_mux_status_line(canvas, content.x, status_y, content.w, status_h);
+            return;
+        }
         let pane_rects = self.mux_session.active_window().pane_rects(
             MuxRect::new(
                 content.x.max(0.0) as u32,
                 content.y.max(0.0) as u32,
                 content.w.max(0.0) as u32,
-                content.h.max(0.0) as u32,
+                pane_area_h.max(0.0) as u32,
             ),
             1,
         );
         if pane_rects.len() == 1 && !self.terminals.contains_key(&pane_rects[0].pane) {
             self.paint_terminal_placeholder(canvas, &content);
-            return;
+        } else {
+            for pane in pane_rects {
+                if self.mux_session.active_window().layout.leaves().len() > 1 {
+                    self.paint_mux_pane_frame(canvas, pane, focused);
+                }
+                match self.terminals.get(&pane.pane) {
+                    Some(terminal) => {
+                        self.paint_terminal_grid(canvas, pane, terminal, focused && pane.active)
+                    }
+                    None => self.paint_mux_placeholder(canvas, pane, "pending PTY"),
+                }
+            }
         }
 
-        for pane in pane_rects {
-            if self.mux_session.active_window().layout.leaves().len() > 1 {
-                self.paint_mux_pane_frame(canvas, pane, focused);
-            }
-            match self.terminals.get(&pane.pane) {
-                Some(terminal) => {
-                    self.paint_terminal_grid(canvas, pane, terminal, focused && pane.active)
-                }
+        // v0.8 M8.2 floating overlay: a single centred rectangle drawn
+        // above the regular split tree. PTYs for floating panes live in
+        // the same `terminals` map keyed by their pane id (the stride
+        // allocator keeps the ids distinct from regular leaves).
+        let mux_pane_bounds = MuxRect::new(
+            content.x.max(0.0) as u32,
+            content.y.max(0.0) as u32,
+            content.w.max(0.0) as u32,
+            pane_area_h.max(0.0) as u32,
+        );
+        if let Some((pane_id, rect)) = self.mux_session.floating_rect(mux_pane_bounds) {
+            let pane = cockpit_mux::PaneRect {
+                pane: pane_id,
+                rect,
+                active: true,
+            };
+            self.paint_mux_pane_frame(canvas, pane, true);
+            match self.terminals.get(&pane_id) {
+                Some(terminal) => self.paint_terminal_grid(canvas, pane, terminal, focused),
                 None => self.paint_mux_placeholder(canvas, pane, "pending PTY"),
             }
         }
+
+        // M7.7 mode-line: bottom strip across the full pane width.
+        let status_y = content.y + content.h - status_h;
+        self.paint_mux_status_line(canvas, content.x, status_y, content.w, status_h);
+    }
+
+    /// Paint the "detached — pick a session" overlay (v0.7 M7.5) inside
+    /// the terminal pane area, leaving the mode-line strip untouched.
+    fn paint_mux_detached_overlay(
+        &self,
+        canvas: &mut Canvas<'_>,
+        content: &ContentRect,
+        pane_area_h: f32,
+    ) {
+        let mut lines: Vec<(String, Color)> = vec![
+            ("Detached".to_string(), self.theme.text),
+            (String::new(), self.theme.text),
+            ("Sessions:".to_string(), self.theme.text),
+        ];
+        for (i, name) in self.mux_overlay_session_names().iter().enumerate() {
+            let marker = if i == self.mux_overlay_index {
+                '▸'
+            } else {
+                ' '
+            };
+            lines.push((format!("  {marker} {i}: {name}"), self.theme.text));
+        }
+        lines.push((String::new(), self.theme.text));
+        lines.push((
+            "↑/↓ to choose, Enter to attach, Ctrl+b d to toggle.".to_string(),
+            self.theme.text,
+        ));
+
+        let total_h = lines.len() as f32 * ROW_H;
+        let start_y = content.y + (pane_area_h - total_h).max(0.0) * 0.5 + FONT;
+        for (i, (line, color)) in lines.iter().enumerate() {
+            canvas.text(
+                content.x + PAD,
+                start_y + i as f32 * ROW_H,
+                line.clone(),
+                *color,
+                FONT,
+            );
+        }
+    }
+
+    /// All registered session names in overlay order: active first, then
+    /// parked sessions in stack order.
+    fn mux_overlay_session_names(&self) -> Vec<String> {
+        let mut names = vec![self.mux_session.name.clone()];
+        names.extend(self.mux_parked.iter().map(|session| session.name.clone()));
+        names
+    }
+
+    /// Paint the native mux mode-line at the bottom of the terminal area
+    /// (v0.7 M7.7). Renders the configured `terminal.status.format`
+    /// against the live mux state on a theme-accented background.
+    fn paint_mux_status_line(&self, canvas: &mut Canvas<'_>, x: f32, y: f32, w: f32, h: f32) {
+        if h <= 0.0 || w <= 0.0 {
+            return;
+        }
+        canvas.rect(x, y, w, h, self.theme.accent);
+        let text = self.render_mux_status_line();
+        let baseline = y + (h - FONT).max(0.0) * 0.5 + FONT * 0.85;
+        canvas.text(x + PAD, baseline, text, self.theme.background, FONT);
+    }
+
+    /// Build the mode-line text by substituting `{session}` / `{windows}` /
+    /// `{task}` / `{pane}` into `self.status_format`. Unknown `{token}`s
+    /// are preserved verbatim so the user spots typos.
+    fn render_mux_status_line(&self) -> String {
+        let summary = self.mux_session.status_summary();
+        // Render the window list with the active marker, matching the
+        // default `StatusSummary::render` formatter so the `{windows}`
+        // token is always recognisable.
+        let mut windows = String::new();
+        for (i, window) in summary.windows.iter().enumerate() {
+            if i > 0 {
+                windows.push(' ');
+            }
+            windows.push_str(&window.index.to_string());
+            windows.push(':');
+            windows.push_str(&window.name);
+            if window.active {
+                windows.push('*');
+            }
+        }
+        let task = self.last_mise_task.clone().unwrap_or_default();
+        let pane = self.mux_session.active_pane().id.to_string();
+        substitute_status_tokens(&self.status_format, |token| match token {
+            "session" => Some(summary.session_name.clone()),
+            "windows" => Some(windows.clone()),
+            "task" => Some(task.clone()),
+            "pane" => Some(pane.clone()),
+            _ => None,
+        })
     }
 
     fn paint_terminal_placeholder(&self, canvas: &mut Canvas<'_>, content: &ContentRect) {
@@ -3603,8 +4370,8 @@ impl AppModel {
             "Integrated terminal",
             "",
             "Focus this pane (Ctrl+L) to start a session.",
-            "Runs the project's Zellij workspace when mise and",
-            "zellij are on PATH; otherwise a plain shell.",
+            "Spawns the host shell in the embedded multiplexer;",
+            "splits via Ctrl+b % / \", windows via Ctrl+b c.",
         ];
         let top = content.y + PAD;
         for (index, line) in lines.iter().enumerate() {
@@ -3828,6 +4595,162 @@ fn mux_rect_contains(rect: MuxRect, position: PointerPosition) -> bool {
 /// True when `chord` is a single unmodified press of `key`.
 fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
+}
+
+/// Replace `<leader>` in `keybind` with the configured leader chord plus a
+/// space, so `<leader>g` becomes `Space g` when the leader is `Space`. Acts
+/// as a no-op when no leader is configured.
+fn substitute_leader(keybind: &str, leader: Option<&str>) -> String {
+    let Some(leader) = leader else {
+        return keybind.to_string();
+    };
+    if leader.is_empty() {
+        return keybind.to_string();
+    }
+    keybind.replace("<leader>", &format!("{leader} "))
+}
+
+/// Match a single-stroke `chord` against the configured leader chord string.
+/// Returns the matched stroke when the chord exactly equals the leader so
+/// the dispatcher can buffer it for a multi-stroke combo.
+fn leader_stroke_match(
+    chord: &cockpit_commands::KeyChord,
+    leader: Option<&str>,
+) -> Option<cockpit_commands::KeyStroke> {
+    let leader = leader?;
+    if leader.is_empty() {
+        return None;
+    }
+    let Ok(leader_chord) = leader.parse::<cockpit_commands::KeyChord>() else {
+        return None;
+    };
+    let [leader_stroke] = leader_chord.strokes() else {
+        return None;
+    };
+    let [chord_stroke] = chord.strokes() else {
+        return None;
+    };
+    if leader_stroke == chord_stroke {
+        Some(chord_stroke.clone())
+    } else {
+        None
+    }
+}
+
+/// Substitute `{token}` references in `template` using `lookup`. Tokens that
+/// `lookup` doesn't recognise are left verbatim (`{unknown}` stays as
+/// `{unknown}`) so users can spot typos. Escapes: a literal `{` is written
+/// as `{{` and `}` as `}}`.
+fn substitute_status_tokens<F>(template: &str, lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                out.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                out.push('}');
+            }
+            '{' => {
+                let mut name = String::new();
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(ch);
+                }
+                if !closed {
+                    out.push('{');
+                    out.push_str(&name);
+                    continue;
+                }
+                match lookup(&name) {
+                    Some(value) => out.push_str(&value),
+                    None => {
+                        out.push('{');
+                        out.push_str(&name);
+                        out.push('}');
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Push `text` to the OS clipboard (v0.7 M7.6 yank wiring). Returns an error
+/// when no clipboard service is reachable — headless test environments and
+/// some CI runners — so the caller can degrade gracefully.
+fn copy_to_os_clipboard(text: &str) -> Result<(), arboard::Error> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text.to_string())
+}
+
+/// Default interactive shell command for a fresh mux pane (v0.7 M7.9).
+fn host_shell_spec() -> cockpit_terminal::CommandSpec {
+    if cfg!(windows) {
+        cockpit_terminal::CommandSpec::new("powershell.exe", Vec::<String>::new())
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        cockpit_terminal::CommandSpec::new(shell, Vec::<String>::new())
+    }
+}
+
+/// Wrap a `cockpit_layout` pane command in the host shell so the user's
+/// command string supports the usual quoting / pipes / globs (M7.8). On
+/// Windows we run through `cmd.exe /C`; everywhere else `sh -c`.
+fn shell_command_spec(command: &str) -> cockpit_terminal::CommandSpec {
+    if cfg!(windows) {
+        cockpit_terminal::CommandSpec::new(
+            "cmd.exe".to_string(),
+            vec!["/C".to_string(), command.to_string()],
+        )
+    } else {
+        cockpit_terminal::CommandSpec::new(
+            "sh".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )
+    }
+}
+
+/// True when `chord` is `Shift+<letter>`. winit emits the lower-case key plus
+/// the shift modifier (see `cockpit_render::key_event`), but parsed text
+/// chords (`"G"`) come through as the upper-case key with no modifier.
+fn is_shift_letter_chord(chord: &KeyChord, lower: char) -> bool {
+    let Some(stroke) = chord.strokes().first() else {
+        return false;
+    };
+    if chord.strokes().len() != 1 {
+        return false;
+    }
+    let modifiers = stroke.modifiers();
+    if modifiers.ctrl || modifiers.alt || modifiers.meta {
+        return false;
+    }
+    let key = stroke.key();
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    if first == lower.to_ascii_uppercase() && !modifiers.shift {
+        return true;
+    }
+    if first == lower && modifiers.shift {
+        return true;
+    }
+    false
 }
 
 /// Translate a single-stroke key chord into a Vim state-machine key.
@@ -4265,6 +5188,15 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(mux_command_ids::SWAP_PANE_NEXT, "Mux: Swap Pane Next"),
         PaletteEntry::new(mux_command_ids::ZOOM_PANE, "Mux: Zoom Pane"),
         PaletteEntry::new(mux_command_ids::COPY_MODE, "Mux: Enter Copy Mode"),
+        PaletteEntry::new(
+            mux_command_ids::FLOATING_TOGGLE,
+            "Mux: Toggle Floating Pane",
+        ),
+        PaletteEntry::new(mux_command_ids::FLOATING_CLOSE, "Mux: Close Floating Pane"),
+        PaletteEntry::new(mux_command_ids::DETACH, "Mux: Detach / Re-attach"),
+        PaletteEntry::new(mux_command_ids::NEW_SESSION, "Mux: New Session"),
+        PaletteEntry::new(mux_command_ids::NEXT_SESSION, "Mux: Next Session"),
+        PaletteEntry::new(mux_command_ids::PREVIOUS_SESSION, "Mux: Previous Session"),
         PaletteEntry::new(mux_command_ids::FOCUS_UP, "Mux: Focus Up"),
         PaletteEntry::new(mux_command_ids::FOCUS_DOWN, "Mux: Focus Down"),
         PaletteEntry::new(mux_command_ids::FOCUS_LEFT, "Mux: Focus Left"),
@@ -4294,12 +5226,18 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(MODELS_BUILD_ALL, "Models: Build All"),
         PaletteEntry::new(MODELS_SHOW_DAG, "Models: Show DAG"),
         PaletteEntry::new(QUARTO_RENDER, "Quarto: Render"),
+        PaletteEntry::new(THEME_SWITCH_DARK, "Theme: Switch Dark"),
+        PaletteEntry::new(THEME_SWITCH_LATTE, "Theme: Switch Latte"),
+        PaletteEntry::new(THEME_SWITCH_FRAPPE, "Theme: Switch Frappé"),
+        PaletteEntry::new(THEME_SWITCH_MACCHIATO, "Theme: Switch Macchiato"),
+        PaletteEntry::new(THEME_SWITCH_MOCHA, "Theme: Switch Mocha"),
         PaletteEntry::new(DEBUG_SHOW_KEY_EVENTS, "Debug: Show Key Events"),
         PaletteEntry::new(DEBUG_SHOW_COMMAND_LOG, "Debug: Show Command Log"),
         PaletteEntry::new(DEBUG_SHOW_PANE_TREE, "Debug: Show Pane Tree"),
         PaletteEntry::new(DEBUG_SHOW_PROJECT_STATE, "Debug: Show Project State"),
         PaletteEntry::new(DEBUG_RELOAD_CONFIG, "Debug: Reload Config"),
         PaletteEntry::new(DEBUG_SHOW_STARTUP_TRACE, "Debug: Show Startup Trace"),
+        PaletteEntry::new(DEBUG_SHOW_MUX_STATUS, "Debug: Show Mux Status"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -5015,6 +5953,513 @@ mod tests {
     }
 
     #[test]
+    fn cockpit_layout_metadata_replaces_default_session_and_records_commands() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = dir.path().join("layout.kdl");
+        fs::write(
+            &layout,
+            r#"
+layout {
+    split direction="horizontal" ratio=0.6 {
+        pane command="editor-here"
+        pane command="lazygit"
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("mise.toml"),
+            r#"
+[tools]
+rust = "1.95.0"
+
+[metadata.cockpit]
+name = "Layout Project"
+cockpit_layout = "layout.kdl"
+"#,
+        )
+        .unwrap();
+
+        let detection = detect_project(dir.path()).expect("detect tempdir project");
+        let tree = FileTree::load(dir.path()).expect("load tempdir tree");
+        let model = AppModel::new(detection, tree).expect("build model");
+
+        assert_eq!(model.mux_session.active_window().panes.len(), 2);
+        let commands: Vec<&str> = model
+            .mux_pane_commands
+            .values()
+            .map(String::as_str)
+            .collect();
+        assert!(commands.contains(&"editor-here"), "commands: {commands:?}");
+        assert!(commands.contains(&"lazygit"), "commands: {commands:?}");
+        assert!(
+            model.status.contains("Mux layout loaded"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn cockpit_layout_missing_file_surfaces_status_and_keeps_default_session() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("mise.toml"),
+            r#"
+[metadata.cockpit]
+cockpit_layout = "missing.kdl"
+"#,
+        )
+        .unwrap();
+
+        let detection = detect_project(dir.path()).expect("detect tempdir project");
+        let tree = FileTree::load(dir.path()).expect("load tempdir tree");
+        let model = AppModel::new(detection, tree).expect("build model");
+
+        assert_eq!(model.mux_session.active_window().panes.len(), 1);
+        assert!(model.mux_pane_commands.is_empty());
+        assert!(
+            model.status.contains("cockpit_layout ignored"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn apply_user_config_registers_tool_pane_recipes() {
+        let mut model = model();
+
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.insert(
+            "lazygit".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "lazygit".to_string(),
+                layout: cockpit_config::ToolPaneLayout::Floating,
+                toggle: true,
+                keybind: "<leader>g".to_string(),
+                detect: String::new(),
+            },
+        );
+        config.panes.tools.insert(
+            "claude-code".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "claude --resume".to_string(),
+                layout: cockpit_config::ToolPaneLayout::SideRight,
+                toggle: false,
+                keybind: "<leader>aa".to_string(),
+                detect: "claude".to_string(),
+            },
+        );
+        model.apply_user_config(&config);
+
+        let entries = model.tool_recipe_palette_entries();
+        let ids: Vec<String> = entries.iter().map(|e| e.id.to_string()).collect();
+        assert!(ids.iter().any(|id| id == "tool.lazygit"), "ids: {ids:?}");
+        assert!(
+            ids.iter().any(|id| id == "tool.claude-code"),
+            "ids: {ids:?}",
+        );
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(titles.contains(&"Tool: lazygit"));
+    }
+
+    #[test]
+    fn leader_chord_substitution_lets_default_lazygit_keybind_fire() {
+        let mut model = model();
+        // The default config ships lazygit on `<leader>g` with `leader =
+        // "Space"`, so a focused-non-terminal `Space g` keystream should
+        // dispatch the `tool.lazygit` command.
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        // Space alone buffers as a pending leader.
+        model.dispatch(chord("Space"));
+        assert!(model.pending_leader.is_some(), "expected leader buffered");
+
+        // The leader still wasn't routed to any local handler.
+        model.dispatch(chord("g"));
+        assert!(model.pending_leader.is_none(), "leader should be consumed");
+        assert!(
+            model.command_log.iter().any(|cmd| cmd == "tool.lazygit"),
+            "log: {:?}",
+            model.command_log,
+        );
+    }
+
+    #[test]
+    fn tool_recipe_with_parseable_chord_binds_into_the_global_keymap() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.clear();
+        config.panes.tools.insert(
+            "lazygit".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "lazygit".to_string(),
+                detect: "lazygit".to_string(),
+                keybind: "Ctrl+Shift+g".to_string(),
+                ..Default::default()
+            },
+        );
+        // Placeholder `<leader>…` notation has no chord parser today and
+        // should be silently skipped without bringing the whole apply
+        // path down.
+        config.panes.tools.insert(
+            "claude-code".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "claude".to_string(),
+                detect: "claude".to_string(),
+                keybind: "<leader>aa".to_string(),
+                ..Default::default()
+            },
+        );
+        model.apply_user_config(&config);
+
+        let chord = "Ctrl+Shift+g".parse().unwrap();
+        match model.router.route(PaneId::Editor, chord) {
+            RoutedInput::Command(id) => assert_eq!(id.as_str(), "tool.lazygit"),
+            other => panic!("expected tool.lazygit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_palette_includes_registered_tool_recipes() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.insert(
+            "lazygit".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "lazygit".to_string(),
+                ..Default::default()
+            },
+        );
+        model.apply_user_config(&config);
+        model.run_command(command_ids::COMMAND_PALETTE);
+
+        let palette = model.palette.as_ref().expect("palette open");
+        let ids: Vec<String> = palette
+            .entries()
+            .iter()
+            .map(|entry| entry.id.to_string())
+            .collect();
+        assert!(ids.iter().any(|id| id == "tool.lazygit"), "ids: {ids:?}");
+    }
+
+    #[test]
+    fn unknown_tool_recipe_command_surfaces_a_status_message() {
+        let mut model = model();
+        model.run_command("tool.does-not-exist");
+        assert!(
+            model.status.contains("not configured"),
+            "status: {}",
+            model.status,
+        );
+    }
+
+    #[test]
+    fn tool_recipe_floating_opens_overlay_and_toggle_hides_it() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.clear();
+        config.panes.tools.insert(
+            "made-up".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "echo".to_string(),
+                detect: "echo".to_string(),
+                layout: cockpit_config::ToolPaneLayout::Floating,
+                toggle: true,
+                keybind: String::new(),
+            },
+        );
+        model.apply_user_config(&config);
+
+        // First dispatch opens a floating pane.
+        model.run_command("tool.made-up");
+        let floating = model
+            .mux_session
+            .floating
+            .as_ref()
+            .expect("floating opened");
+        assert_eq!(floating.label, "made-up");
+        assert!(floating.visible);
+
+        // Second dispatch hides it (toggle).
+        model.run_command("tool.made-up");
+        assert!(!model.mux_session.floating_visible());
+        assert!(
+            model.mux_session.floating.is_some(),
+            "PTY stays alive when hidden",
+        );
+
+        // Third dispatch re-shows the same overlay without respawning.
+        model.run_command("tool.made-up");
+        assert!(model.mux_session.floating_visible());
+    }
+
+    #[test]
+    fn mux_floating_close_drops_the_overlay() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.clear();
+        config.panes.tools.insert(
+            "made-up".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "echo".to_string(),
+                detect: "echo".to_string(),
+                layout: cockpit_config::ToolPaneLayout::Floating,
+                ..Default::default()
+            },
+        );
+        model.apply_user_config(&config);
+        model.run_command("tool.made-up");
+        assert!(model.mux_session.floating.is_some());
+
+        model.run_command(mux_command_ids::FLOATING_CLOSE);
+        assert!(model.mux_session.floating.is_none());
+    }
+
+    #[test]
+    fn tool_recipe_with_missing_binary_surfaces_install_hint() {
+        let mut model = model();
+        let mut config = cockpit_config::Config::default();
+        config.panes.tools.clear();
+        config.panes.tools.insert(
+            "made-up-tool".to_string(),
+            cockpit_config::ToolPaneRecipe {
+                command: "made-up-tool".to_string(),
+                detect: "made-up-tool-binary-that-does-not-exist".to_string(),
+                ..Default::default()
+            },
+        );
+        model.apply_user_config(&config);
+
+        model.run_command("tool.made-up-tool");
+        assert!(
+            model.status.contains("not found"),
+            "status: {}",
+            model.status
+        );
+        assert!(
+            model.status.contains("mise use"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn apply_user_config_resolves_catppuccin_theme_names() {
+        let mut model = model();
+        let original = model.theme.clone();
+
+        let mut config = cockpit_config::Config::default();
+        config.ui.theme = "mocha".to_string();
+        model.apply_user_config(&config);
+        assert_eq!(model.theme, cockpit_render::Theme::catppuccin_mocha());
+
+        // Unknown names log a warning and keep the current theme.
+        config.ui.theme = "solarized".to_string();
+        model.apply_user_config(&config);
+        assert_eq!(model.theme, cockpit_render::Theme::catppuccin_mocha());
+
+        config.ui.theme = "dark".to_string();
+        model.apply_user_config(&config);
+        assert_eq!(model.theme, original);
+    }
+
+    #[test]
+    fn theme_switch_palette_commands_hot_swap_without_restart() {
+        let mut model = model();
+        model.run_command(THEME_SWITCH_LATTE);
+        assert_eq!(model.theme, cockpit_render::Theme::catppuccin_latte());
+        assert!(model.status.contains("latte"), "status: {}", model.status);
+
+        model.run_command(THEME_SWITCH_MOCHA);
+        assert_eq!(model.theme, cockpit_render::Theme::catppuccin_mocha());
+    }
+
+    #[test]
+    fn theme_switch_persists_to_user_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# user prefs
+[ui]
+theme = "dark"
+font  = "JetBrains Mono"
+"#,
+        )
+        .unwrap();
+
+        let mut model = model();
+        model.set_user_config_path(path.clone());
+        model.run_command(THEME_SWITCH_MOCHA);
+
+        let rendered = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            rendered.contains(r#"theme = "mocha""#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("# user prefs"),
+            "comment preserved: {rendered}"
+        );
+        assert!(rendered.contains(r#"font  = "JetBrains Mono""#));
+        assert!(
+            model.status.contains("persisted"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn palette_lists_every_theme_switch_command() {
+        let ids: Vec<String> = palette_entries()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect();
+        for id in [
+            THEME_SWITCH_DARK,
+            THEME_SWITCH_LATTE,
+            THEME_SWITCH_FRAPPE,
+            THEME_SWITCH_MACCHIATO,
+            THEME_SWITCH_MOCHA,
+        ] {
+            assert!(ids.iter().any(|c| c == id), "missing {id} in {ids:?}");
+        }
+    }
+
+    #[test]
+    fn mux_detach_command_flips_attached_and_enter_reattaches() {
+        let mut model = model();
+        assert!(model.mux_attached);
+
+        model.run_command(mux_command_ids::DETACH);
+        assert!(!model.mux_attached);
+        assert!(
+            model.status.contains("detached"),
+            "status: {}",
+            model.status
+        );
+
+        // While detached, terminal-focused Enter reattaches.
+        model.layout.focus(PaneId::Terminal);
+        model.dispatch(chord("Enter"));
+        assert!(model.mux_attached);
+        assert!(
+            model.status.contains("re-attached"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn mux_detached_paint_shows_overlay_instead_of_terminal_grid() {
+        let mut model = model();
+        model.run_command(mux_command_ids::DETACH);
+
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+        let texts: Vec<String> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "Detached"),
+            "expected detached overlay, got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn mux_new_session_parks_the_previous_session_and_activates_a_fresh_one() {
+        let mut model = model();
+        let original_name = model.mux_session.name.clone();
+
+        model.run_command(mux_command_ids::NEW_SESSION);
+        assert_eq!(model.mux_session_count(), 2);
+        assert_ne!(model.mux_session.name, original_name);
+        assert_eq!(model.mux_parked.len(), 1);
+        assert_eq!(model.mux_parked[0].name, original_name);
+
+        // Pane ids of the new session are disjoint from the parked one.
+        let active_pane = model.mux_session.active_pane().id.get();
+        assert!(active_pane >= MUX_SESSION_STRIDE, "got {active_pane}");
+    }
+
+    #[test]
+    fn mux_next_session_cycles_back_to_the_parked_session() {
+        let mut model = model();
+        let original_name = model.mux_session.name.clone();
+        model.run_command(mux_command_ids::NEW_SESSION);
+        let new_name = model.mux_session.name.clone();
+
+        model.run_command(mux_command_ids::NEXT_SESSION);
+        assert_eq!(model.mux_session.name, original_name);
+        assert_eq!(model.mux_parked.len(), 1);
+        assert_eq!(model.mux_parked[0].name, new_name);
+    }
+
+    #[test]
+    fn mux_overlay_arrow_keys_and_enter_attach_to_a_parked_session() {
+        let mut model = model();
+        let original_name = model.mux_session.name.clone();
+        model.run_command(mux_command_ids::NEW_SESSION);
+        let new_name = model.mux_session.name.clone();
+        model.run_command(mux_command_ids::DETACH);
+        assert!(!model.mux_attached);
+
+        model.layout.focus(PaneId::Terminal);
+        // Highlight index 1 (the parked original) and press Enter to attach.
+        model.dispatch(chord("ArrowDown"));
+        assert_eq!(model.mux_overlay_index, 1);
+        model.dispatch(chord("Enter"));
+
+        assert!(model.mux_attached);
+        assert_eq!(model.mux_session.name, original_name);
+        assert_eq!(model.mux_parked.len(), 1);
+        assert_eq!(model.mux_parked[0].name, new_name);
+    }
+
+    #[test]
+    fn debug_show_mux_status_summarises_session_and_windows() {
+        let mut model = model();
+        model.run_command(mux_command_ids::NEW_WINDOW);
+        model.run_command(mux_command_ids::SELECT_WINDOW_0);
+
+        model.debug_show_mux_status();
+        assert!(model.status.starts_with('['), "status: {}", model.status);
+        assert!(model.status.contains("0:0*"), "status: {}", model.status);
+        assert!(model.status.contains("1:1"), "status: {}", model.status);
+    }
+
+    #[test]
+    fn palette_lists_mux_status_debug_command() {
+        let ids = palette_entries()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            ids.iter().any(|id| id == DEBUG_SHOW_MUX_STATUS),
+            "entries: {ids:?}"
+        );
+    }
+
+    #[test]
     fn debug_reload_config_restores_default_keybindings() {
         let mut model = model();
         model.debug_reload_config();
@@ -5618,6 +7063,117 @@ mod tests {
     }
 
     #[test]
+    fn paint_terminal_status_line_renders_configured_task_token() {
+        let mut model = model();
+        model.status_format = "[{session}] {windows} task:{task}".to_string();
+        model.last_mise_task = Some("test".to_string());
+
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+
+        let texts: Vec<String> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.clone()),
+                _ => None,
+            })
+            .collect();
+        let summary = model.mux_session.status_summary();
+        let expected = format!(
+            "[{}] {} task:test",
+            summary.session_name,
+            format_args!(
+                "{}:{}{}",
+                summary.windows[0].index,
+                summary.windows[0].name,
+                if summary.windows[0].active { "*" } else { "" }
+            ),
+        );
+        assert!(
+            texts.iter().any(|text| text == &expected),
+            "expected `{expected}` in painted text, got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn render_mux_status_line_substitutes_known_tokens() {
+        let mut model = model();
+        model.status_format = "{session} | {windows} | {pane} | task={task}".to_string();
+        model.last_mise_task = Some("build".to_string());
+
+        let text = model.render_mux_status_line();
+        let summary = model.mux_session.status_summary();
+        let active_window = &summary.windows[0];
+        let windows = format!(
+            "{}:{}{}",
+            active_window.index,
+            active_window.name,
+            if active_window.active { "*" } else { "" }
+        );
+        assert_eq!(
+            text,
+            format!(
+                "{} | {} | {} | task=build",
+                summary.session_name,
+                windows,
+                model.mux_session.active_pane().id,
+            )
+        );
+    }
+
+    #[test]
+    fn render_mux_status_line_leaves_unknown_tokens_verbatim() {
+        let mut model = model();
+        model.status_format = "{session} {nope} {task}".to_string();
+        let text = model.render_mux_status_line();
+        assert!(text.contains("{nope}"), "rendered: {text}");
+    }
+
+    #[test]
+    fn render_mux_status_line_supports_escaped_braces() {
+        let mut model = model();
+        model.status_format = "{{literal}} {session}".to_string();
+        let text = model.render_mux_status_line();
+        assert!(text.starts_with("{literal} "), "rendered: {text}");
+    }
+
+    #[test]
+    fn paint_terminal_emits_mux_status_line_at_the_bottom() {
+        let mut model = model();
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+
+        let texts: Vec<String> = painter
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                cockpit_render::DrawCommand::Text(run) => Some(run.text.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected = model.render_mux_status_line();
+        assert!(
+            texts.iter().any(|text| text == &expected),
+            "expected `{expected}` in painted text, got {texts:?}"
+        );
+    }
+
+    #[test]
     fn paint_terminal_mux_split_emits_pane_labels() {
         let mut model = model();
         model.run_command(mux_command_ids::SPLIT_HORIZONTAL);
@@ -6065,6 +7621,95 @@ mod tests {
         model.dispatch(chord("Escape"));
         assert_eq!(model.mux_session.active_pane().mode, PaneMode::Live);
         assert!(model.status.contains("copy mode exited for pane-0"));
+    }
+
+    #[test]
+    fn mux_copy_mode_gg_jumps_to_the_top_of_the_scrollback() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        // First `g` is recorded as pending — scrollback stays put.
+        model.dispatch(chord("g"));
+        assert_eq!(model.mux_session.active_pane().scrollback_offset, 0);
+
+        // Second `g` completes `gg` and jumps to the top of the scrollback.
+        model.dispatch(chord("g"));
+        assert_eq!(
+            model.mux_session.active_pane().scrollback_offset,
+            usize::MAX
+        );
+
+        // Capital `G` snaps back to the live edge.
+        model.dispatch(chord("Shift+g"));
+        assert_eq!(model.mux_session.active_pane().scrollback_offset, 0);
+    }
+
+    #[test]
+    fn mux_copy_mode_yank_exits_copy_mode_and_stashes_the_selection() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        // Anchor a selection in headless mode by talking to the session
+        // directly — the visible rows source returns empty without a real
+        // terminal, but the selection state still exercises the chord wiring.
+        model.mux_session.move_copy_cursor(0, 0, 0, 0);
+        model.mux_session.toggle_copy_selection();
+        model.dispatch(chord("y"));
+
+        assert_eq!(model.mux_session.active_pane().mode, PaneMode::Live);
+        assert_eq!(model.mux_copy_yank.as_deref(), Some(""));
+        assert!(model.status.contains("yanked"));
+    }
+
+    #[test]
+    fn mux_copy_mode_yank_without_selection_keeps_copy_mode_active() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        model.dispatch(chord("y"));
+
+        assert_eq!(model.mux_session.active_pane().mode, PaneMode::Copy);
+        assert!(model.mux_copy_yank.is_none());
+        assert!(model.status.contains("no selection to yank"));
+    }
+
+    #[test]
+    fn mux_copy_mode_search_input_captures_chars_until_enter() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        model.dispatch(chord("/"));
+        model.dispatch(chord("f"));
+        model.dispatch(chord("o"));
+        model.dispatch(chord("o"));
+        assert_eq!(model.mux_session.copy_search_query(), Some("foo"));
+
+        // Backspace pops, Enter finishes — with no visible rows the search
+        // simply yields "no match" and clears the pending query.
+        model.dispatch(chord("Backspace"));
+        assert_eq!(model.mux_session.copy_search_query(), Some("fo"));
+
+        model.dispatch(chord("Enter"));
+        assert_eq!(model.mux_session.copy_search_query(), None);
+        assert!(model.status.contains("no match"));
+    }
+
+    #[test]
+    fn mux_copy_mode_search_escape_cancels_the_pending_query() {
+        let mut model = model();
+        model.run_command(mux_command_ids::COPY_MODE);
+        model.layout.focus(PaneId::Terminal);
+
+        model.dispatch(chord("/"));
+        model.dispatch(chord("a"));
+        model.dispatch(chord("Escape"));
+
+        assert_eq!(model.mux_session.copy_search_query(), None);
+        assert!(model.status.contains("search cancelled"));
     }
 
     #[test]

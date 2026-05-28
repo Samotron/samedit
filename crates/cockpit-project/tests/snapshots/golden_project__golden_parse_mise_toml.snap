@@ -1,5 +1,6 @@
 ---
 source: crates/cockpit-project/tests/golden_project.rs
+assertion_line: 105
 expression: render_mise(&mise)
 ---
 mise.detected: true
@@ -12,4 +13,4 @@ mise.tasks:
   test | desc=None | run=Some("cargo test")
 mise.env:
   RUST_LOG = debug
-mise.metadata: Some(CockpitMetadata { name: Some("Sample Project"), default_task: Some("test"), terminal_workspace: Some("zellij"), zellij_layout: None })
+mise.metadata: Some(CockpitMetadata { name: Some("Sample Project"), default_task: Some("test"), terminal_workspace: Some("zellij"), zellij_layout: None, cockpit_layout: None })

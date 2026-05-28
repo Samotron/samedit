@@ -1,5 +1,6 @@
 ---
 source: crates/cockpit-project/tests/golden_project.rs
+assertion_line: 66
 expression: render_detection(&detection)
 ---
 display_name: mise-basic
@@ -14,4 +15,4 @@ mise.tasks:
   lint | desc=Some("Run clippy") | run=Some("cargo clippy --workspace --all-targets -- -D warnings")
   test | desc=Some("Run tests") | run=Some("cargo test --workspace")
 mise.env:
-mise.metadata: Some(CockpitMetadata { name: Some("Mise Basic"), default_task: Some("test"), terminal_workspace: Some("zellij"), zellij_layout: Some(".config/zellij/dev.kdl") })
+mise.metadata: Some(CockpitMetadata { name: Some("Mise Basic"), default_task: Some("test"), terminal_workspace: Some("zellij"), zellij_layout: Some(".config/zellij/dev.kdl"), cockpit_layout: None })

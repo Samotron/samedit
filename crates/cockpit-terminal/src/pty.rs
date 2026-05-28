@@ -12,8 +12,8 @@ use std::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use thiserror::Error;
 
+use crate::command::CommandSpec;
 use crate::io_thread::{ReaderThread, spawn_reader_thread};
-use crate::zellij::CommandSpec;
 
 /// PTY dimensions in terminal cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -168,7 +168,10 @@ impl HydrationDriver {
             (HydrationPhase::ApplyConfig, DriverState::ModelBuilt { mut model }) => {
                 if let Some(path) = cockpit_config::user_config_path() {
                     match cockpit_config::Config::load_optional(&path) {
-                        Ok(config) => model.apply_user_config(&config),
+                        Ok(config) => {
+                            model.apply_user_config(&config);
+                            model.set_user_config_path(path);
+                        }
                         Err(err) => {
                             tracing::warn!(error = %err, "user config load failed");
                         }

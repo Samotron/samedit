@@ -870,6 +870,25 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   session tree + each PTY's scrollback on shutdown) is M7.5a, deferred.
   Spec §10 explicitly does not promise tmux's "survive cockpit exit"
   behaviour yet — say so.
+- Headless data model: `cockpit_mux::SessionRegistry` holds every
+  in-flight `Session`, tracks which is active and whether the workspace
+  is attached, allocates fresh session ids on `create` / `add`, and
+  exposes `detach` / `attach(id)` / `kill(id)` operations.
+  `Session::set_name` is the rename hook the overlay will drive.
+  Cross-session pane-id collisions are resolved by handing each
+  registry-created session a disjoint id stride
+  (`SESSION_ID_STRIDE = 1_000_000`) via the new
+  `Session::with_id_base` constructor — splits inside that session keep
+  allocating within its own range.
+- Binary wire-up: `AppModel::mux_attached` flips on `Ctrl+b d`. While
+  detached the terminal pane paints a session-list overlay and the
+  PTYs keep running in the background. `Mux: New Session`,
+  `Mux: Next Session`, and `Mux: Previous Session` palette commands
+  park the current session into `AppModel::mux_parked` and swap a
+  fresh / next session in; the pane-id stride keeps each session's
+  PTYs reachable in the shared `terminals` map. The overlay walks
+  the active session followed by every parked session — Up/Down or
+  j/k move the cursor and Enter attaches to the highlighted entry.
 - Tests: scripted detach → attach round-trip preserves the layout tree
   and pane focus.
 
@@ -891,7 +910,22 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
     scrollback-ring renderer a stable viewport, cursor, and selection
     state. Copy-mode panes render their mode, offset, cursor position,
     and selection range in the mux pane label, and the command is also
-    exposed through the palette. Search/yank remain the next M7.6 layer.
+    exposed through the palette.
+  - Motions layer: `gg` / `G` jump to the top of the scrollback /
+    live edge; `w` / `b` walk word boundaries on the active line using
+    the visible grid row text. The chord handler tracks a single-key
+    `g` pending flag so the second `g` completes `gg` without a parallel
+    FSM. Word motions clamp to the same max column used by `h/l/0/$`.
+  - Yank + search layer: `y` extracts the current selection text from
+    the visible terminal grid, stashes it in `AppModel::mux_copy_yank`,
+    and pushes it to the OS clipboard via `arboard`. Headless / display-
+    less environments fail the clipboard write gracefully and surface
+    `(clipboard unavailable)` in the status line so the workflow still
+    finishes. `/` enters a search-input substate; characters accumulate
+    into the pane's `CopySearch::query`, Backspace pops, Escape cancels,
+    and Enter runs the forward search across the visible rows and jumps
+    the cursor to the first match. `n` repeats the last completed
+    search forward from the cursor.
 - Tests: golden of the rendered selection after a recorded key script
   on a fixture scrollback.
 
@@ -901,6 +935,25 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   active marker, time, optional `mise` task status.
 - Pure view-model in `cockpit-ui`; painter in `cockpit-render`.
 - Configurable via spec §20 (`terminal.status.format`).
+- Headless data + default render shipped: `cockpit_mux::Session::status_summary`
+  emits a `StatusSummary { session_name, windows }` snapshot keyed by
+  window index, name, active marker, and per-window pane count.
+  `StatusSummary::render(extras)` produces the default tmux-style
+  `[<session>] 0:name 1:name* …` formatted line, with optional
+  `extras` (time, mise task, etc.) appended after a `│` separator.
+- Painter: `paint_terminal` reserves an `STATUS_LINE_H` strip at the
+  bottom of the terminal pane and renders the rendered status text on
+  a theme-accent background. The mux pane-rect projection used by
+  hit-tests, drags, and resize-sync now subtracts the same strip so
+  the painted strip and the layout share bounds.
+- Live extras: `AppModel::last_mise_task` records the most recent task
+  kicked off via `run_mise_task`. The mode-line painter now drives a
+  configurable template — `cockpit_config::TerminalStatusConfig::format`
+  defaults to `"[{session}] {windows}"` and the substitutor recognises
+  `{session}`, `{windows}`, `{task}`, `{pane}` plus `{{` / `}}` for
+  literal braces. Unknown `{token}` references stay verbatim so users
+  spot typos. A tz-aware `{time}` extra remains an explicit non-goal
+  (would pull in a new dependency) until a real user asks for it.
 
 ### M7.8 — Native layout config
 
@@ -911,8 +964,28 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   leaf `pane` nodes with optional `command` strings (run on first
   attach). Smaller surface than the Zellij KDL — no plugin slots, no
   themes, no swap layouts (out of scope per AGENTS §2 hard rule #7).
-- Loader lives in `cockpit-config::layout` (rename of
-  `cockpit-config::zellij_layout`).
+- Loader lives in `cockpit-config::cockpit_layout`. ✅
+  `CockpitLayout::from_kdl` / `::load` parse the schema into a
+  `CockpitLayoutNode` tree with optional per-pane commands.
+  `cockpit_mux::LayoutDescription` is the matching, runtime-side
+  description type, and `Session::from_layout(name, description)`
+  builds a session whose layout tree, pane ids, and active pane all
+  derive from the description plus a `Vec<(PaneId, Option<String>)>`
+  the caller can spawn against on first attach.
+- Binary wire-up: `cockpit::mux_layout::resolve_cockpit_layout` reads
+  `metadata.cockpit.cockpit_layout` from the project detection,
+  loads + parses the KDL, and `AppModel::apply_cockpit_layout`
+  replaces the default single-pane mux session with one built from
+  the layout. Per-pane first-attach commands live in
+  `AppModel::mux_pane_commands` until `ensure_terminal` consumes
+  them — at which point the PTY spawns the layout command through
+  the host shell (`sh -c` on Unix, `cmd.exe /C` on Windows) instead
+  of the Zellij / fallback launcher. Bad / missing layout paths
+  surface in the status line and keep the default session running.
+- `CockpitMetadata::cockpit_layout` joins the existing `zellij_layout`
+  field on the project metadata block so the v0.7 multiplexer can
+  pick up the new schema while the legacy Zellij wiring is still
+  live; M7.9 removes the Zellij field.
 
 ### M7.9 — Remove Zellij surface
 
@@ -929,6 +1002,20 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
 - Update [`AGENTS.md`](AGENTS.md) §3–§4: rename
   "zellij" → "embedded multiplexer (`cockpit-mux`)" in the layout +
   decision table.
+- Progress: cockpit no longer spawns Zellij from its own terminal path.
+  `ensure_terminal` always spawns the host shell directly through the
+  embedded multiplexer; `plan_launch` / `LaunchPlan` / `ShellProfile` /
+  `PathBinaryLookup` / `resolve_zellij_layout` are out of the cockpit
+  binary. `crates/cockpit-terminal/src/zellij.rs` and
+  `crates/cockpit-config/src/zellij_layout.rs` are deleted along with
+  the `ConfigError::ZellijLayout` variant; `CommandSpec` moved to
+  `cockpit_terminal::command::CommandSpec`. The `--print` CLI keeps
+  surfacing the legacy `zellij_layout` field as "deprecated, ignored"
+  so existing user configs that still reference it keep parsing —
+  the `CockpitMetadata::zellij_layout` field is preserved for
+  serde compatibility but no code reads it. AGENTS.md now points at
+  the embedded multiplexer in §1 and §3–§4; updating spec.md §10 /
+  §9 / §20 / §25 is the remaining doc churn.
 
 ### M7.10 — Windows parity
 
@@ -1014,49 +1101,76 @@ running upstream CLIs the user already has. That is the whole point.
 
 ### M8.1 — Catppuccin theme
 
-- Extend [crates/cockpit-render/src/theme.rs](file:///home/samotron/dev/samedit/crates/cockpit-render/src/theme.rs)
-  with four constructors: `Theme::catppuccin_latte()`,
-  `catppuccin_frappe()`, `catppuccin_macchiato()`, `catppuccin_mocha()`.
-  Palettes sourced from https://catppuccin.com/palette — comment each
-  colour with its hex source so palette drift is reviewable.
-- `Theme::from_name(&str) -> Option<Self>` resolves
-  `dark | latte | frappe | macchiato | mocha` (case-insensitive,
-  accepts the `catppuccin-` alias prefix). Unknown names return
-  `None` so callers fall back without panicking.
-- Wire `cockpit_config::UiConfig::theme` (already a `String`, today
-  defaults to `"dark"`) into `AppModel::apply_user_config`: on
-  unknown name, log a `tracing::warn!` and keep the current theme —
-  never crash on a typo'd config (AGENTS §2 hard rule #6 sibling: be
-  forgiving of user input).
-- New palette command `Theme: Switch…` with sub-actions per flavour;
-  selecting one updates the in-memory `AppModel::theme` immediately
-  and writes the choice back to the user config (single-key change,
-  preserves comments — use `toml_edit`, not a full re-serialise).
-- Tests (all headless, in `cockpit-render`):
-  - `from_name` resolves every flavour + aliases + unknown.
-  - Every flavour is opaque except `selection`.
-  - Latte luminance > Mocha luminance (catches palette typos).
-  - `apply_user_config_resolves_catppuccin_theme_names` in
-    `cockpit::app` tests covers the wiring end-to-end.
+- ✅ `cockpit-render::Theme::catppuccin_latte() / _frappe() / _macchiato()
+  / _mocha()` constructors ship with palette values pasted verbatim
+  from https://catppuccin.com/palette (each `Color::hex(0x…)` carries
+  the palette name in a trailing comment). `Color::hex` /
+  `Color::hex_with_alpha` are the new const helpers backing them.
+- ✅ `Theme::from_name(&str) -> Option<Self>` resolves
+  `dark | latte | frappe | macchiato | mocha`, case-insensitively, and
+  strips an optional `catppuccin-` alias prefix so
+  `"catppuccin-mocha"` and `"mocha"` route the same way.
+- ✅ `AppModel::apply_user_config` reads `ui.theme` through
+  `Theme::from_name`. Unknown names log a `tracing::warn!` and leave
+  the active theme alone — typo'd configs never crash the cockpit.
+- ✅ `Theme: Switch <Flavour>` palette commands hot-swap the active
+  theme immediately and persist the choice via
+  `cockpit_config::write_ui_theme`, which round-trips the user config
+  through `toml_edit` so comments / ordering / surrounding whitespace
+  survive. The cockpit binary records the resolved user-config path
+  in `AppModel::user_config_path` during hydration so the write-back
+  doesn't re-resolve the platform config dir on every dispatch.
+- ✅ Tests cover hex decoding, `from_name` aliasing + unknowns,
+  per-flavour opacity, and the brightness ordering
+  Mocha < Macchiato < Frappé < Latte (catches palette typos). The
+  cockpit-side `apply_user_config_resolves_catppuccin_theme_names`
+  test exercises the wiring end-to-end.
 - **Done when:** `ui.theme = "mocha"` in the user config opens the
   cockpit in Mocha; `Theme: Switch Latte` from the palette
   hot-swaps without restart on Linux + macOS + Windows.
 
 ### M8.2 — Tool-pane recipes  *(needs M7.4)*
 
-- New config schema in [cockpit-config](file:///home/samotron/dev/samedit/crates/cockpit-config):
+- ✅ Config schema in `cockpit-config::PanesConfig`:
   ```toml
   [panes.tools.lazygit]
   command  = "lazygit"
-  layout   = "floating"   # floating | side | bottom
+  layout   = "floating"   # floating | side-right | bottom
   toggle   = true         # second invocation hides the pane
   keybind  = "<leader>g"
   detect   = "lazygit"    # binary name (mise exec first, then PATH)
   ```
-- Loader produces typed `ToolPaneRecipe { name, command, layout,
-  toggle, keybind, detect }` values; each becomes a `CommandId` in
-  `cockpit-commands` so the palette *and* the keybind dispatch the
-  same code (AGENTS §2 hard rule #5).
+  Defaults: `layout = floating`, `toggle = true`, `detect = <first
+  command word>`. `ToolPaneRecipe::detect_binary` returns the
+  effective binary name for the probe.
+- ✅ Each registered recipe becomes a `tool.<name>` palette command
+  (dispatched via the existing `cockpit-commands` spine, AGENTS §2
+  hard rule #5). `AppModel::apply_user_config` snapshots
+  `config.panes.tools` into `AppModel::tool_recipes`; the palette
+  `open` path appends the dynamic recipe entries to the static set.
+- ✅ Detection: `run_tool_recipe` probes `recipe.detect_binary()`
+  against the project's mise `[tools]` list and the host `$PATH` and
+  refuses to dispatch with a "`<binary>` not found. `mise use
+  <binary>@latest`?" toast (AGENTS §2 hard rule #6).
+- ✅ Floating-pane primitive: `cockpit-mux::Session::open_floating`,
+  `toggle_floating`, `show_floating`, `hide_floating`, `close_floating`
+  manage a single overlay per session. `Session::floating_rect`
+  projects an 80% × 80% centred rectangle for the painter, which now
+  draws the overlay above the regular split tree.
+  `mux.floating.toggle` / `mux.floating.close` palette commands manage
+  the slot; tool recipes with `layout = "floating"` open into it. A
+  repeat dispatch with `toggle = true` hides the overlay while the
+  PTY keeps running; the third press resumes it without respawning.
+- Side-right and bottom slotted layouts still type the command into
+  the active pane today — dedicated docked panes are a follow-up.
+- ✅ Leader chord support: `keys.global.leader` (default `Space`) is
+  substituted into recipe keybinds, so the default `<leader>g`
+  Lazygit binding becomes the two-stroke chord `Space g` and fires
+  from the keymap without needing the palette. The dispatch path
+  buffers the leader stroke when it lands as a single chord and
+  combines it with the next chord to look up multi-stroke matches.
+  Tools that don't carry a real `<leader>` substitution still work
+  via their palette entry.
 - Mux gains two primitives on top of M7.4's split tree:
   - **Floating pane** — overlay rectangle centred over the project,
     sized 80% × 80%, drawn above the regular layout. Single floating
@@ -1091,10 +1205,13 @@ user config — same merge rule as the existing `[keys.global]`):
 - Side-right panes share a slot: opening `codex` while `claude-code`
   is visible hides Claude and shows Codex. Avoids fighting over
   screen real estate while keeping both PTYs alive in the
-  background.
-- All three recipes ship under `[panes.tools.*]` defaults; users can
-  override any field (e.g. swap `claude` for `aichat`) without
-  losing the rest of the schema.
+  background. (Mux floating + slotted layout still pending — see
+  M8.2.)
+- ✅ All three recipes ship under `PanesConfig::default()` via
+  `ToolPaneRecipe::default_lazygit / _claude_code / _codex`. An empty
+  `[panes.tools]` section inherits them; users replace the whole
+  table by re-declaring `[panes.tools.*]` (per-field merge across
+  defaults is a follow-up if it proves valuable).
 - **No** in-cockpit chat UI, file-context injection, diff-apply, or
   prompt rendering. The user's task #2 ("see #1") was explicit:
   *the mux is the integration.*

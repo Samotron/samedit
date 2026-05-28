@@ -12,12 +12,12 @@
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use crate::command::CommandSpec;
 use crate::engine::{ScreenGrid, TerminalEngine};
 use crate::io_thread::TerminalIoEvent;
 use crate::pty::{PtyDimensions, PtyError, PtySession};
 use crate::session::TerminalStatus;
 use crate::termwiz_engine::TermwizEngine;
-use crate::zellij::CommandSpec;
 
 /// Callback invoked on the reader thread after every terminal state change, so
 /// the UI can schedule a redraw.
