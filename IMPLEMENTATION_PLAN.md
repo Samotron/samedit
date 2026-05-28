@@ -1922,16 +1922,23 @@ Registered in `cockpit-commands`:
   `http.switch_environment`, `http.copy_as_curl`,
   `http.save_response`, `http.next_tab`, `http.prev_tab`,
   `http.tab.{body,headers,timing,raw}`) plus a
-  `default_keybindings()` table that ships `<leader>hs`, `<leader>he`,
-  and `<leader>h1..h4` ready for the binary to bind via
-  `InputRouter::bind_extra_chord`. `cockpit_http::PreparedRequest::to_curl`
+  `default_keybindings()` table shipping `<leader>hs`, `<leader>he`,
+  and `<leader>h1..h4`. `cockpit_http::PreparedRequest::to_curl`
   emits POSIX-quoted curl invocations (URL + `-X METHOD` when non-GET
   + `-H` per header + `--data-binary` for bodies; form bodies
-  url-encoded by `PreparedBody::to_bytes`). `cockpit_ui::http::copy_selected_as_curl`
-  wraps `prepare_selected` + `to_curl` so the binary's clipboard hook
-  is a one-liner. The actual command-registry registration and
-  palette wiring inside `crates/cockpit/src/app.rs` land in M11.5.1
-  alongside the M11.4.1 painter.
+  url-encoded by `PreparedBody::to_bytes`). The binary
+  (`crates/cockpit/src/app.rs`) recognises `.bru` files on open via
+  `recognise_http_request` → constructs an `HttpView` (auto-selecting
+  the request whose `meta.name` matches the file stem), binds the
+  default chords via `bind_http_chords` at init, exposes every HTTP
+  command in the palette, and dispatches the synchronous commands:
+  `Http: Copy As cURL` (writes to the OS clipboard via the existing
+  `arboard` hook), `Http: Show {Body|Headers|Timing|Raw} Tab`, and
+  `Http: Next/Previous Response Tab`. `Http: Send Request`,
+  `Http: Switch Environment`, `Http: Send All In Folder`, and
+  `Http: Save Response To File` register and surface a status
+  pointing at M11.5.2 — they need the async-engine thread + a
+  sub-palette and land with the M11.4.1 painter.
 
 ### M11.6 — Scripts (Lua, capability-gated)
 

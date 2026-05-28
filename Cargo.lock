@@ -622,6 +622,7 @@ dependencies = [
  "cockpit-commands",
  "cockpit-config",
  "cockpit-editor",
+ "cockpit-http",
  "cockpit-lsp",
  "cockpit-lua",
  "cockpit-mux",

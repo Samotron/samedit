@@ -20,6 +20,7 @@ cockpit-testkit.workspace = true
 cockpit-commands.workspace = true
 cockpit-config.workspace = true
 cockpit-editor.workspace = true
+cockpit-http.workspace = true
 cockpit-lsp.workspace = true
 cockpit-lua.workspace = true
 cockpit-mux.workspace = true

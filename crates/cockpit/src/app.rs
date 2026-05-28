@@ -54,6 +54,12 @@ use cockpit_terminal::session::TerminalStatus;
 // multiplexer handles all spawn / split / window concerns; cockpit
 // pulls only `CommandSpec` (now at the crate root) from
 // `cockpit-terminal`.
+use cockpit_http::{Collection as HttpCollection, load_collection as load_http_collection};
+use cockpit_ui::http::{
+    HttpView, ResponseTab, command_ids as http_command_ids,
+    copy_selected_as_curl as http_copy_selected_as_curl,
+    default_keybindings as http_default_keybindings,
+};
 use cockpit_ui::{
     CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, FileBrowser, FileBrowserAction,
     FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput,
@@ -318,6 +324,9 @@ pub struct AppModel {
     /// wire-up). Populated when [`open_document`] detects a Jupytext
     /// `.sql` / `.ggsql` source or any `.qmd` file; `None` otherwise.
     notebook: Option<Notebook>,
+    /// Bruno HTTP collection view (v0.11 M11.4). Populated when the
+    /// open document is a `.bru` request file; cleared on close.
+    http: Option<HttpView>,
     /// Detected analytics project (v0.5 M5.6 wire-up). Built once during
     /// [`new`] when a `models/` directory is present and refreshed by
     /// `Models: Build All`.
@@ -502,6 +511,7 @@ impl AppModel {
             confirm_intent: None,
             format_on_save: false,
             notebook: None,
+            http: None,
             analytics: None,
             editor_pending_g: false,
             editor_pending_leader: 0,
@@ -621,6 +631,7 @@ impl AppModel {
         };
         self.tool_recipes = config.panes.tools.clone();
         self.bind_tool_recipe_chords();
+        self.bind_http_chords();
 
         // v0.7 M7.7: pick up the configured mode-line format. An empty
         // template falls back to the default so users never see a blank
@@ -1282,6 +1293,22 @@ impl AppModel {
             NOTEBOOK_NEXT_CELL => self.notebook_next_cell(),
             NOTEBOOK_PREVIOUS_CELL => self.notebook_previous_cell(),
             NOTEBOOK_INSERT_CELL_BELOW => self.notebook_insert_cell_below(),
+            http_command_ids::COPY_AS_CURL => self.http_copy_as_curl(),
+            http_command_ids::TAB_BODY => self.http_set_tab(ResponseTab::Body),
+            http_command_ids::TAB_HEADERS => self.http_set_tab(ResponseTab::Headers),
+            http_command_ids::TAB_TIMING => self.http_set_tab(ResponseTab::Timing),
+            http_command_ids::TAB_RAW => self.http_set_tab(ResponseTab::Raw),
+            http_command_ids::NEXT_TAB => self.http_cycle_tab(true),
+            http_command_ids::PREV_TAB => self.http_cycle_tab(false),
+            http_command_ids::SEND_REQUEST
+            | http_command_ids::SEND_ALL_IN_FOLDER
+            | http_command_ids::SWITCH_ENVIRONMENT
+            | http_command_ids::SAVE_RESPONSE => {
+                self.status = format!(
+                    "{} — wiring lands with M11.5.2 (async engine + sub-palette).",
+                    id
+                );
+            }
             MODELS_BUILD_ALL => self.run_build_all_models(),
             MODELS_SHOW_DAG => self.show_dag_summary(),
             QUARTO_RENDER => self.render_quarto_document(),
@@ -1747,6 +1774,23 @@ impl AppModel {
             return true;
         }
         FormatPathLookup.exists(binary)
+    }
+
+    /// Bind the v0.11 HTTP command chords (`<leader>hs`, `<leader>he`,
+    /// `<leader>h1..h4`) onto the global keymap. Failures are silent
+    /// (palette dispatch still works) — same policy as tool-recipe
+    /// chord binding.
+    fn bind_http_chords(&mut self) {
+        for (chord, command) in http_default_keybindings() {
+            if let Err(err) = self.router.bind_extra_chord(chord, *command) {
+                tracing::debug!(
+                    ?err,
+                    chord = %chord,
+                    command = %command,
+                    "http command keybind not bound (parser/conflict)",
+                );
+            }
+        }
     }
 
     /// Bind every registered tool-pane recipe's `keybind` to its
@@ -2846,9 +2890,14 @@ impl AppModel {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 self.notebook = recognise_notebook(&path, &content);
-                let suffix = match &self.notebook {
-                    Some(nb) => format!(" — notebook ({} cells)", nb.cells.len()),
-                    None => String::new(),
+                self.http = recognise_http_request(&path, &self.detection.root_path);
+                let suffix = match (&self.notebook, &self.http) {
+                    (Some(nb), _) => format!(" — notebook ({} cells)", nb.cells.len()),
+                    (_, Some(view)) => format!(
+                        " — http collection ({} requests)",
+                        view.collection().requests.len()
+                    ),
+                    (None, None) => String::new(),
                 };
                 self.status = format!("Opened {name}{suffix}");
                 let language = Language::from_path(&path);
@@ -3831,6 +3880,54 @@ impl AppModel {
             notebook.active + 1,
             notebook.cells.len()
         );
+    }
+
+    /// `Http: Copy As cURL` (v0.11 M11.5). Renders the selected request
+    /// against the active environment and pushes the curl invocation to
+    /// the OS clipboard. Status surfaces missing-var / no-selection
+    /// errors so the user knows why the clipboard didn't change.
+    fn http_copy_as_curl(&mut self) {
+        let Some(view) = self.http.as_ref() else {
+            self.status = "Http: Copy As cURL — open a .bru file first.".to_string();
+            return;
+        };
+        match http_copy_selected_as_curl(view) {
+            Ok(curl) => match copy_to_os_clipboard(&curl) {
+                Ok(()) => {
+                    self.status = "Http: copied curl invocation to clipboard.".to_string();
+                }
+                Err(err) => {
+                    self.status = format!("Http: clipboard error — {err}");
+                }
+            },
+            Err(err) => {
+                self.status = format!("Http: Copy As cURL — {err}");
+            }
+        }
+    }
+
+    /// `Http: Show {Body|Headers|Timing|Raw} Tab` (v0.11 M11.5).
+    fn http_set_tab(&mut self, tab: ResponseTab) {
+        let Some(view) = self.http.as_mut() else {
+            self.status = "Http: open a .bru file to use the response panel.".to_string();
+            return;
+        };
+        view.set_response_tab(tab);
+        self.status = format!("Http: showing {} tab.", tab.label());
+    }
+
+    /// `Http: Next/Previous Response Tab` (v0.11 M11.5).
+    fn http_cycle_tab(&mut self, forward: bool) {
+        let Some(view) = self.http.as_mut() else {
+            self.status = "Http: open a .bru file to use the response panel.".to_string();
+            return;
+        };
+        if forward {
+            view.next_tab();
+        } else {
+            view.prev_tab();
+        }
+        self.status = format!("Http: showing {} tab.", view.response_tab().label());
     }
 
     /// Re-detect the analytics project (if any) and run every
@@ -5246,6 +5343,61 @@ fn chord_to_terminal_bytes(chord: &KeyChord) -> Option<Vec<u8>> {
 ///
 /// Returns `None` for plain text files so opening a regular `.sql`
 /// file without markers keeps the normal editor experience.
+/// Recognise a `.bru` file open as a Bruno collection editor pane
+/// (v0.11 M11.4). Loads the surrounding collection from `project_root`
+/// so the view picks up the full request list + environments — Bruno
+/// requests don't make sense in isolation. Returns `None` for
+/// non-`.bru` files and silently falls back when no collection is
+/// detected (the user opened a stray `.bru` outside a project).
+fn recognise_http_request(path: &Path, project_root: &Path) -> Option<HttpView> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    if ext.as_deref() != Some("bru") {
+        return None;
+    }
+    let collection = match load_http_collection(project_root) {
+        Ok(Some(collection)) => collection,
+        Ok(None) => HttpCollection {
+            root: project_root.to_path_buf(),
+            requests: Vec::new(),
+            environments: Vec::new(),
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to load Bruno collection");
+            return None;
+        }
+    };
+    let mut view = HttpView::new(collection);
+    // If the opened file matches a request in the collection, select it.
+    if let Some(index) = view
+        .collection()
+        .requests
+        .iter()
+        .position(|req| matches_path(req, path))
+    {
+        view.select(index);
+    }
+    Some(view)
+}
+
+/// Best-effort match: Bruno keeps the source file path on disk but the
+/// parsed [`Request`] doesn't carry it. We compare by `meta.name` —
+/// good enough for selection bias; the user can still navigate with
+/// `Http: Send Request` on whatever the collection currently considers
+/// active.
+fn matches_path(req: &cockpit_http::Request, path: &Path) -> bool {
+    let Some(name) = req.meta.name.as_deref() else {
+        return false;
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    name.eq_ignore_ascii_case(stem)
+}
+
 fn recognise_notebook(path: &Path, content: &str) -> Option<Notebook> {
     let ext = path
         .extension()
@@ -5628,6 +5780,26 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(NOTEBOOK_NEXT_CELL, "Notebook: Next Cell"),
         PaletteEntry::new(NOTEBOOK_PREVIOUS_CELL, "Notebook: Previous Cell"),
         PaletteEntry::new(NOTEBOOK_INSERT_CELL_BELOW, "Notebook: Insert Cell Below"),
+        PaletteEntry::new(http_command_ids::SEND_REQUEST, "Http: Send Request"),
+        PaletteEntry::new(
+            http_command_ids::SEND_ALL_IN_FOLDER,
+            "Http: Send All In Folder",
+        ),
+        PaletteEntry::new(
+            http_command_ids::SWITCH_ENVIRONMENT,
+            "Http: Switch Environment",
+        ),
+        PaletteEntry::new(http_command_ids::COPY_AS_CURL, "Http: Copy As cURL"),
+        PaletteEntry::new(
+            http_command_ids::SAVE_RESPONSE,
+            "Http: Save Response To File",
+        ),
+        PaletteEntry::new(http_command_ids::TAB_BODY, "Http: Show Body Tab"),
+        PaletteEntry::new(http_command_ids::TAB_HEADERS, "Http: Show Headers Tab"),
+        PaletteEntry::new(http_command_ids::TAB_TIMING, "Http: Show Timing Tab"),
+        PaletteEntry::new(http_command_ids::TAB_RAW, "Http: Show Raw Tab"),
+        PaletteEntry::new(http_command_ids::NEXT_TAB, "Http: Next Response Tab"),
+        PaletteEntry::new(http_command_ids::PREV_TAB, "Http: Previous Response Tab"),
         PaletteEntry::new(MODELS_BUILD_ALL, "Models: Build All"),
         PaletteEntry::new(MODELS_SHOW_DAG, "Models: Show DAG"),
         PaletteEntry::new(QUARTO_RENDER, "Quarto: Render"),
@@ -9086,6 +9258,50 @@ format_on_save = true
             model.browser.rows().iter().any(|row| row.name == "lib.rs"),
             "src should be expanded after the click"
         );
+    }
+
+    #[test]
+    fn recognise_http_request_returns_none_for_non_bru_files() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let path = project.path().join("notes.txt");
+        std::fs::write(&path, "hi").unwrap();
+        assert!(recognise_http_request(&path, project.path()).is_none());
+    }
+
+    #[test]
+    fn recognise_http_request_loads_collection_and_selects_matching_request() {
+        let project = tempfile::tempdir().expect("tempdir");
+        std::fs::write(project.path().join("bruno.json"), "{}").unwrap();
+        std::fs::write(
+            project.path().join("get-users.bru"),
+            "meta {\n  name: get-users\n}\n\nget {\n  url: https://api.test/users\n  body: none\n  auth: none\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("get-roles.bru"),
+            "meta {\n  name: get-roles\n}\n\nget {\n  url: https://api.test/roles\n  body: none\n  auth: none\n}\n",
+        )
+        .unwrap();
+        let path = project.path().join("get-roles.bru");
+        let view = recognise_http_request(&path, project.path()).expect("view");
+        assert_eq!(view.collection().requests.len(), 2);
+        let selected = view.selected_request().expect("selection");
+        assert_eq!(selected.meta.name.as_deref(), Some("get-roles"));
+    }
+
+    #[test]
+    fn recognise_http_request_falls_back_to_empty_collection_when_marker_missing() {
+        let project = tempfile::tempdir().expect("tempdir");
+        // No bruno.json or cockpit-http/ — the user opened a stray .bru.
+        let path = project.path().join("standalone.bru");
+        std::fs::write(
+            &path,
+            "get {\n  url: https://x\n  body: none\n  auth: none\n}\n",
+        )
+        .unwrap();
+        let view = recognise_http_request(&path, project.path()).expect("view");
+        assert!(view.collection().requests.is_empty());
+        assert!(view.selected_request().is_none());
     }
 }
 
