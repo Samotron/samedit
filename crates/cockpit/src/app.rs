@@ -353,6 +353,9 @@ pub struct AppModel {
     /// a `tool.<name>` palette command that spawns the recipe's command
     /// in the active terminal pane.
     tool_recipes: std::collections::BTreeMap<String, cockpit_config::ToolPaneRecipe>,
+    /// `terminal.status.format` template used for the mux mode-line
+    /// (v0.7 M7.7).
+    status_format: String,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -466,6 +469,7 @@ impl AppModel {
             mux_overlay_index: 0,
             mux_next_session_index: 1,
             tool_recipes: std::collections::BTreeMap::new(),
+            status_format: cockpit_config::TerminalStatusConfig::default().format,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -551,6 +555,15 @@ impl AppModel {
         // `run_tool_recipe`. Spawn semantics (floating overlay vs side
         // pane) land in follow-up sub-tasks.
         self.tool_recipes = config.panes.tools.clone();
+
+        // v0.7 M7.7: pick up the configured mode-line format. An empty
+        // template falls back to the default so users never see a blank
+        // strip.
+        self.status_format = if config.terminal.status.format.is_empty() {
+            cockpit_config::TerminalStatusConfig::default().format
+        } else {
+            config.terminal.status.format.clone()
+        };
     }
 
     /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
@@ -4094,23 +4107,47 @@ impl AppModel {
     }
 
     /// Paint the native mux mode-line at the bottom of the terminal area
-    /// (v0.7 M7.7). Renders the default `StatusSummary` format on a
-    /// theme-accented background, optionally extended with the most
-    /// recently kicked-off mise task.
+    /// (v0.7 M7.7). Renders the configured `terminal.status.format`
+    /// against the live mux state on a theme-accented background.
     fn paint_mux_status_line(&self, canvas: &mut Canvas<'_>, x: f32, y: f32, w: f32, h: f32) {
         if h <= 0.0 || w <= 0.0 {
             return;
         }
         canvas.rect(x, y, w, h, self.theme.accent);
-        let summary = self.mux_session.status_summary();
-        let task_label = self
-            .last_mise_task
-            .as_deref()
-            .map(|task| format!("task:{task}"));
-        let extras: Vec<&str> = task_label.as_deref().into_iter().collect();
-        let text = summary.render(&extras);
+        let text = self.render_mux_status_line();
         let baseline = y + (h - FONT).max(0.0) * 0.5 + FONT * 0.85;
         canvas.text(x + PAD, baseline, text, self.theme.background, FONT);
+    }
+
+    /// Build the mode-line text by substituting `{session}` / `{windows}` /
+    /// `{task}` / `{pane}` into `self.status_format`. Unknown `{token}`s
+    /// are preserved verbatim so the user spots typos.
+    fn render_mux_status_line(&self) -> String {
+        let summary = self.mux_session.status_summary();
+        // Render the window list with the active marker, matching the
+        // default `StatusSummary::render` formatter so the `{windows}`
+        // token is always recognisable.
+        let mut windows = String::new();
+        for (i, window) in summary.windows.iter().enumerate() {
+            if i > 0 {
+                windows.push(' ');
+            }
+            windows.push_str(&window.index.to_string());
+            windows.push(':');
+            windows.push_str(&window.name);
+            if window.active {
+                windows.push('*');
+            }
+        }
+        let task = self.last_mise_task.clone().unwrap_or_default();
+        let pane = self.mux_session.active_pane().id.to_string();
+        substitute_status_tokens(&self.status_format, |token| match token {
+            "session" => Some(summary.session_name.clone()),
+            "windows" => Some(windows.clone()),
+            "task" => Some(task.clone()),
+            "pane" => Some(pane.clone()),
+            _ => None,
+        })
     }
 
     fn paint_terminal_placeholder(&self, canvas: &mut Canvas<'_>, content: &ContentRect) {
@@ -4343,6 +4380,56 @@ fn mux_rect_contains(rect: MuxRect, position: PointerPosition) -> bool {
 /// True when `chord` is a single unmodified press of `key`.
 fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
+}
+
+/// Substitute `{token}` references in `template` using `lookup`. Tokens that
+/// `lookup` doesn't recognise are left verbatim (`{unknown}` stays as
+/// `{unknown}`) so users can spot typos. Escapes: a literal `{` is written
+/// as `{{` and `}` as `}}`.
+fn substitute_status_tokens<F>(template: &str, lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                out.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                out.push('}');
+            }
+            '{' => {
+                let mut name = String::new();
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(ch);
+                }
+                if !closed {
+                    out.push('{');
+                    out.push_str(&name);
+                    continue;
+                }
+                match lookup(&name) {
+                    Some(value) => out.push_str(&value),
+                    None => {
+                        out.push('{');
+                        out.push_str(&name);
+                        out.push('}');
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Push `text` to the OS clipboard (v0.7 M7.6 yank wiring). Returns an error
@@ -6560,8 +6647,9 @@ cockpit_layout = "missing.kdl"
     }
 
     #[test]
-    fn paint_terminal_status_line_includes_last_mise_task_when_set() {
+    fn paint_terminal_status_line_renders_configured_task_token() {
         let mut model = model();
+        model.status_format = "[{session}] {windows} task:{task}".to_string();
         model.last_mise_task = Some("test".to_string());
 
         let mut painter = Painter::new();
@@ -6582,11 +6670,63 @@ cockpit_layout = "missing.kdl"
                 _ => None,
             })
             .collect();
-        let expected = model.mux_session.status_summary().render(&["task:test"]);
+        let summary = model.mux_session.status_summary();
+        let expected = format!(
+            "[{}] {} task:test",
+            summary.session_name,
+            format_args!(
+                "{}:{}{}",
+                summary.windows[0].index,
+                summary.windows[0].name,
+                if summary.windows[0].active { "*" } else { "" }
+            ),
+        );
         assert!(
             texts.iter().any(|text| text == &expected),
             "expected `{expected}` in painted text, got {texts:?}"
         );
+    }
+
+    #[test]
+    fn render_mux_status_line_substitutes_known_tokens() {
+        let mut model = model();
+        model.status_format = "{session} | {windows} | {pane} | task={task}".to_string();
+        model.last_mise_task = Some("build".to_string());
+
+        let text = model.render_mux_status_line();
+        let summary = model.mux_session.status_summary();
+        let active_window = &summary.windows[0];
+        let windows = format!(
+            "{}:{}{}",
+            active_window.index,
+            active_window.name,
+            if active_window.active { "*" } else { "" }
+        );
+        assert_eq!(
+            text,
+            format!(
+                "{} | {} | {} | task=build",
+                summary.session_name,
+                windows,
+                model.mux_session.active_pane().id,
+            )
+        );
+    }
+
+    #[test]
+    fn render_mux_status_line_leaves_unknown_tokens_verbatim() {
+        let mut model = model();
+        model.status_format = "{session} {nope} {task}".to_string();
+        let text = model.render_mux_status_line();
+        assert!(text.contains("{nope}"), "rendered: {text}");
+    }
+
+    #[test]
+    fn render_mux_status_line_supports_escaped_braces() {
+        let mut model = model();
+        model.status_format = "{{literal}} {session}".to_string();
+        let text = model.render_mux_status_line();
+        assert!(text.starts_with("{literal} "), "rendered: {text}");
     }
 
     #[test]
@@ -6610,10 +6750,10 @@ cockpit_layout = "missing.kdl"
                 _ => None,
             })
             .collect();
-        let summary = model.mux_session.status_summary().render(&[]);
+        let expected = model.render_mux_status_line();
         assert!(
-            texts.iter().any(|text| text == &summary),
-            "expected `{summary}` in painted text, got {texts:?}"
+            texts.iter().any(|text| text == &expected),
+            "expected `{expected}` in painted text, got {texts:?}"
         );
     }
 

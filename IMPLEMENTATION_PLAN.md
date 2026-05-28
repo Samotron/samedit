@@ -947,11 +947,13 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   hit-tests, drags, and resize-sync now subtracts the same strip so
   the painted strip and the layout share bounds.
 - Live extras: `AppModel::last_mise_task` records the most recent task
-  kicked off via `run_mise_task` and the painter folds it in as
-  `task:<name>` after the window list. Configurable format strings
-  (spec §20 `terminal.status.format`) plus a `time` extra remain the
-  next sub-task — adding a tz-aware clock would pull in a new
-  dependency, so the explicit choice for now is task-only.
+  kicked off via `run_mise_task`. The mode-line painter now drives a
+  configurable template — `cockpit_config::TerminalStatusConfig::format`
+  defaults to `"[{session}] {windows}"` and the substitutor recognises
+  `{session}`, `{windows}`, `{task}`, `{pane}` plus `{{` / `}}` for
+  literal braces. Unknown `{token}` references stay verbatim so users
+  spot typos. A tz-aware `{time}` extra remains an explicit non-goal
+  (would pull in a new dependency) until a real user asks for it.
 
 ### M7.8 — Native layout config
 

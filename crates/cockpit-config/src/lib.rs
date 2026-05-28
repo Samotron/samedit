@@ -159,6 +159,7 @@ pub struct TerminalConfig {
     pub workspace: String,
     pub default_profile: String,
     pub profiles: BTreeMap<String, TerminalProfile>,
+    pub status: TerminalStatusConfig,
 }
 
 impl Default for TerminalConfig {
@@ -171,6 +172,32 @@ impl Default for TerminalConfig {
                 "project-zellij".to_string(),
                 TerminalProfile::project_zellij(),
             )]),
+            status: TerminalStatusConfig::default(),
+        }
+    }
+}
+
+/// Native mux mode-line format settings (v0.7 M7.7).
+///
+/// `format` is a tmux-flavoured substitution string. Recognised tokens:
+///
+/// * `{session}` — active session name
+/// * `{windows}` — formatted window list with active marker
+/// * `{task}` — most recent mise task, or empty
+/// * `{pane}` — active pane id (`pane-N`)
+///
+/// Unknown `{token}` references are kept verbatim so users can spot typos
+/// in the rendered line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalStatusConfig {
+    pub format: String,
+}
+
+impl Default for TerminalStatusConfig {
+    fn default() -> Self {
+        Self {
+            format: "[{session}] {windows}".to_string(),
         }
     }
 }
