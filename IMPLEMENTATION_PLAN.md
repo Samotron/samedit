@@ -2018,8 +2018,25 @@ Registered in `cockpit-commands`:
   `cockpit_lua::http_scripts` (set/read vars, sandbox blocks
   `os.execute`, runtime errors, response-shape iteration) + 3 in the
   binary (granted path mutates headers, ungranted path skips, script
-  failure aborts before dispatch). Post-response script integration
-  in the binary is M11.6.2 alongside the env-overlay store.
+  failure aborts before dispatch).
+- **M11.6.2 update (post-response wired):** `HttpInFlight` now captures
+  the request's `post_script` source + `active_environment_name` at
+  send time, so a mid-flight selection switch can't swap which script
+  runs. `poll_http_inflight` drains those fields before applying the
+  result, then on `Ok(response)` runs
+  `cockpit_lua::run_post_response`. `HttpView::replace_environment_vars(name,
+  vars)` writes the script's `cockpit.http.set_var` mutations back to
+  the in-memory environment so the next request picks them up; on-disk
+  persistence to `environments/<name>.bru` still routes through the
+  M11.4.1 editor surface. Script failures surface as a `(post-script
+  failed: …)` suffix on the round-trip status without flipping the
+  response status (the engine call still succeeded). 5 new tests
+  (3 binary integration: write-back, failure surfacing, ungranted
+  skip; 2 view-model: replace-vars happy path + unknown-name error).
+  Remaining for full M11.6: a per-collection grant store reading
+  `~/.config/cockpit/extensions.toml` so the binary's
+  `http_scripts_granted` is sourced from real config instead of a
+  test-only flag.
 
 ### M11.7 — Docs
 

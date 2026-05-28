@@ -239,6 +239,37 @@ impl HttpView {
         self.active_env.as_deref()
     }
 
+    /// Replace the vars on the environment named `name`, in-place
+    /// (v0.11 M11.6.2). Returns `Err` if no such environment exists —
+    /// callers should validate the name was real at send time and bail
+    /// here only on a genuine race (e.g. the user reloaded the
+    /// collection mid-flight).
+    ///
+    /// The mutation is *in-memory only*. Persisting back to the on-disk
+    /// `environments/<name>.bru` happens through the M11.4.1 editor
+    /// surface — we keep that boundary clean so a single typo in a
+    /// post-response script doesn't corrupt the file on disk.
+    pub fn replace_environment_vars(
+        &mut self,
+        name: &str,
+        vars: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), UnknownEnvironment> {
+        match self
+            .collection
+            .environments
+            .iter_mut()
+            .find(|env| env.name == name)
+        {
+            Some(env) => {
+                env.vars = vars;
+                Ok(())
+            }
+            None => Err(UnknownEnvironment {
+                name: name.to_string(),
+            }),
+        }
+    }
+
     /// Per-request run state for the selected request.
     pub fn selected_run(&self) -> Option<&RequestRun> {
         self.selected.and_then(|index| self.runs.get(index))
@@ -814,6 +845,36 @@ mod tests {
         ));
         view.switch_environment(None).unwrap();
         assert_eq!(view.active_environment_name(), None);
+    }
+
+    #[test]
+    fn replace_environment_vars_swaps_the_named_env_in_place() {
+        let mut view = HttpView::new(collection_with(
+            vec![request("a", "https://a")],
+            vec![env("dev", &[("base", "https://old")])],
+        ));
+        let mut new_vars = std::collections::BTreeMap::new();
+        new_vars.insert("base".into(), "https://new".into());
+        new_vars.insert("token".into(), "fresh".into());
+        view.replace_environment_vars("dev", new_vars).unwrap();
+        let env = view.active_environment().expect("env");
+        assert_eq!(
+            env.vars.get("base").map(String::as_str),
+            Some("https://new")
+        );
+        assert_eq!(env.vars.get("token").map(String::as_str), Some("fresh"));
+    }
+
+    #[test]
+    fn replace_environment_vars_errors_on_unknown_name() {
+        let mut view = HttpView::new(collection_with(
+            vec![request("a", "https://a")],
+            vec![env("dev", &[])],
+        ));
+        let err = view
+            .replace_environment_vars("staging", Default::default())
+            .unwrap_err();
+        assert_eq!(err.name, "staging");
     }
 
     #[test]

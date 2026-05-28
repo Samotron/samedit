@@ -215,6 +215,15 @@ struct HttpInFlight {
     cancel: cockpit_http::CancelHandle,
     /// Logged for the status bar so the user sees what's still pending.
     summary: cockpit_ui::http::SentSummary,
+    /// `script:lua-post-response` body to run when the engine succeeds.
+    /// Captured at send-time so a mid-flight selection change can't
+    /// silently swap which script runs against this response.
+    /// v0.11 M11.6.2.
+    post_script: Option<String>,
+    /// Name of the environment whose vars the post-response script may
+    /// mutate via `cockpit.http.set_var`. `None` ⇒ no active env at
+    /// send time; mutations land in a discarded scratch map.
+    post_script_env: Option<String>,
 }
 
 /// What an in-flight LSP request was asking for, so its [`Response`] can be
@@ -4069,6 +4078,15 @@ impl AppModel {
                     rx,
                     cancel,
                     summary,
+                    post_script: if self.http_scripts_granted {
+                        request.post_script.clone()
+                    } else {
+                        None
+                    },
+                    post_script_env: self
+                        .http
+                        .as_ref()
+                        .and_then(|view| view.active_environment_name().map(str::to_string)),
                 });
             }
             Err(err) => {
@@ -4109,26 +4127,79 @@ impl AppModel {
                 return;
             }
         };
-        let summary = self.http_in_flight.take().map(|p| p.summary);
+        // Drain everything we captured at send-time *before* we let the
+        // view see the result — that way the post-script runs against
+        // the response the engine returned, not whatever the user might
+        // select while we're mid-tick.
+        let pending = self.http_in_flight.take().expect("guarded above");
+        let HttpInFlight {
+            summary,
+            post_script,
+            post_script_env,
+            ..
+        } = pending;
         if let Some(view) = self.http.as_mut() {
             view.apply_result(result.clone());
         }
+        let mut post_script_status: Option<String> = None;
+        if let Ok(response) = &result
+            && let Some(source) = post_script.as_deref()
+        {
+            post_script_status = self.run_post_script(source, response, post_script_env.as_deref());
+        }
         self.status = match (&summary, &result) {
-            (Some(summary), Ok(response)) => format!(
-                "Http: {} {} → {} in {} ms",
-                summary.method.block_name().to_uppercase(),
-                summary.url,
-                response.status,
-                response.elapsed.as_millis()
-            ),
-            (Some(summary), Err(err)) => format!(
+            (summary, Ok(response)) => {
+                let base = format!(
+                    "Http: {} {} → {} in {} ms",
+                    summary.method.block_name().to_uppercase(),
+                    summary.url,
+                    response.status,
+                    response.elapsed.as_millis()
+                );
+                match post_script_status {
+                    Some(extra) => format!("{base} ({extra})"),
+                    None => base,
+                }
+            }
+            (summary, Err(err)) => format!(
                 "Http: {} {} failed — {err}",
                 summary.method.block_name().to_uppercase(),
                 summary.url
             ),
-            (None, Ok(response)) => format!("Http: response {} arrived.", response.status),
-            (None, Err(err)) => format!("Http: send failed — {err}"),
         };
+    }
+
+    /// Run a captured `script:lua-post-response` against `response`,
+    /// mutating the env named `env_name` (if any) on the view in place.
+    /// Returns a short status suffix on failure / success so the caller
+    /// can append it to the round-trip message. v0.11 M11.6.2.
+    fn run_post_script(
+        &mut self,
+        source: &str,
+        response: &cockpit_http::Response,
+        env_name: Option<&str>,
+    ) -> Option<String> {
+        let mut env_vars = self
+            .http
+            .as_ref()
+            .and_then(|view| view.active_environment().map(|env| env.vars.clone()))
+            .unwrap_or_default();
+        let response_view = cockpit_lua::ScriptResponseView {
+            status: response.status,
+            headers: response.headers.clone(),
+            body: response.body.clone(),
+        };
+        if let Err(err) = cockpit_lua::run_post_response(source, &response_view, &mut env_vars) {
+            tracing::warn!(error = %err, "post-response script failed");
+            return Some(format!("post-script failed: {err}"));
+        }
+        if let (Some(name), Some(view)) = (env_name, self.http.as_mut())
+            && let Err(err) = view.replace_environment_vars(name, env_vars)
+        {
+            tracing::warn!(error = %err, "post-script env write-back failed");
+            return Some(format!("post-script env update failed: {err}"));
+        }
+        Some("post-script ran".to_string())
     }
 
     /// `Http: Switch Environment` (v0.11 M11.5.2). Opens the palette
@@ -9811,6 +9882,139 @@ format_on_save = true
                 .any(|(k, _)| k.eq_ignore_ascii_case("X-Token")),
             "headers should not contain X-Token: {:?}",
             sent[0].headers
+        );
+    }
+
+    #[test]
+    fn http_send_request_runs_post_script_and_writes_env_back() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 201,
+            headers: vec![("X-New-Token".into(), "fresh".into())],
+            body: b"{\"id\":42}".to_vec(),
+            elapsed: std::time::Duration::from_millis(3),
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        model.http_scripts_granted = true;
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Post;
+                req.url = "https://api.test/users".into();
+                req.post_script = Some(
+                    "local r = cockpit.http.response(); \
+                     cockpit.http.set_var('last_status', tostring(r.status)); \
+                     cockpit.http.set_var('last_token', r.headers[1].value)"
+                        .into(),
+                );
+                req
+            }],
+            environments: vec![cockpit_http::Environment {
+                name: "dev".into(),
+                vars: Default::default(),
+            }],
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        // Status reports the post-script ran.
+        assert!(
+            model.status.contains("post-script ran"),
+            "status = {}",
+            model.status
+        );
+        // Env mutation landed back on the active environment so the
+        // next send picks up the new value.
+        let env = model
+            .http
+            .as_ref()
+            .unwrap()
+            .active_environment()
+            .expect("env");
+        assert_eq!(env.vars.get("last_status").map(String::as_str), Some("201"));
+        assert_eq!(
+            env.vars.get("last_token").map(String::as_str),
+            Some("fresh")
+        );
+    }
+
+    #[test]
+    fn http_send_request_post_script_failure_surfaces_in_status() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        model.http_scripts_granted = true;
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.post_script = Some("error('explode')".into());
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        assert!(
+            model.status.contains("post-script failed"),
+            "status = {}",
+            model.status
+        );
+        // The Ok response still lands on the view; only the script failed.
+        let run = model.http.as_ref().unwrap().selected_run().unwrap();
+        assert_eq!(run.status, cockpit_ui::http::SendStatus::Ok);
+    }
+
+    #[test]
+    fn http_send_request_skips_post_script_when_capability_not_granted() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        // http_scripts_granted stays false.
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.post_script = Some("error('would explode but skipped')".into());
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        assert!(
+            !model.status.contains("post-script"),
+            "post-script should not have run: {}",
+            model.status
         );
     }
 
