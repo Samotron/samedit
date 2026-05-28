@@ -32,6 +32,11 @@ pub enum KnownFormatter {
     Black,
     /// SQL formatter; pairs with `sqls` (LSP) from M4.8.
     Sqlfluff,
+    /// `goimports` — preferred Go formatter; rewrites imports and formats
+    /// (a strict superset of `gofmt`).
+    Goimports,
+    /// Go's standard formatter; bundled with every Go toolchain.
+    Gofmt,
 }
 
 impl KnownFormatter {
@@ -43,6 +48,8 @@ impl KnownFormatter {
             Self::Ruff => "ruff",
             Self::Black => "black",
             Self::Sqlfluff => "sqlfluff",
+            Self::Goimports => "goimports",
+            Self::Gofmt => "gofmt",
         }
     }
 
@@ -62,6 +69,7 @@ impl KnownFormatter {
             }
             "python" => &[KnownFormatter::Ruff, KnownFormatter::Black],
             "sql" => &[KnownFormatter::Sqlfluff],
+            "go" => &[KnownFormatter::Goimports, KnownFormatter::Gofmt],
             _ => &[],
         }
     }
@@ -77,6 +85,8 @@ impl KnownFormatter {
             Self::Ruff => "ruff format \"$1\"",
             Self::Black => "black \"$1\"",
             Self::Sqlfluff => "sqlfluff format \"$1\"",
+            Self::Goimports => "goimports -w \"$1\"",
+            Self::Gofmt => "gofmt -w \"$1\"",
         }
     }
 }
@@ -420,6 +430,35 @@ mod tests {
     }
 
     #[test]
+    fn go_prefers_goimports_then_gofmt() {
+        let goimports_only = plan_format(
+            &MiseProject::default(),
+            Some("go"),
+            &FixedBinaryLookup::new(["goimports", "gofmt"]),
+        );
+        assert!(matches!(
+            goimports_only,
+            FormatPlan::SuggestMiseTask {
+                formatter: KnownFormatter::Goimports,
+                ..
+            }
+        ));
+
+        let gofmt_only = plan_format(
+            &MiseProject::default(),
+            Some("go"),
+            &FixedBinaryLookup::new(["gofmt"]),
+        );
+        assert!(matches!(
+            gofmt_only,
+            FormatPlan::SuggestMiseTask {
+                formatter: KnownFormatter::Gofmt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn format_task_snippet_is_valid_toml_for_typical_run_lines() {
         for formatter in [
             KnownFormatter::Rustfmt,
@@ -427,6 +466,8 @@ mod tests {
             KnownFormatter::Ruff,
             KnownFormatter::Black,
             KnownFormatter::Sqlfluff,
+            KnownFormatter::Goimports,
+            KnownFormatter::Gofmt,
         ] {
             let snippet = render_format_task_snippet(formatter.default_run());
             let parsed: toml::Value = toml::from_str(&snippet).expect("snippet must be valid TOML");

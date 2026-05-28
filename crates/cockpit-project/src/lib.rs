@@ -466,6 +466,7 @@ pub const DEFAULT_IGNORES: &[&str] = &[
     "build",
     ".venv",
     "__pycache__",
+    "vendor",
 ];
 
 /// A lazy project file tree.
@@ -929,6 +930,25 @@ cockpit_layout = ".config/cockpit/dev.kdl"
 
         let project = detect_project(tempdir.path()).unwrap();
         assert_eq!(project.strongest_signal, Some(ProjectSignalKind::Rust));
+        assert!(!project.mise.detected);
+    }
+
+    #[test]
+    fn detects_go_module_as_go_project() {
+        let root = workspace_root().join("tests/fixtures/go-basic");
+        let project = detect_project(&root).unwrap();
+
+        assert!(project.detected());
+        assert_eq!(project.strongest_signal, Some(ProjectSignalKind::Go));
+        assert!(
+            project
+                .signals
+                .iter()
+                .any(|signal| signal.kind == ProjectSignalKind::Go
+                    && signal.path.ends_with("go.mod")),
+            "go.mod signal missing from {:?}",
+            project.signals,
+        );
         assert!(!project.mise.detected);
     }
 

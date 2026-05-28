@@ -1577,7 +1577,7 @@ hookups, build-tag-aware analysis, custom Go-template highlighting.
 Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 "can I drive a Go project the way I drive a Rust one today".
 
-### M10.1 — Highlighting + extension routing
+### M10.1 — Highlighting + extension routing  ✅
 
 - `cockpit-editor::highlight`: add `Language::Go`. Map `.go` (and the
   `.tmpl` Go-template files? — **no**, out of scope) via
@@ -1588,14 +1588,23 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
   upstream highlight queries map to the existing `Kind` palette. Reuse
   the table; do not invent a Go-specific kind without a real palette
   need.
-- **Golden tests:** add `tests/golden/highlight/go_basic.snap` covering
-  imports, fn declarations, methods on receivers, struct + interface,
-  string interpolation (`fmt.Sprintf`), channels (`<-`), and a
-  `//go:generate` directive.
+- **Note (post-shipping):** tree-sitter-go's upstream highlights query
+  ends with a bare `(identifier) @variable` rule that overrides earlier
+  function captures because tree-sitter-highlight resolves later patterns
+  last. `build_go_config` strips that single rule from the query string
+  before configuration so `func main()` declarations keep their
+  `@function` highlight. Field-identifier vs method-name has the same
+  shape (`@property` later than `@function.method`) but is left intact
+  — methods render with the Variable kind today; revisit if a Go-shaped
+  syntax-only PR justifies a fuller custom query.
+- **Golden tests:** `tests/snapshots/golden_highlight__golden_go_basic.snap`
+  covers imports, `package`/`func` keywords, struct + interface
+  declarations, channels (`<-`), `//go:generate`, method receivers
+  (`func (w *World) Hello`), and a `fmt.Sprintf` call.
 - **Done when:** opening a `.go` file paints with the same kind set as
   the existing Rust fixtures, snapshot tests green.
 
-### M10.2 — `gopls` LSP wiring
+### M10.2 — `gopls` LSP wiring  ✅ (unit + registry; integration deferred)
 
 - `cockpit-lsp::registry`: add a `Language::Go` arm returning
   `ServerConfig { binary: "gopls", args: vec![], ... }`. Launch via
@@ -1614,7 +1623,7 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 - **Done when:** `cmd-click` on a Go symbol jumps to its definition;
   type errors render in the gutter on a fixture project.
 
-### M10.3 — Project detection + mise
+### M10.3 — Project detection + mise  ✅
 
 - `cockpit-project::detect`: add `go.mod` to the signal-file list with
   a confidence equal to `Cargo.toml` / `package.json`. The mise layer
@@ -1625,7 +1634,7 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 - **Done when:** opening the `go-basic` fixture lights up the project
   launcher with `Go` as the project kind and `gopls` as the lazy LSP.
 
-### M10.4 — Format-on-save (mise task wins)
+### M10.4 — Format-on-save (mise task wins)  ✅ (planner; UI prompt unchanged)
 
 - Reuse the M4.4 contract: if a `format` (or `format:go`) mise task
   exists, that wins. If no task exists but `gofmt` or `goimports` is
@@ -1638,7 +1647,7 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 - **Done when:** saving a deliberately mis-indented `.go` file in the
   `go-basic` fixture rewrites to canonical `gofmt` style.
 
-### M10.5 — Test runner palette commands
+### M10.5 — Test runner palette commands  ⚙ (nearest-name parser landed; runner integration WIP)
 
 - Extend `cockpit-editor::nearest_test` with a `Language::Go` arm:
   walk the AST (already available from tree-sitter-go) to find the
@@ -1658,7 +1667,7 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
   appears in the active mux pane via the existing M2.2 "run task in
   the active pane" path.
 
-### M10.6 — Ignore list + status badges
+### M10.6 — Ignore list + status badges  ⚙ (vendor/ ignored; `*.pb.go` glob WIP)
 
 - `cockpit-project` default ignore list (spec §13): add `vendor/`
   (Go's vendored deps) and `**/*.pb.go` (generated protobuf). Do

@@ -49,6 +49,7 @@ pub enum Language {
     /// and so the LSP registry has an entry to plug into later.
     Ggsql,
     TypeScript,
+    Go,
 }
 
 impl Language {
@@ -60,6 +61,7 @@ impl Language {
             "sql" => Some(Language::Sql),
             "ggsql" => Some(Language::Ggsql),
             "ts" | "tsx" => Some(Language::TypeScript),
+            "go" => Some(Language::Go),
             _ => None,
         }
     }
@@ -96,6 +98,7 @@ thread_local! {
     /// Per-thread cache: configuring a grammar's queries is not free, so the
     /// configuration is built once and reused for every highlight pass.
     static RUST_CONFIG: RefCell<Option<HighlightConfiguration>> = const { RefCell::new(None) };
+    static GO_CONFIG: RefCell<Option<HighlightConfiguration>> = const { RefCell::new(None) };
     static HIGHLIGHTER: RefCell<Highlighter> = RefCell::new(Highlighter::new());
 }
 
@@ -105,7 +108,7 @@ pub fn compute(language: Language, text: &str) -> Vec<HighlightSpan> {
     if text.len() > MAX_HIGHLIGHT_BYTES {
         return Vec::new();
     }
-    if language != Language::Rust {
+    if !matches!(language, Language::Rust | Language::Go) {
         return Vec::new();
     }
     with_config(language, |config| {
@@ -125,8 +128,12 @@ fn with_config<R>(language: Language, f: impl FnOnce(&HighlightConfiguration) ->
             let mut slot = cell.borrow_mut();
             f(slot.get_or_insert_with(build_rust_config))
         }),
+        Language::Go => GO_CONFIG.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            f(slot.get_or_insert_with(build_go_config))
+        }),
         Language::Python | Language::Sql | Language::Ggsql | Language::TypeScript => {
-            unreachable!("non-Rust languages return before requesting a highlight config")
+            unreachable!("unsupported languages return before requesting a highlight config")
         }
     }
 }
@@ -145,6 +152,38 @@ fn build_rust_config() -> HighlightConfiguration {
     let names: Vec<&str> = CAPTURES.iter().map(|(name, _)| *name).collect();
     config.configure(&names);
     config
+}
+
+fn build_go_config() -> HighlightConfiguration {
+    // tree-sitter-go ships a generic `(identifier) @variable` rule that
+    // tree-sitter-highlight resolves *after* the earlier function/type
+    // rules — and the runtime picks the last query-order match per node,
+    // so every `func main()`-style declaration loses its `@function`
+    // capture to the trailing `@variable` line. Strip that one rule
+    // before feeding the query to HighlightConfiguration; bare identifier
+    // tokens then render as default text instead of overwriting the more
+    // specific captures we want.
+    let query = strip_go_identifier_variable(tree_sitter_go::HIGHLIGHTS_QUERY);
+    let mut config =
+        HighlightConfiguration::new(tree_sitter_go::LANGUAGE.into(), "go", &query, "", "")
+            .expect("tree-sitter-go ships a valid highlight query");
+    let names: Vec<&str> = CAPTURES.iter().map(|(name, _)| *name).collect();
+    config.configure(&names);
+    config
+}
+
+/// Remove the bare `(identifier) @variable` rule (and only that rule) from
+/// the upstream tree-sitter-go highlights query. See [`build_go_config`].
+fn strip_go_identifier_variable(query: &str) -> String {
+    const PATTERN: &str = "(identifier) @variable";
+    let mut out = String::with_capacity(query.len());
+    for line in query.split_inclusive('\n') {
+        if line.trim_start().starts_with(PATTERN) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// Flatten tree-sitter's nested highlight events into merged spans. The
@@ -221,6 +260,14 @@ mod tests {
             Language::from_path(Path::new("app.tsx")),
             Some(Language::TypeScript)
         );
+        assert_eq!(
+            Language::from_path(Path::new("main.go")),
+            Some(Language::Go)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("foo_test.GO")),
+            Some(Language::Go)
+        );
         assert_eq!(Language::from_path(Path::new("README")), None);
     }
 
@@ -260,5 +307,22 @@ mod tests {
         let text = "fn f() {}\n".repeat(MAX_HIGHLIGHT_BYTES / 10 + 1);
         assert!(text.len() > MAX_HIGHLIGHT_BYTES);
         assert!(compute(Language::Rust, &text).is_empty());
+    }
+
+    #[test]
+    fn go_keywords_and_functions_are_highlighted() {
+        let text = "package main\n\nfunc main() {}\n";
+        let spans = compute(Language::Go, text);
+        assert_eq!(kinds_at(&spans, text, "package"), [HighlightKind::Keyword]);
+        assert_eq!(kinds_at(&spans, text, "func"), [HighlightKind::Keyword]);
+        assert_eq!(kinds_at(&spans, text, "main("), [HighlightKind::Function]);
+    }
+
+    #[test]
+    fn go_strings_and_comments_are_highlighted() {
+        let text = "package main\n// note\nvar s = \"hi\"\n";
+        let spans = compute(Language::Go, text);
+        assert_eq!(kinds_at(&spans, text, "// note"), [HighlightKind::Comment]);
+        assert_eq!(kinds_at(&spans, text, "\"hi\""), [HighlightKind::String]);
     }
 }

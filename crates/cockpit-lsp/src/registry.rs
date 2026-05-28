@@ -45,6 +45,11 @@ impl ServerConfig {
                 command: "typescript-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
             }),
+            Language::Go => Some(Self {
+                language,
+                command: "gopls".to_string(),
+                args: Vec::new(),
+            }),
             // ggsql has no dedicated language server yet (v0.5 M5.5a) —
             // notebook cells fall back to sqls when they need schema
             // intelligence, since ggsql wraps DuckDB anyway.
@@ -61,6 +66,7 @@ impl ServerConfig {
             Language::Sql => "sql",
             Language::Ggsql => "ggsql",
             Language::TypeScript => "typescript",
+            Language::Go => "go",
         }
     }
 }
@@ -102,5 +108,14 @@ mod tests {
             assert_eq!(config.args, args);
             assert_eq!(config.language_id(), language_id);
         }
+    }
+
+    #[test]
+    fn go_resolves_to_gopls() {
+        let config = ServerConfig::for_language(Language::Go).expect("go has a server");
+        assert_eq!(config.language, Language::Go);
+        assert_eq!(config.command, "gopls");
+        assert!(config.args.is_empty());
+        assert_eq!(config.language_id(), "go");
     }
 }

@@ -9,6 +9,7 @@ description = "Rope buffer, cursor, undo, and Vim state machine for Coding Cockp
 [dependencies]
 ropey = "1.6.1"
 tree-sitter = "0.26.9"
+tree-sitter-go = "0.25.0"
 tree-sitter-highlight = "0.26.9"
 tree-sitter-rust = "0.24.2"
 
