@@ -4,8 +4,9 @@
 //! backwards from the cursor through the buffer and reports the first function
 //! declaration it finds. Pure, language-aware, and headless-testable.
 //!
-//! Currently implemented for Rust (`fn <name>(...)`). Returns `None` for
-//! unknown languages or when no function is in scope before the cursor.
+//! Implemented for Rust (`fn <name>(...)`) and Go (`func TestXxx(...)`,
+//! `func (recv T) TestXxx(...)`). Returns `None` for unknown languages or
+//! when no function is in scope before the cursor.
 
 use crate::buffer::Buffer;
 use crate::highlight::Language;
@@ -18,9 +19,11 @@ pub fn nearest_test_name(
     cursor_byte: usize,
     language: Option<Language>,
 ) -> Option<String> {
-    if language != Some(Language::Rust) {
-        return None;
-    }
+    let parser = match language? {
+        Language::Rust => parse_rust_fn_name,
+        Language::Go => parse_go_fn_name,
+        _ => return None,
+    };
     let text = buffer.text();
     let cursor_byte = cursor_byte.min(text.len());
     // Include the rest of the cursor's line so a cursor inside the `fn` line
@@ -30,7 +33,7 @@ pub fn nearest_test_name(
         .map(|offset| cursor_byte + offset)
         .unwrap_or(text.len());
 
-    text[..line_end].lines().rev().find_map(parse_rust_fn_name)
+    text[..line_end].lines().rev().find_map(parser)
 }
 
 fn parse_rust_fn_name(line: &str) -> Option<String> {
@@ -64,6 +67,28 @@ fn strip_fn_modifiers(line: &str) -> &str {
             None => return current,
         }
     }
+}
+
+/// Parse a Go `func` declaration line and return the function name. Handles
+/// both free functions (`func TestFoo(t *testing.T) {`) and method receivers
+/// (`func (s *Server) TestFoo(t *testing.T) {`).
+fn parse_go_fn_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let after_func = trimmed.strip_prefix("func ")?;
+    // Skip an optional method receiver like `(s *Server) `.
+    let after_receiver = if after_func.starts_with('(') {
+        let close = after_func.find(')')?;
+        after_func[close + 1..].trim_start()
+    } else {
+        after_func
+    };
+    let end = after_receiver
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(after_receiver.len());
+    if end == 0 {
+        return None;
+    }
+    Some(after_receiver[..end].to_string())
 }
 
 #[cfg(test)]
@@ -169,6 +194,55 @@ mod tests {
         assert_eq!(
             nearest_test_name(&buffer, cursor, Some(Language::Rust)),
             Some("real".to_string()),
+        );
+    }
+
+    const GO_SOURCE: &str = r#"package widgets
+
+import "testing"
+
+func TestAlpha(t *testing.T) {
+    if 1 != 1 {
+        t.Fatal("nope")
+    }
+}
+
+func (s *Server) TestBeta(t *testing.T) {
+    t.Log("ok")
+}
+
+func helper() int {
+    return 7
+}
+"#;
+
+    #[test]
+    fn go_finds_test_function_containing_cursor() {
+        let buffer = buffer(GO_SOURCE);
+        let cursor = byte_offset_of(GO_SOURCE, "t.Fatal(\"nope\")");
+        assert_eq!(
+            nearest_test_name(&buffer, cursor, Some(Language::Go)),
+            Some("TestAlpha".to_string()),
+        );
+    }
+
+    #[test]
+    fn go_strips_method_receiver() {
+        let buffer = buffer(GO_SOURCE);
+        let cursor = byte_offset_of(GO_SOURCE, "t.Log(\"ok\")");
+        assert_eq!(
+            nearest_test_name(&buffer, cursor, Some(Language::Go)),
+            Some("TestBeta".to_string()),
+        );
+    }
+
+    #[test]
+    fn go_finds_helper_below_tests() {
+        let buffer = buffer(GO_SOURCE);
+        let cursor = byte_offset_of(GO_SOURCE, "return 7");
+        assert_eq!(
+            nearest_test_name(&buffer, cursor, Some(Language::Go)),
+            Some("helper".to_string()),
         );
     }
 }

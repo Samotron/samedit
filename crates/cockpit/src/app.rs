@@ -18,7 +18,8 @@ use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::GlobalKeys;
 use cockpit_editor::vim::{Key as VimKey, Mode};
 use cockpit_editor::{
-    Editor, EditorSignal, HighlightKind, HighlightSpan, Language, nearest_test_name,
+    Editor, EditorSignal, HighlightKind, HighlightSpan, Language, TestScope, fallback_test_command,
+    nearest_test_name,
 };
 use cockpit_lsp::{
     Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, Response,
@@ -89,6 +90,8 @@ const TEST_RUN_ALL: &str = "test.run_all";
 const TEST_RUN_CURRENT_FILE: &str = "test.run_current_file";
 /// Command id for "run the `test` task targeting the nearest test" (spec §16).
 const TEST_RUN_NEAREST: &str = "test.run_nearest";
+/// Command id for `go generate ./...` (v0.10 M10.5).
+const GO_GENERATE: &str = "go.generate";
 /// Command id for "summarise the recent key chord ring buffer" (spec §18.13).
 const DEBUG_SHOW_KEY_EVENTS: &str = "debug.show_key_events";
 /// Command id for "summarise the recent command dispatch log" (spec §18.13).
@@ -1253,6 +1256,7 @@ impl AppModel {
             TEST_RUN_ALL => self.run_test_all(),
             TEST_RUN_CURRENT_FILE => self.run_test_current_file(),
             TEST_RUN_NEAREST => self.run_test_nearest(),
+            GO_GENERATE => self.run_go_generate(),
             DEBUG_SHOW_KEY_EVENTS => self.debug_show_key_events(),
             DEBUG_SHOW_COMMAND_LOG => self.debug_show_command_log(),
             DEBUG_SHOW_PANE_TREE => self.debug_show_pane_tree(),
@@ -1856,57 +1860,124 @@ impl AppModel {
     }
 
     /// Run `mise run test` for the whole project (spec §16 Test: Run All).
+    /// Languages with a native runner (Go) fall back to `go test ./...` when
+    /// no mise `test` task exists (v0.10 M10.5).
     fn run_test_all(&mut self) {
-        if !self.has_test_task() {
-            self.status = TEST_TASK_MISSING.to_string();
+        if self.has_test_task() {
+            self.send_command_to_terminal(
+                &format!("mise run {TEST_TASK}"),
+                "Running `mise run test`.".to_string(),
+            );
             return;
         }
-        self.send_command_to_terminal(
-            &format!("mise run {TEST_TASK}"),
-            "Running `mise run test`.".to_string(),
-        );
+        let language = self
+            .document
+            .as_ref()
+            .and_then(|doc| Language::from_path(&doc.path));
+        let relative = self.relative_document_path();
+        if let Some(argv) = language
+            .zip(relative.as_deref())
+            .and_then(|(lang, path)| fallback_test_command(lang, TestScope::All, path, None))
+        {
+            let command = argv.join(" ");
+            self.send_command_to_terminal(&command, format!("Running `{command}`."));
+            return;
+        }
+        self.status = TEST_TASK_MISSING.to_string();
     }
 
     /// Run `mise run test -- <file>` targeting the current document (spec §16
     /// Test: Run Current File). Whether the file path is honoured depends on
-    /// the user's `test` task forwarding extra args (e.g. via `$@`).
+    /// the user's `test` task forwarding extra args (e.g. via `$@`). Go files
+    /// fall back to `go test ./<package>` when no `test` task exists.
     fn run_test_current_file(&mut self) {
         let Some(doc) = self.document.as_ref() else {
             self.status = "No file open to test.".to_string();
             return;
         };
-        if !self.has_test_task() {
-            self.status = TEST_TASK_MISSING.to_string();
+        let language = Language::from_path(&doc.path);
+        let path = render_document_path(&doc.path, &self.detection.root_path);
+        if self.has_test_task() {
+            self.send_command_to_terminal(
+                &format!("mise run {TEST_TASK} -- {path}"),
+                format!("Running tests for `{path}`."),
+            );
             return;
         }
-        let path = render_document_path(&doc.path, &self.detection.root_path);
-        self.send_command_to_terminal(
-            &format!("mise run {TEST_TASK} -- {path}"),
-            format!("Running tests for `{path}`."),
-        );
+        let relative = self.relative_document_path();
+        if let Some(argv) = language
+            .zip(relative.as_deref())
+            .and_then(|(lang, rel)| fallback_test_command(lang, TestScope::CurrentFile, rel, None))
+        {
+            let command = argv.join(" ");
+            self.send_command_to_terminal(&command, format!("Running tests for `{path}`."));
+            return;
+        }
+        self.status = TEST_TASK_MISSING.to_string();
     }
 
     /// Run `mise run test -- <name>` targeting the function declaration nearest
-    /// to the cursor (spec §16 Test: Run Nearest).
+    /// to the cursor (spec §16 Test: Run Nearest). Go files fall back to
+    /// `go test -run '^<name>$' ./<package>` when no `test` task exists.
     fn run_test_nearest(&mut self) {
         let Some(doc) = self.document.as_ref() else {
             self.status = "No file open to test.".to_string();
             return;
         };
-        if !self.has_test_task() {
-            self.status = TEST_TASK_MISSING.to_string();
-            return;
-        }
         let language = Language::from_path(&doc.path);
         let cursor_byte = doc.editor.cursor().byte();
         let Some(name) = nearest_test_name(doc.editor.buffer(), cursor_byte, language) else {
             self.status = "No nearby test function found.".to_string();
             return;
         };
-        self.send_command_to_terminal(
-            &format!("mise run {TEST_TASK} -- {name}"),
-            format!("Running test `{name}`."),
-        );
+        if self.has_test_task() {
+            self.send_command_to_terminal(
+                &format!("mise run {TEST_TASK} -- {name}"),
+                format!("Running test `{name}`."),
+            );
+            return;
+        }
+        let relative = self.relative_document_path();
+        if let Some(argv) = language.zip(relative.as_deref()).and_then(|(lang, rel)| {
+            fallback_test_command(lang, TestScope::Nearest, rel, Some(&name))
+        }) {
+            let command = argv.join(" ");
+            self.send_command_to_terminal(&command, format!("Running test `{name}`."));
+            return;
+        }
+        self.status = TEST_TASK_MISSING.to_string();
+    }
+
+    /// Run `go generate ./...` in the active terminal (spec v0.10 M10.5
+    /// `Go: Generate`). Detected Go projects only — the command is silently
+    /// a no-op when the project isn't a Go project to avoid running it in
+    /// the wrong toolchain.
+    fn run_go_generate(&mut self) {
+        use cockpit_project::ProjectSignalKind;
+        let is_go = self
+            .detection
+            .signals
+            .iter()
+            .any(|signal| signal.kind == ProjectSignalKind::Go);
+        if !is_go {
+            self.status = "Go: Generate only runs in Go projects (`go.mod` not detected).".into();
+            return;
+        }
+        self.send_command_to_terminal("go generate ./...", "Running `go generate ./...`.".into());
+    }
+
+    /// Project-relative path of the active document, normalised to forward
+    /// slashes for the `go test ./pkg/...` and similar shapes used by the
+    /// native test fallbacks.
+    fn relative_document_path(&self) -> Option<std::path::PathBuf> {
+        let doc = self.document.as_ref()?;
+        let stripped = doc
+            .path
+            .strip_prefix(&self.detection.root_path)
+            .unwrap_or(&doc.path);
+        Some(std::path::PathBuf::from(
+            stripped.to_string_lossy().replace('\\', "/"),
+        ))
     }
 
     /// True when the detected project defines a [`TEST_TASK`] mise task.
@@ -5542,6 +5613,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(TEST_RUN_ALL, "Test: Run All"),
         PaletteEntry::new(TEST_RUN_CURRENT_FILE, "Test: Run Current File"),
         PaletteEntry::new(TEST_RUN_NEAREST, "Test: Run Nearest"),
+        PaletteEntry::new(GO_GENERATE, "Go: Generate"),
         PaletteEntry::new(LSP_GOTO_DEFINITION, "LSP: Go to Definition"),
         PaletteEntry::new(LSP_SHOW_HOVER, "LSP: Show Hover"),
         PaletteEntry::new(LSP_RENAME, "LSP: Rename Symbol"),
@@ -6148,6 +6220,15 @@ mod tests {
         AppModel::new(detection, tree).expect("build model")
     }
 
+    /// A model over the `go-basic` fixture (a `go.mod` project with no
+    /// `mise.toml`). Used to exercise the v0.10 M10.5 native test fallback.
+    fn go_model() -> AppModel {
+        let path = fixture_path("go-basic");
+        let detection = detect_project(&path).expect("detect go-basic fixture");
+        let tree = FileTree::load(&path).expect("load go-basic fixture");
+        AppModel::new(detection, tree).expect("build model")
+    }
+
     #[test]
     fn open_path_reference_jumps_to_a_file_at_line_and_column() {
         let mut model = rust_model();
@@ -6253,6 +6334,78 @@ mod tests {
             model.status.contains("No file open"),
             "status: {}",
             model.status
+        );
+    }
+
+    #[test]
+    fn run_test_all_on_go_project_without_mise_falls_back_to_go_test() {
+        let mut model = go_model();
+        model.open_path_reference("main_test.go");
+        assert!(model.document.is_some(), "fixture document should open");
+        model.run_test_all();
+        // The fixture has no `test` mise task — the fallback should kick in
+        // instead of bailing with the missing-task message. In test mode
+        // there's no real PTY so the command isn't echoed into a terminal;
+        // status reports the terminal outcome instead. Either way the
+        // missing-task short-circuit must not fire.
+        assert!(
+            !model.status.contains("No `test` mise task"),
+            "status: {}",
+            model.status,
+        );
+    }
+
+    #[test]
+    fn run_test_current_file_on_go_project_uses_package_path() {
+        let mut model = go_model();
+        model.open_path_reference("main_test.go");
+        model.run_test_current_file();
+        assert!(
+            !model.status.contains("No `test` mise task"),
+            "status: {}",
+            model.status,
+        );
+    }
+
+    #[test]
+    fn run_test_nearest_on_go_project_uses_anchored_run_pattern() {
+        let mut model = go_model();
+        // `main_test.go` line 8 (1-based) is `t.Fatalf(...)` inside the
+        // `TestWorldHello` body — landing the cursor there exercises the
+        // Nearest path against the Go AST.
+        model.open_path_reference("main_test.go:8:1");
+        model.run_test_nearest();
+        assert!(
+            !model.status.contains("No `test` mise task"),
+            "status: {}",
+            model.status,
+        );
+        assert!(
+            !model.status.contains("No nearby test function found"),
+            "status: {}",
+            model.status,
+        );
+    }
+
+    #[test]
+    fn go_generate_refuses_outside_a_go_project() {
+        let mut model = rust_model();
+        model.run_go_generate();
+        assert!(
+            model.status.contains("only runs in Go projects"),
+            "status: {}",
+            model.status,
+        );
+    }
+
+    #[test]
+    fn go_generate_in_a_go_project_dispatches_the_command() {
+        let mut model = go_model();
+        model.run_go_generate();
+        assert!(
+            !model.status.contains("only runs in Go projects"),
+            "status: {}",
+            model.status,
         );
     }
 

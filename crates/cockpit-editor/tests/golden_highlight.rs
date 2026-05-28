@@ -10,7 +10,11 @@ use cockpit_editor::Language;
 use cockpit_editor::highlight::compute;
 
 fn snapshot(case: &str, source: &str) -> String {
-    let spans = compute(Language::Rust, source);
+    snapshot_with(Language::Rust, case, source)
+}
+
+fn snapshot_with(language: Language, case: &str, source: &str) -> String {
+    let spans = compute(language, source);
     let mut out = String::new();
     writeln!(out, "case:   {case}").unwrap();
     writeln!(out, "source: {source:?}").unwrap();
@@ -57,4 +61,39 @@ fn golden_attribute_and_macro() {
         "attribute_and_macro",
         "#[derive(Debug)]\nstruct S;\nfn f() { println!(\"hi\"); }\n"
     ));
+}
+
+#[test]
+fn golden_go_basic() {
+    let source = concat!(
+        "// Package main greets the world.\n",
+        "package main\n",
+        "\n",
+        "import \"fmt\"\n",
+        "\n",
+        "//go:generate stringer -type=Color\n",
+        "type Color int\n",
+        "\n",
+        "type Greeter interface {\n",
+        "\tHello() string\n",
+        "}\n",
+        "\n",
+        "type World struct {\n",
+        "\tName string\n",
+        "}\n",
+        "\n",
+        "func (w *World) Hello() string {\n",
+        "\treturn fmt.Sprintf(\"hello %s\", w.Name)\n",
+        "}\n",
+        "\n",
+        "func pump(ch chan<- int) {\n",
+        "\tch <- 1\n",
+        "}\n",
+        "\n",
+        "func main() {\n",
+        "\tw := &World{Name: \"world\"}\n",
+        "\tfmt.Println(w.Hello())\n",
+        "}\n",
+    );
+    insta::assert_snapshot!(snapshot_with(Language::Go, "go_basic", source));
 }

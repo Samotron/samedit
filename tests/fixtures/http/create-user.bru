@@ -1,0 +1,27 @@
+meta {
+  name: Create User
+  type: http
+  seq: 2
+}
+
+post {
+  url: https://api.example.com/users
+  body: json
+  auth: basic
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "alice",
+    "email": "alice@example.com"
+  }
+}
+
+auth:basic {
+  username: alice
+  password: hunter2
+}

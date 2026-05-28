@@ -1,0 +1,28 @@
+meta {
+  name: List Users
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://api.example.com/users
+  body: none
+  auth: bearer
+}
+
+headers {
+  Accept: application/json
+}
+
+query {
+  limit: 10
+  page: 2
+}
+
+auth:bearer {
+  token: {{authToken}}
+}
+
+docs {
+  Lists every user in the system.
+}

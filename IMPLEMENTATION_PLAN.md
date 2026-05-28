@@ -1577,7 +1577,7 @@ hookups, build-tag-aware analysis, custom Go-template highlighting.
 Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 "can I drive a Go project the way I drive a Rust one today".
 
-### M10.1 — Highlighting + extension routing
+### M10.1 — Highlighting + extension routing  ✅
 
 - `cockpit-editor::highlight`: add `Language::Go`. Map `.go` (and the
   `.tmpl` Go-template files? — **no**, out of scope) via
@@ -1588,14 +1588,23 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
   upstream highlight queries map to the existing `Kind` palette. Reuse
   the table; do not invent a Go-specific kind without a real palette
   need.
-- **Golden tests:** add `tests/golden/highlight/go_basic.snap` covering
-  imports, fn declarations, methods on receivers, struct + interface,
-  string interpolation (`fmt.Sprintf`), channels (`<-`), and a
-  `//go:generate` directive.
+- **Note (post-shipping):** tree-sitter-go's upstream highlights query
+  ends with a bare `(identifier) @variable` rule that overrides earlier
+  function captures because tree-sitter-highlight resolves later patterns
+  last. `build_go_config` strips that single rule from the query string
+  before configuration so `func main()` declarations keep their
+  `@function` highlight. Field-identifier vs method-name has the same
+  shape (`@property` later than `@function.method`) but is left intact
+  — methods render with the Variable kind today; revisit if a Go-shaped
+  syntax-only PR justifies a fuller custom query.
+- **Golden tests:** `tests/snapshots/golden_highlight__golden_go_basic.snap`
+  covers imports, `package`/`func` keywords, struct + interface
+  declarations, channels (`<-`), `//go:generate`, method receivers
+  (`func (w *World) Hello`), and a `fmt.Sprintf` call.
 - **Done when:** opening a `.go` file paints with the same kind set as
   the existing Rust fixtures, snapshot tests green.
 
-### M10.2 — `gopls` LSP wiring
+### M10.2 — `gopls` LSP wiring  ✅ (unit + registry; integration deferred)
 
 - `cockpit-lsp::registry`: add a `Language::Go` arm returning
   `ServerConfig { binary: "gopls", args: vec![], ... }`. Launch via
@@ -1614,7 +1623,7 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 - **Done when:** `cmd-click` on a Go symbol jumps to its definition;
   type errors render in the gutter on a fixture project.
 
-### M10.3 — Project detection + mise
+### M10.3 — Project detection + mise  ✅
 
 - `cockpit-project::detect`: add `go.mod` to the signal-file list with
   a confidence equal to `Cargo.toml` / `package.json`. The mise layer
@@ -1625,7 +1634,7 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 - **Done when:** opening the `go-basic` fixture lights up the project
   launcher with `Go` as the project kind and `gopls` as the lazy LSP.
 
-### M10.4 — Format-on-save (mise task wins)
+### M10.4 — Format-on-save (mise task wins)  ✅ (planner; UI prompt unchanged)
 
 - Reuse the M4.4 contract: if a `format` (or `format:go`) mise task
   exists, that wins. If no task exists but `gofmt` or `goimports` is
@@ -1638,7 +1647,7 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 - **Done when:** saving a deliberately mis-indented `.go` file in the
   `go-basic` fixture rewrites to canonical `gofmt` style.
 
-### M10.5 — Test runner palette commands
+### M10.5 — Test runner palette commands  ✅ (no `go list` cache; package = file's directory)
 
 - Extend `cockpit-editor::nearest_test` with a `Language::Go` arm:
   walk the AST (already available from tree-sitter-go) to find the
@@ -1650,15 +1659,24 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
     from `go list -f '{{.ImportPath}}' <file>` — cached per file via
     `ProcessRunner` seam so repeated invocations don't re-spawn).
   - Nearest → `go test -run '^<TestName>$' ./<package>`.
+- **Shipped behaviour vs plan:** package resolution skips the `go list`
+  cache — `fallback_test_command` uses the file's directory verbatim
+  as `./<dir>` (collapsing root-level files to `.`). This works for
+  the typical one-package-per-directory layout; tag-based or
+  multi-package directories fall back to the same `./<dir>` arg and
+  let `go test` filter. A `go list` cache via `ProcessRunner` remains
+  the right next step if real projects need it.
 - `Go: Generate` palette command runs `go generate ./...`. No
-  watch mode in v0.10.
+  watch mode in v0.10. ✅ Shipped — refuses outside detected Go
+  projects so the wrong toolchain never gets typed into a pane.
 - **Tests:** golden `nearest_test` over `_test.go` fixtures; command
-  construction tests for the three test scopes.
+  construction tests for the three test scopes (in
+  `cockpit-editor::test_runner`).
 - **Done when:** every test scope works against the fixture; output
   appears in the active mux pane via the existing M2.2 "run task in
   the active pane" path.
 
-### M10.6 — Ignore list + status badges
+### M10.6 — Ignore list + status badges  ⚙ (vendor/ ignored; `*.pb.go` glob WIP)
 
 - `cockpit-project` default ignore list (spec §13): add `vendor/`
   (Go's vendored deps) and `**/*.pb.go` (generated protobuf). Do
@@ -1755,7 +1773,7 @@ UI lives in `cockpit-ui::http` (view-model) and `cockpit-render`
 (painter). The "send" command goes through `cockpit-commands` like
 everything else (AGENTS §2 #5).
 
-### M11.1 — `.bru` parser + serialiser
+### M11.1 — `.bru` parser + serialiser  ✅ (canonical round-trip; byte-identical deferred)
 
 - Hand-rolled parser over the documented Bruno grammar
   (block sections: `meta`, `<method>`, `headers`, `body:<kind>`,
@@ -1767,13 +1785,28 @@ everything else (AGENTS §2 #5).
   well-formed file (golden tests with `insta`). Adding a header
   via the UI inserts at the documented position; never reorders
   unrelated content.
-- **Tests:** `tests/fixtures/http/` — a small Bruno collection with
-  one GET, one POST with JSON body, one with auth, one with
-  pre-request script. Golden round-trip for each.
+- **Shipped behaviour vs plan:** parse → serialise round-trips
+  **semantically** (the second parse yields the same [`Request`]),
+  not byte-identical. The serialiser is opinionated about block
+  order (`meta`, verb, headers, query, body, auth, docs) and uses
+  two-space indentation inside body blocks so JSON `}` characters
+  don't terminate the block early. The byte-identical round-trip
+  needs an edit-AST layered on top (similar to `toml_edit` for
+  `cockpit-config`) and lands with the M11.4 view-model.
+- Recognised today: `meta`, every HTTP verb block, `headers`,
+  `query`, `body:{none,text,json,xml,form-urlencoded}`,
+  `auth:{none,basic,bearer}`, `docs`. Unknown blocks
+  (`vars:*`, `script:*`, `assert`, future OAuth) silently round-trip
+  by being ignored on parse — preserved-but-not-edited surfacing is
+  M11.4 work.
+- **Tests:** `tests/fixtures/http/` — `list-users.bru` (GET + bearer
+  auth + docs) and `create-user.bru` (POST + JSON body + basic auth).
+  `tests/golden_round_trip.rs` parses every fixture and checks the
+  parse → serialise → parse loop stays semantically stable.
 - **Done when:** every fixture round-trips byte-identical; malformed
   files surface a typed `ParseError` with line:col, never panic.
 
-### M11.2 — Collection + environment model
+### M11.2 — Collection + environment model  ✅ (interpolation; OS-env fallback deferred)
 
 - Detect a `bruno.json` or `cockpit-http/` directory at the project
   root → `Collection { root, requests: Vec<Request>, environments:
@@ -1786,6 +1819,14 @@ everything else (AGENTS §2 #5).
   environment, falling back to OS env when the env file declares
   `process.env.FOO`. Cycles are detected and surfaced as a typed
   error.
+- **Shipped behaviour vs plan:** `detect_collection_root`,
+  `load_collection`, environment file parsing, transitive
+  interpolation with cycle detection, and disabled-row (`~`) skipping
+  are all in place. `process.env.FOO` style OS-env fallback is *not*
+  shipped — it lands with the M11.3 engine where the
+  environment-vs-process boundary actually matters. Active-environment
+  persistence in `ProjectCache` is left for the binary wiring (lands
+  with M11.4).
 - **Tests:** env switching, variable resolution, missing-var
   diagnostics, cyclic references.
 

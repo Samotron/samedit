@@ -90,6 +90,7 @@ samedit/                            # Cargo workspace root
 │   │                               #    seams (M4.10)
 │   ├── cockpit-mux/                # native multiplexer state (M7.2+)
 │   ├── cockpit-terminal/           # pty, termwiz engine, path detect
+│   ├── cockpit-http/               # Bruno-style .bru parser + model (v0.11)
 │   ├── cockpit-lsp/                # LSP transport — codec, JSON-RPC, client
 │   ├── cockpit-lua/                # sandboxed Lua 5.4 extension runtime (v0.9)
 │   ├── cockpit-commands/           # command registry + keybinding resolution
@@ -136,6 +137,7 @@ should never gain a window/GPU dependency.
 | Notebook cell parser / view-model        | `cockpit-notebook`       |
 | dbt-lite analytics (detect / DAG / build)| `cockpit-analytics`      |
 | Sandboxed Lua extensions (v0.9)          | `cockpit-lua`            |
+| `.bru` parser + HTTP collection model    | `cockpit-http`           |
 | Cold-start phase work (detect/tree/...)  | `cockpit::hydration`     |
 | Splash painter (uses Painter+Theme)      | `cockpit::splash`        |
 | Wiring crates together, CLI flags        | `cockpit` (binary)       |
