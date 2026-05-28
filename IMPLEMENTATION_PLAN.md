@@ -1830,37 +1830,43 @@ everything else (AGENTS §2 #5).
 - **Tests:** env switching, variable resolution, missing-var
   diagnostics, cyclic references.
 
-### M11.3 — `HttpEngine` trait + reqwest impl  ◐ (trait, prepare, fake; reqwest worker deferred)
+### M11.3 — `HttpEngine` trait + reqwest impl  ✅ (worker, cancellation, integration tests; redirect-chain capture deferred to M11.4)
 
 - `trait HttpEngine { fn send(&self, req: PreparedRequest, cancel:
   &CancelHandle) -> Result<Response, HttpError>; }` — blocking,
   synchronous on the caller's perspective. Real impl uses
-  `reqwest::blocking::Client` on a dedicated thread with a channel
-  boundary (so the UI thread never blocks on network).
+  `reqwest::blocking::Client` on a per-call worker thread with an
+  `mpsc` channel boundary (so the UI thread never blocks on network).
 - `PreparedRequest`: post-interpolation, post-script, ready-to-ship
   HTTP. `Response`: status, headers, body bytes, timing, redirects.
-- TLS: default platform native-tls (reqwest default); document that
-  custom CA bundles work via `SSL_CERT_FILE`.
+- TLS: default platform native-tls (reqwest default); custom CA
+  bundles work via `SSL_CERT_FILE` (the standard OpenSSL convention).
 - Cancellation: the engine takes a `CancelHandle` (clonable
   `Arc<AtomicBool>`) that the UI can trip when the user hits `Ctrl-C`
-  on an in-flight request.
+  on an in-flight request. The caller's thread polls the handle every
+  50 ms while waiting on the worker, so cancellation actually wakes
+  the call rather than waiting for reqwest's timeout.
 - **Shipped behaviour vs plan:** the engine trait, every type
   (`PreparedRequest`, `PreparedBody`, `Response`, `RedirectHop`,
-  `HttpError`, `CancelHandle`), and `FakeHttpEngine` (FIFO scripted
-  exchanges, request capture, cancellation short-circuit) are in
-  place. `prepare_request(&Request, &Environment) -> PreparedRequest`
-  handles `{{var}}` interpolation across URL/headers/query/body/auth,
-  appends url-encoded query strings, derives `Authorization` headers
-  (Basic base64-encoded; Bearer literal) with a user-`Authorization`-
-  wins rule, sets default `Content-Type` per body kind, and skips
-  disabled (`~`) rows. The `reqwest::blocking` worker + wiremock
-  integration tests land in M11.3.1 alongside the M11.4 view-model
-  wiring — keeping that PR small means we don't pull a 60-crate
-  network stack into a parser-only milestone.
-- **Tests:** `FakeHttpEngine` scripted exchanges; happy-path GET,
-  redirect chain, 4xx, 5xx, timeout, network error. Real reqwest
-  tests behind the `integration` feature against a local
-  `wiremock` server (deferred to M11.3.1 with the worker).
+  `HttpError`, `CancelHandle`), `FakeHttpEngine`, and `ReqwestEngine`
+  are all in place. `prepare_request(&Request, &Environment) ->
+  PreparedRequest` handles `{{var}}` interpolation across
+  URL/headers/query/body/auth, appends url-encoded query strings,
+  derives `Authorization` headers (Basic base64-encoded; Bearer
+  literal) with a user-`Authorization`-wins rule, sets default
+  `Content-Type` per body kind, and skips disabled (`~`) rows.
+  Redirect-chain capture in `Response.redirects` is left empty for
+  now — needs a custom `redirect::Policy` and only matters once the
+  M11.4 view-model surfaces the chain. `final_url` is already filled,
+  so callers can detect that a redirect happened.
+- **Tests:** 48 unit tests + 2 golden + 7 integration. Integration
+  suite lives in `tests/integration_reqwest.rs` behind the
+  `integration` feature, runs against a hand-rolled
+  `TcpListener`-based mock (avoids a wiremock/tokio dev-dep) and
+  covers happy-path GET, redirect chain, 4xx, 5xx, per-request
+  timeout, unreachable host, and a real cooperative-cancel mid-flight.
+  CI runs them on Ubuntu/macOS/Windows via the existing `integration`
+  job; mirrored in `mise run test-integration`.
 
 ### M11.4 — View-model + render
 

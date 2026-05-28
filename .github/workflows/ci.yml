@@ -89,6 +89,9 @@ jobs:
       - name: Clippy — cockpit-lsp (integration)
         run: cargo clippy -p cockpit-lsp --all-targets --features integration -- -D warnings
 
+      - name: Clippy — cockpit-http (integration)
+        run: cargo clippy -p cockpit-http --all-targets --features integration -- -D warnings
+
       - name: PTY integration tests
         run: cargo test -p cockpit-terminal --features integration
 
@@ -97,6 +100,9 @@ jobs:
 
       - name: LSP transport integration tests
         run: cargo test -p cockpit-lsp --features integration
+
+      - name: HTTP engine integration tests
+        run: cargo test -p cockpit-http --features integration --test integration_reqwest
 
   ui-smoke:
     name: ui-smoke (${{ matrix.os }})

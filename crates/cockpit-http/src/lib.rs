@@ -20,6 +20,7 @@
 
 pub mod collection;
 pub mod engine;
+pub mod engine_reqwest;
 pub mod model;
 pub mod parse;
 pub mod prepare;
@@ -33,6 +34,7 @@ pub use engine::{
     CancelHandle, FakeHttpEngine, HttpEngine, HttpError, PreparedBody, PreparedRequest,
     RedirectHop, Response,
 };
+pub use engine_reqwest::ReqwestEngine;
 pub use model::{
     Auth, BasicAuth, BearerAuth, Body, Collection, Environment, HttpMethod, Meta, Request,
 };
