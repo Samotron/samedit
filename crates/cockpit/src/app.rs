@@ -24,6 +24,7 @@ use cockpit_lsp::{
     Diagnostic, DiagnosticSeverity, LspClient, PublishDiagnosticsParams, RecvMessage, Response,
     ServerConfig,
 };
+use cockpit_lua::{DispatchRequest, Event as LuaEvent, EventContext, LuaRuntime};
 use cockpit_mux::{
     PaneMode, PrefixDispatcher, Rect as MuxRect, SESSION_ID_STRIDE as MUX_SESSION_STRIDE,
     Session as MuxSession, SplitDirection, command_ids as mux_command_ids,
@@ -103,6 +104,11 @@ const DEBUG_RELOAD_CONFIG: &str = "debug.reload_config";
 const DEBUG_SHOW_STARTUP_TRACE: &str = "debug.show_startup_trace";
 /// Command id for "summarise the native mux mode-line" (v0.7 M7.7).
 const DEBUG_SHOW_MUX_STATUS: &str = "debug.show_mux_status";
+/// Command id for "list every loaded Lua extension and its registrations"
+/// (v0.9 M9.5).
+const DEBUG_SHOW_EXTENSIONS: &str = "debug.show_extensions";
+/// Command id for "reload every Lua extension from disk" (v0.9 M9.5).
+const DEBUG_RELOAD_EXTENSIONS: &str = "debug.reload_extensions";
 /// Command ids for switching the active theme (v0.8 M8.1). One per
 /// supported flavour so the palette can list them as discrete entries.
 const THEME_SWITCH_DARK: &str = "theme.switch.dark";
@@ -379,6 +385,30 @@ pub struct AppModel {
     drag: Option<DragState>,
     /// Scroll offset (logical rows from the top) for the editor pane (M4.7).
     editor_scroll: f32,
+    /// Sandboxed Lua extension runtime (v0.9 M9.1+). Extensions register
+    /// commands, keybindings, themes, and tool-pane recipes through this
+    /// runtime; the binary drains its [`Registrations`] back into the
+    /// owning subsystems at startup and routes unknown commands /
+    /// editor + mux events through it at dispatch time.
+    lua: LuaRuntime,
+    /// Filesystem watcher that surfaces edits to `~/.config/cockpit/extensions/*.lua`
+    /// for the hot-reload path (v0.9 M9.5). Disabled (no-op) when
+    /// extensions live only as embedded defaults.
+    lua_watcher: cockpit_lua::ExtensionWatcher,
+    /// Shared slot the watcher reads to wake the event loop after a
+    /// reload-worthy filesystem event. Populated by
+    /// [`AppModel::set_redraw_handle`]; the watcher closure clones the
+    /// `Arc` so the redraw is fired off-thread without holding the
+    /// AppModel borrow.
+    lua_wake_handle: std::sync::Arc<std::sync::Mutex<Option<RedrawHandle>>>,
+    /// Palette entries contributed by Lua-registered commands, cached at
+    /// load time so the palette doesn't re-walk the runtime on every
+    /// `Ctrl+Shift+P`.
+    lua_palette_entries: Vec<PaletteEntry>,
+    /// Whether the most recent extension load surfaced a failure — used
+    /// by `Debug: Show Extensions` to flag bad state without crawling
+    /// the whole runtime.
+    lua_load_errors: Vec<String>,
     exit: bool,
 }
 
@@ -490,6 +520,11 @@ impl AppModel {
             last_view_height: 0.0,
             drag: None,
             editor_scroll: 0.0,
+            lua: LuaRuntime::new(),
+            lua_watcher: cockpit_lua::ExtensionWatcher::disabled(),
+            lua_wake_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            lua_palette_entries: Vec::new(),
+            lua_load_errors: Vec::new(),
             exit: false,
             detection,
         };
@@ -594,6 +629,178 @@ impl AppModel {
         };
     }
 
+    /// Load every Lua extension in `dir` (and the embedded defaults) into
+    /// the runtime, then apply their registrations to the keymap,
+    /// tool-recipe map, and palette. The cockpit binary calls this once
+    /// during hydration after [`apply_user_config`]; tests can call it
+    /// directly with a tempdir.
+    pub fn load_lua_extensions(&mut self, dir: Option<&Path>) {
+        // Embedded defaults — ship in-binary so a fresh install gets the
+        // examples without an extra IO cost (M9.8).
+        for (name, source) in embedded_default_extensions() {
+            let label = format!("<embedded:{name}>");
+            if let Err(err) = self
+                .lua
+                .load_source(name.to_string(), label, source.to_string())
+            {
+                self.lua_load_errors.push(err.to_string());
+                tracing::warn!(error = %err, extension = %name, "embedded extension failed to load");
+            }
+        }
+
+        if let Some(dir) = dir {
+            // Only walk the directory if it exists; missing is normal.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                let mut paths: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("lua"))
+                    .collect();
+                paths.sort();
+                for path in paths {
+                    if let Err(err) = self.lua.load_path(&path) {
+                        self.lua_load_errors.push(err.to_string());
+                        tracing::warn!(error = %err, path = %path.display(), "extension load failed");
+                    }
+                }
+            }
+            // Start the watcher *after* the initial load so any save
+            // during boot doesn't trigger a spurious reload before
+            // hydration finishes. The wake closure pokes the event
+            // loop if a redraw handle is already attached; otherwise
+            // the change waits for the next interaction.
+            let wake_handle = std::sync::Arc::clone(&self.lua_wake_handle);
+            self.lua_watcher =
+                match cockpit_lua::ExtensionWatcher::start_with_wake(dir, move || {
+                    if let Ok(slot) = wake_handle.lock()
+                        && let Some(handle) = slot.as_ref()
+                    {
+                        handle.request();
+                    }
+                }) {
+                    Ok(watcher) => watcher,
+                    Err(err) => {
+                        tracing::debug!(?err, "extension watcher disabled");
+                        cockpit_lua::ExtensionWatcher::disabled()
+                    }
+                };
+        }
+
+        self.apply_lua_registrations();
+    }
+
+    /// Poll the extension watcher for changed paths and reload each
+    /// one. Called once per tick from the shell.
+    pub fn poll_lua_watcher(&mut self) {
+        let changed = self.lua_watcher.changed();
+        if changed.is_empty() {
+            return;
+        }
+        for path in changed {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string);
+            let Some(name) = stem else { continue };
+            match self.lua.reload(&name) {
+                Ok(()) => {
+                    tracing::info!(extension = %name, "Lua extension reloaded");
+                    self.status = format!("Extension `{name}` reloaded.");
+                }
+                Err(err) => {
+                    if matches!(err, cockpit_lua::LuaError::Read { .. }) {
+                        // File appeared / renamed — load as new.
+                        if let Err(err) = self.lua.load_path(&path) {
+                            tracing::warn!(error = %err, path = %path.display(), "watch load failed");
+                            self.lua_load_errors.push(err.to_string());
+                        }
+                    } else {
+                        tracing::warn!(error = %err, extension = %name, "extension reload failed");
+                        self.status = format!("Extension `{name}` reload failed: {err}");
+                    }
+                }
+            }
+        }
+        self.apply_lua_registrations();
+    }
+
+    /// Drain the runtime's accumulated [`Registrations`] into the
+    /// keymap, tool-recipe map, and palette index. Idempotent — re-runs
+    /// safely after [`debug_reload_extensions`].
+    fn apply_lua_registrations(&mut self) {
+        let registrations = self.lua.registrations();
+        self.lua_palette_entries = registrations
+            .commands
+            .iter()
+            .map(|cmd| PaletteEntry::new(cmd.id.as_str(), cmd.title.clone()))
+            .collect();
+
+        for keybind in &registrations.keybinds {
+            if let Err(err) = self
+                .router
+                .bind_chord(keybind.chord.clone(), keybind.command.clone())
+            {
+                tracing::debug!(?err, chord = %keybind.chord, "lua keybind shadowed");
+            }
+        }
+
+        for recipe in &registrations.recipes {
+            self.tool_recipes
+                .insert(recipe.name.clone(), recipe.recipe.clone());
+        }
+        if !registrations.recipes.is_empty() {
+            self.bind_tool_recipe_chords();
+        }
+
+        if !registrations.themes.is_empty() {
+            // Theme registrations are surfaced as toasts — the live
+            // theme swap landing alongside palette plumbing is M9 follow-up.
+            tracing::info!(
+                count = registrations.themes.len(),
+                "extension themes registered (palette wiring pending)"
+            );
+        }
+    }
+
+    /// Snapshot the Lua-registered palette entries (used by `open_palette`).
+    fn lua_palette_entries(&self) -> Vec<PaletteEntry> {
+        self.lua_palette_entries.clone()
+    }
+
+    /// Drain any side-effects extensions emitted since the last call —
+    /// surface their toasts on the status line and replay their
+    /// `cockpit.commands.dispatch` requests.
+    fn drain_lua_effects(&mut self) {
+        let effects = self.lua.take_effects();
+        for toast in effects.toasts {
+            self.status = toast;
+        }
+        let dispatch: Vec<DispatchRequest> = effects.dispatch;
+        for request in dispatch {
+            self.run_command(request.command.as_str());
+        }
+    }
+
+    /// Fire a Lua event through the runtime and drain any side-effects
+    /// the handler raised.
+    fn fire_lua_event(&mut self, event: LuaEvent) {
+        self.lua.fire_event(&event);
+        self.drain_lua_effects();
+    }
+
+    /// Build the read-only context Lua command handlers receive as `ctx`.
+    fn lua_event_context(&self, command: &str) -> EventContext {
+        let mut ctx = EventContext::for_command(command);
+        ctx = ctx.with_project(
+            self.detection.root_path.clone(),
+            self.detection.display_name.clone(),
+        );
+        if let Some(doc) = &self.document {
+            ctx = ctx.with_active_path(doc.path.clone());
+        }
+        ctx
+    }
+
     /// Best-effort refresh of git status badges (spec §23 v0.3 / M3.4). Shells
     /// out to `git status --porcelain`; no-ops when `git` is missing or the
     /// project is not a git working tree.
@@ -661,6 +868,12 @@ impl AppModel {
 
     /// Store the handle used to wake the event loop from background threads.
     pub fn set_redraw_handle(&mut self, handle: RedrawHandle) {
+        // Share the handle with the extension watcher (v0.9 M9.5) so a
+        // save in another editor wakes the cockpit event loop instead
+        // of waiting for the next user interaction.
+        if let Ok(mut slot) = self.lua_wake_handle.lock() {
+            *slot = Some(handle.clone());
+        }
         self.redraw = Some(handle);
     }
 
@@ -1047,6 +1260,8 @@ impl AppModel {
             DEBUG_RELOAD_CONFIG => self.debug_reload_config(),
             DEBUG_SHOW_STARTUP_TRACE => self.debug_show_startup_trace(),
             DEBUG_SHOW_MUX_STATUS => self.debug_show_mux_status(),
+            DEBUG_SHOW_EXTENSIONS => self.debug_show_extensions(),
+            DEBUG_RELOAD_EXTENSIONS => self.debug_reload_extensions(),
             THEME_SWITCH_DARK => self.switch_theme("dark"),
             THEME_SWITCH_LATTE => self.switch_theme("latte"),
             THEME_SWITCH_FRAPPE => self.switch_theme("frappe"),
@@ -1071,7 +1286,15 @@ impl AppModel {
                 let name = other[TOOL_RECIPE_PREFIX.len()..].to_string();
                 self.run_tool_recipe(&name);
             }
-            other => self.status = format!("Unhandled command `{other}`."),
+            other => {
+                let command_id = cockpit_commands::CommandId::from(other);
+                let ctx = self.lua_event_context(other);
+                if self.lua.dispatch_command(&command_id, ctx) {
+                    self.drain_lua_effects();
+                } else {
+                    self.status = format!("Unhandled command `{other}`.");
+                }
+            }
         }
     }
 
@@ -1080,8 +1303,14 @@ impl AppModel {
         self.palette_mode = PaletteMode::Commands;
         let mut entries = palette_entries();
         entries.extend(self.tool_recipe_palette_entries());
+        entries.extend(self.lua_palette_entries());
         self.palette = Some(Palette::new(entries));
         self.status = "Command palette — type to filter, Enter to run, Esc to close.".to_string();
+        // Lua extensions may listen for `palette.open` — fire after the
+        // palette is set so handlers see the open state.
+        self.fire_lua_event(LuaEvent::PaletteOpen {
+            query: String::new(),
+        });
     }
 
     /// Open the mise-task picker, populated from the detected project tasks.
@@ -1794,6 +2023,58 @@ impl AppModel {
         self.status = text;
     }
 
+    /// Summarise every loaded Lua extension (v0.9 M9.5). One line per
+    /// extension with its load state, registration counts, and the most
+    /// recent error if any.
+    fn debug_show_extensions(&mut self) {
+        let summaries = self.lua.debug_summary();
+        if summaries.is_empty() {
+            self.status = "Extensions: (none loaded)".to_string();
+            return;
+        }
+        let mut buf = format!("Extensions: {} loaded", summaries.len());
+        for s in &summaries {
+            buf.push_str(&format!(
+                " | {} [{}cmds,{}keys,{}themes,{}recipes]",
+                s.name,
+                s.registrations.commands.len(),
+                s.registrations.keybinds.len(),
+                s.registrations.themes.len(),
+                s.registrations.recipes.len(),
+            ));
+            if s.disabled {
+                buf.push_str(" DISABLED");
+            }
+            if let Some(err) = &s.last_error {
+                buf.push_str(&format!(" err={err}"));
+            }
+        }
+        if !self.lua_load_errors.is_empty() {
+            buf.push_str(&format!(" | load_errors={}", self.lua_load_errors.len()));
+        }
+        tracing::info!(extensions = %buf, "debug: show extensions");
+        self.status = buf;
+    }
+
+    /// Reload every Lua extension from disk (v0.9 M9.5). Walks the user
+    /// extensions directory + reloads embedded defaults, applies the
+    /// fresh registrations, and replaces the palette index.
+    fn debug_reload_extensions(&mut self) {
+        let dir = extensions_dir();
+        // Tear down the runtime entirely — simplest correct path: the
+        // command registrations live inside the Lua VMs, so disposing
+        // them is the cleanest way to avoid stale id collisions.
+        let new_runtime = LuaRuntime::new();
+        self.lua = new_runtime;
+        self.lua_palette_entries.clear();
+        self.lua_load_errors.clear();
+        self.load_lua_extensions(dir.as_deref());
+        self.status = format!(
+            "Extensions: reloaded ({} loaded).",
+            self.lua.debug_summary().len()
+        );
+    }
+
     fn debug_reload_config(&mut self) {
         match InputRouter::from_global_keys(&GlobalKeys::default()) {
             Ok(router) => {
@@ -2499,11 +2780,23 @@ impl AppModel {
                     None => String::new(),
                 };
                 self.status = format!("Opened {name}{suffix}");
+                let language = Language::from_path(&path);
                 let mut editor = Editor::new(&content);
-                editor.set_language(Language::from_path(&path));
-                self.document = Some(OpenDocument { editor, path, name });
+                editor.set_language(language);
+                self.document = Some(OpenDocument {
+                    editor,
+                    path: path.clone(),
+                    name,
+                });
                 self.layout.focus(PaneId::Editor);
                 self.start_lsp_for_document();
+                let language_label = language
+                    .map(|l| format!("{l:?}").to_ascii_lowercase())
+                    .unwrap_or_else(|| "text".to_string());
+                self.fire_lua_event(LuaEvent::EditorOpen {
+                    path,
+                    language: language_label,
+                });
             }
             Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
         }
@@ -2600,7 +2893,11 @@ impl AppModel {
             self.status = "No document to save.".to_string();
             return;
         };
-        match self.fs.write(&doc.path, doc.editor.text().as_bytes()) {
+        let path = doc.path.clone();
+        let text = doc.editor.text();
+        let bytes = text.len();
+        let language = doc.editor.language();
+        match self.fs.write(&doc.path, text.as_bytes()) {
             Ok(()) => {
                 doc.editor.mark_saved();
                 self.status = format!("Saved {}", doc.name);
@@ -2613,6 +2910,14 @@ impl AppModel {
         if self.format_on_save {
             self.request_format(FormatTrigger::Save);
         }
+        let language_label = language
+            .map(|l| format!("{l:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "text".to_string());
+        self.fire_lua_event(LuaEvent::EditorSave {
+            path,
+            language: language_label,
+            bytes,
+        });
     }
 
     /// Close the open document, returning the editor pane to the welcome view.
@@ -5152,6 +5457,34 @@ fn mux_select_window_index(id: &str) -> Option<usize> {
         .position(|candidate| *candidate == id)
 }
 
+/// User-extensions directory under the platform config dir
+/// (`~/.config/cockpit/extensions` on Linux). `None` when the platform
+/// surface doesn't provide a config home — extensions still load from
+/// the embedded defaults in that case.
+fn extensions_dir() -> Option<PathBuf> {
+    cockpit_config::user_config_path().and_then(|p| p.parent().map(|d| d.join("extensions")))
+}
+
+/// In-binary extensions that ship with every install (v0.9 M9.8).
+/// Force-disabled in CI by skipping the load call; users disable them
+/// individually via `extensions.toml` (planned follow-up).
+fn embedded_default_extensions() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "runtime.format-paragraph",
+            include_str!("../../../runtime/extensions/format-paragraph.lua"),
+        ),
+        (
+            "runtime.session-toast",
+            include_str!("../../../runtime/extensions/session-toast.lua"),
+        ),
+        (
+            "runtime.theme-by-time-of-day",
+            include_str!("../../../runtime/extensions/theme-by-time-of-day.lua"),
+        ),
+    ]
+}
+
 /// The command palette's v0.1 command set (spec §16).
 fn palette_entries() -> Vec<PaletteEntry> {
     vec![
@@ -5238,6 +5571,8 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(DEBUG_RELOAD_CONFIG, "Debug: Reload Config"),
         PaletteEntry::new(DEBUG_SHOW_STARTUP_TRACE, "Debug: Show Startup Trace"),
         PaletteEntry::new(DEBUG_SHOW_MUX_STATUS, "Debug: Show Mux Status"),
+        PaletteEntry::new(DEBUG_SHOW_EXTENSIONS, "Debug: Show Extensions"),
+        PaletteEntry::new(DEBUG_RELOAD_EXTENSIONS, "Debug: Reload Extensions"),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }
@@ -5713,6 +6048,14 @@ impl CockpitApp for AppShell {
                         model.set_redraw_handle(handle);
                     }
                     tracing::info!(project = model.project_name(), "cockpit hydration complete");
+                    // v0.9 M9.3: fire the `project.open` event as soon as
+                    // hydration completes, so extensions see the project
+                    // settled before the first paint.
+                    let event = LuaEvent::ProjectOpen {
+                        root: model.detection.root_path.clone(),
+                        name: model.detection.display_name.clone(),
+                    };
+                    model.fire_lua_event(event);
                     self.state = ShellState::Live(model);
                 }
                 crate::hydration::HydrationOutcome::Failed(message) => {
@@ -5725,6 +6068,11 @@ impl CockpitApp for AppShell {
                     self.state = ShellState::Failed(progress);
                 }
             },
+            ShellState::Live(model) => {
+                // v0.9 M9.5: hot-reload pulse — pick up any extension
+                // files the user just saved.
+                model.poll_lua_watcher();
+            }
             _ => {}
         }
     }
@@ -6027,6 +6375,90 @@ cockpit_layout = "missing.kdl"
             "status: {}",
             model.status
         );
+    }
+
+    #[test]
+    fn load_lua_extensions_registers_palette_entries_and_dispatches_command() {
+        let mut model = model();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("hello.lua"),
+            r#"
+            cockpit.commands.register {
+              id    = "user.hello",
+              title = "User: Hello",
+              run   = function(ctx) ctx.toast("hi from " .. ctx.command) end,
+            }
+            "#,
+        )
+        .unwrap();
+        model.load_lua_extensions(Some(dir.path()));
+
+        let entries = model.lua_palette_entries();
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(
+            titles.contains(&"User: Hello"),
+            "expected User: Hello, got {titles:?}",
+        );
+
+        // Dispatch via the unhandled-command fallback — extension toast
+        // should land on the status line.
+        model.run_command("user.hello");
+        assert_eq!(
+            model.status, "hi from user.hello",
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn editor_save_event_reaches_lua_handler() {
+        let mut model = model();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("save-toast.lua"),
+            r#"
+            cockpit.events.on("editor.save", function(ctx)
+              cockpit.toast("saved " .. ctx.path)
+            end)
+            "#,
+        )
+        .unwrap();
+        model.load_lua_extensions(Some(dir.path()));
+
+        // Write a file we own into a tempdir so the save round-trip
+        // doesn't depend on a specific fixture layout.
+        let doc_dir = tempfile::tempdir().expect("doc tempdir");
+        let doc_path = doc_dir.path().join("note.txt");
+        std::fs::write(&doc_path, "hello\n").unwrap();
+        model.open_document(doc_path.clone());
+        model.run_command(command_ids::SAVE);
+
+        let expected = format!("saved {}", doc_path.display());
+        assert_eq!(model.status, expected, "status: {}", model.status);
+    }
+
+    #[test]
+    fn debug_show_extensions_summarises_loaded_extensions() {
+        let mut model = model();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.lua"),
+            r#"cockpit.commands.register{id="user.a", title="A", run=function() end}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.lua"),
+            r#"cockpit.events.on("editor.save", function() end)"#,
+        )
+        .unwrap();
+        model.load_lua_extensions(Some(dir.path()));
+
+        model.run_command(DEBUG_SHOW_EXTENSIONS);
+        let summary = model.status.clone();
+        assert!(summary.contains("Extensions:"), "summary: {summary}");
+        assert!(summary.contains(" a "), "summary: {summary}");
+        assert!(summary.contains(" b "), "summary: {summary}");
     }
 
     #[test]

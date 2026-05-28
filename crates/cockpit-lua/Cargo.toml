@@ -1,0 +1,26 @@
+[package]
+name = "cockpit-lua"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sandboxed Lua extension runtime for Coding Cockpit (v0.9)."
+
+[features]
+default = []
+# Asserts cold-start budgets from IMPLEMENTATION_PLAN.md §M9.7. Off by
+# default so contributors don't pay the timing-overhead in fast tests.
+bench = []
+
+[dependencies]
+cockpit-commands.workspace = true
+cockpit-config.workspace = true
+cockpit-project.workspace = true
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+notify = "8.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0.18"
+tracing = "0.1.41"
+
+[dev-dependencies]
+tempfile = "3.27.0"

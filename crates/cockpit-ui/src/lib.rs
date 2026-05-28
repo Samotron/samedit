@@ -289,6 +289,19 @@ impl InputRouter {
         &self.global
     }
 
+    /// Bind a pre-parsed chord → command id. Used by Lua extensions
+    /// (v0.9 M9.2) where the chord is already a [`KeyChord`] coming
+    /// out of the `cockpit.keys.bind(chord, id)` registrar.
+    pub fn bind_chord(
+        &mut self,
+        chord: KeyChord,
+        command: impl Into<CommandId>,
+    ) -> Result<(), InputRouterError> {
+        self.global
+            .bind(chord, command.into())
+            .map_err(InputRouterError::Command)
+    }
+
     /// Route a key chord based on the currently focused pane.
     pub fn route(&self, focused: PaneId, chord: KeyChord) -> RoutedInput {
         if let Some(command) = self.global.resolve(&chord) {

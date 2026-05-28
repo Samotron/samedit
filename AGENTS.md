@@ -60,7 +60,11 @@ revert, not a review comment.
    never silently install.
 
 7. **No heavy background indexing, no LSP before v0.3, no plugin
-   marketplace.** Out of scope on purpose (spec §3, §19, §23, §24).
+   marketplace, registry, or in-app installer.** Out of scope on
+   purpose (spec §3, §19, §23, §24). The v0.9 Lua extension system
+   (see [`docs/extensions.md`](docs/extensions.md)) ships sandboxed
+   **local-file** extensions only — there is no discovery server, no
+   auto-update, no `:PackerInstall`. Adding one is a plan change.
 
 8. **Don't make `spec.md` and `IMPLEMENTATION_PLAN.md` diverge further.** If
    the plan is wrong, update it; if the spec is wrong, annotate or update it.
@@ -87,6 +91,7 @@ samedit/                            # Cargo workspace root
 │   ├── cockpit-mux/                # native multiplexer state (M7.2+)
 │   ├── cockpit-terminal/           # pty, termwiz engine, path detect
 │   ├── cockpit-lsp/                # LSP transport — codec, JSON-RPC, client
+│   ├── cockpit-lua/                # sandboxed Lua 5.4 extension runtime (v0.9)
 │   ├── cockpit-commands/           # command registry + keybinding resolution
 │   ├── cockpit-config/             # serde config types, TOML/KDL loading
 │   ├── cockpit-ui/                 # view-model tree, layout, panes, palette
@@ -130,6 +135,7 @@ should never gain a window/GPU dependency.
 | DuckDB / ggsql / new SQL backend         | `cockpit-sql`            |
 | Notebook cell parser / view-model        | `cockpit-notebook`       |
 | dbt-lite analytics (detect / DAG / build)| `cockpit-analytics`      |
+| Sandboxed Lua extensions (v0.9)          | `cockpit-lua`            |
 | Cold-start phase work (detect/tree/...)  | `cockpit::hydration`     |
 | Splash painter (uses Painter+Theme)      | `cockpit::splash`        |
 | Wiring crates together, CLI flags        | `cockpit` (binary)       |

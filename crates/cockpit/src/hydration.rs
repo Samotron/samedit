@@ -177,6 +177,13 @@ impl HydrationDriver {
                         }
                     }
                 }
+                // v0.9 M9: load Lua extensions on the same phase so
+                // their registrations land before the user lifts a
+                // finger. The directory is derived from the user
+                // config path; embedded defaults always load.
+                let ext_dir = cockpit_config::user_config_path()
+                    .and_then(|p| p.parent().map(|d| d.join("extensions")));
+                model.load_lua_extensions(ext_dir.as_deref());
                 DriverState::ConfigApplied { model }
             }
             (HydrationPhase::RefreshGit, DriverState::ConfigApplied { mut model }) => {
