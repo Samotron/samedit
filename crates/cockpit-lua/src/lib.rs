@@ -16,6 +16,7 @@
 pub mod api;
 pub mod capability;
 pub mod event;
+pub mod http_scripts;
 pub mod theme;
 pub mod watcher;
 
@@ -31,6 +32,7 @@ use thiserror::Error;
 
 pub use capability::{Capability, CapabilityError, CapabilitySet};
 pub use event::{Event, EventContext, EventKind};
+pub use http_scripts::{HttpScriptError, ScriptResponseView, run_post_response, run_pre_request};
 pub use theme::ExtensionTheme;
 pub use watcher::ExtensionWatcher;
 

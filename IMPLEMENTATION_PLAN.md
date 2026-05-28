@@ -1995,6 +1995,31 @@ Registered in `cockpit-commands`:
   bridge into `cockpit-http`'s `Environment`. 5 new tests in
   cockpit-http (round-trip + JS-flag + unknown-variant) + 4 new in
   cockpit-ui (script_warnings matrix).
+- **M11.6.1 update (Lua execution wired):** `cockpit_lua::http_scripts`
+  ships `run_pre_request(source, &mut env.vars)` and
+  `run_post_response(source, response, &mut env.vars)`. Both spin a
+  fresh `mlua` VM with the same `apply_sandbox` the v0.9 extensions
+  use (no `io`, no `os.execute`, no `package.loadlib`, no `require`).
+  The bridge installs `cockpit.http.set_var(name, value)` and
+  `cockpit.http.var(name)` against an `Arc<Mutex<BTreeMap>>` so
+  mutations land back on the caller's environment in place; post-
+  response scripts additionally get `cockpit.http.response()`
+  returning a read-only table with `status`, `headers` (1-indexed
+  list of `{name, value}` rows so Lua's `#` works), and `body`. Pre-
+  request scripts that call `cockpit.http.response()` raise a clear
+  error rather than returning nil. The binary owns a new
+  `http_scripts_granted: bool` field (default-deny; tests flip it
+  directly — a per-collection grant store reading
+  `~/.config/cockpit/extensions.toml` lands in M11.6.2). `Http: Send
+  Request` now clones the active env, runs the pre-script when
+  granted, threads the mutated env through
+  `cockpit_http::prepare_request`, then dispatches — script failures
+  land in the status without ever spawning a worker. 8 new tests in
+  `cockpit_lua::http_scripts` (set/read vars, sandbox blocks
+  `os.execute`, runtime errors, response-shape iteration) + 3 in the
+  binary (granted path mutates headers, ungranted path skips, script
+  failure aborts before dispatch). Post-response script integration
+  in the binary is M11.6.2 alongside the env-overlay store.
 
 ### M11.7 — Docs
 

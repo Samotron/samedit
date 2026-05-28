@@ -360,6 +360,13 @@ pub struct AppModel {
     /// channel resolves; cleared back to `None` once the result has
     /// been applied to [`Self::http`]. v0.11 M11.5.2.
     http_in_flight: Option<HttpInFlight>,
+    /// `http.scripts` capability grant (v0.11 M11.6.1). When `true`,
+    /// `Http: Send Request` runs `script:lua-pre-request` blocks before
+    /// preparing the request. Defaults to `false` (default-deny per
+    /// spec); a per-collection grant store lands in a follow-up.
+    /// Test-only setter `set_http_scripts_granted` exists alongside the
+    /// `#[cfg(test)]` `install_fake_http` helper.
+    http_scripts_granted: bool,
     /// Detected analytics project (v0.5 M5.6 wire-up). Built once during
     /// [`new`] when a `models/` directory is present and refreshed by
     /// `Models: Build All`.
@@ -547,6 +554,7 @@ impl AppModel {
             http: None,
             http_engine: None,
             http_in_flight: None,
+            http_scripts_granted: false,
             analytics: None,
             editor_pending_g: false,
             editor_pending_leader: 0,
@@ -3983,27 +3991,47 @@ impl AppModel {
         // Prepare before touching the engine — preparation only needs an
         // immutable borrow on `self.http`, and we want to surface
         // missing-var errors before paying the engine-init cost.
-        let prepared =
-            match cockpit_ui::http::prepare_selected(self.http.as_ref().expect("guarded above")) {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    self.status = format!("Http: cannot send — {err}");
-                    return;
-                }
-            };
+        let view = self.http.as_ref().expect("guarded above");
         // v0.11 M11.6: emit one-time toasts for JS scripts we don't run
         // and for ungranted Lua scripts. Logged via `tracing` because
         // the status line is about to advertise the in-flight send;
         // `tracing` keeps the warning visible via Debug: Show Command Log.
-        for warning in cockpit_ui::http::script_warnings(
-            self.http.as_ref().expect("guarded above"),
-            // The `http.scripts` capability lives in cockpit-lua's set.
-            // We don't have a per-collection grant store yet (M11.6.1),
-            // so default-deny: pass `false` and the warning fires.
-            false,
-        ) {
+        for warning in cockpit_ui::http::script_warnings(view, self.http_scripts_granted) {
             tracing::warn!(http_script_warning = %warning);
         }
+        // v0.11 M11.6.1: if the request carries a Lua pre-request script
+        // *and* `http.scripts` is granted, run it. The script can mutate
+        // the env via `cockpit.http.set_var`; the mutated env is what
+        // `prepare_request` sees, so `{{var}}` interpolation picks up
+        // the script's writes.
+        let request = match view.selected_request() {
+            Some(req) => req.clone(),
+            None => {
+                self.status = "Http: no request selected.".to_string();
+                return;
+            }
+        };
+        let mut env =
+            view.active_environment()
+                .cloned()
+                .unwrap_or_else(|| cockpit_http::Environment {
+                    name: String::new(),
+                    vars: Default::default(),
+                });
+        if self.http_scripts_granted
+            && let Some(source) = request.pre_script.as_deref()
+            && let Err(err) = cockpit_lua::run_pre_request(source, &mut env.vars)
+        {
+            self.status = format!("Http: pre-request script failed — {err}");
+            return;
+        }
+        let prepared = match cockpit_http::prepare_request(&request, &env) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.status = format!("Http: cannot send — {err}");
+                return;
+            }
+        };
         let summary = cockpit_ui::http::SentSummary {
             method: prepared.method,
             url: prepared.url.clone(),
@@ -9692,6 +9720,128 @@ format_on_save = true
             model.status.contains("nothing in flight"),
             "{}",
             model.status
+        );
+    }
+
+    #[test]
+    fn http_send_request_runs_pre_script_when_granted() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        model.http_scripts_granted = true;
+        // Replace the installed collection with one carrying a pre_script.
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.meta.name = Some("get-users".into());
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.headers = vec![cockpit_http::KeyValue::new("X-Token", "{{token}}")];
+                req.pre_script = Some("cockpit.http.set_var('token', 'abc')".into());
+                req
+            }],
+            environments: vec![cockpit_http::Environment {
+                name: "dev".into(),
+                vars: Default::default(),
+            }],
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let sent = engine.requests();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k == "X-Token" && v == "abc"),
+            "pre-script env mutation did not flow into headers: {:?}",
+            sent[0].headers
+        );
+    }
+
+    #[test]
+    fn http_send_request_skips_pre_script_when_capability_not_granted() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        // http_scripts_granted stays false (default).
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.pre_script = Some("cockpit.http.set_var('token', 'abc')".into());
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let run = model.http.as_ref().unwrap().selected_run().unwrap();
+        assert_eq!(run.status, cockpit_ui::http::SendStatus::Ok);
+        let sent = engine.requests();
+        // Script was skipped — nothing set `token`, so no header should
+        // carry it. The send still went through with the unmutated env.
+        assert!(
+            !sent[0]
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("X-Token")),
+            "headers should not contain X-Token: {:?}",
+            sent[0].headers
+        );
+    }
+
+    #[test]
+    fn http_send_request_surfaces_pre_script_failure_without_dispatching() {
+        let mut model = model();
+        let _engine = install_fake_http(&mut model);
+        model.http_scripts_granted = true;
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.pre_script = Some("error('boom from script')".into());
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+
+        assert!(
+            model.status.contains("pre-request script failed"),
+            "status = {}",
+            model.status
+        );
+        assert!(
+            model.http_in_flight.is_none(),
+            "engine should not have been called"
         );
     }
 }
