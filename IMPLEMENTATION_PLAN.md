@@ -1667,7 +1667,8 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
   let `go test` filter. A `go list` cache via `ProcessRunner` remains
   the right next step if real projects need it.
 - `Go: Generate` palette command runs `go generate ./...`. No
-  watch mode in v0.10. **Not yet shipped** — track as a follow-up.
+  watch mode in v0.10. ✅ Shipped — refuses outside detected Go
+  projects so the wrong toolchain never gets typed into a pane.
 - **Tests:** golden `nearest_test` over `_test.go` fixtures; command
   construction tests for the three test scopes (in
   `cockpit-editor::test_runner`).

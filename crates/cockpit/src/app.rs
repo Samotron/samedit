@@ -90,6 +90,8 @@ const TEST_RUN_ALL: &str = "test.run_all";
 const TEST_RUN_CURRENT_FILE: &str = "test.run_current_file";
 /// Command id for "run the `test` task targeting the nearest test" (spec §16).
 const TEST_RUN_NEAREST: &str = "test.run_nearest";
+/// Command id for `go generate ./...` (v0.10 M10.5).
+const GO_GENERATE: &str = "go.generate";
 /// Command id for "summarise the recent key chord ring buffer" (spec §18.13).
 const DEBUG_SHOW_KEY_EVENTS: &str = "debug.show_key_events";
 /// Command id for "summarise the recent command dispatch log" (spec §18.13).
@@ -1254,6 +1256,7 @@ impl AppModel {
             TEST_RUN_ALL => self.run_test_all(),
             TEST_RUN_CURRENT_FILE => self.run_test_current_file(),
             TEST_RUN_NEAREST => self.run_test_nearest(),
+            GO_GENERATE => self.run_go_generate(),
             DEBUG_SHOW_KEY_EVENTS => self.debug_show_key_events(),
             DEBUG_SHOW_COMMAND_LOG => self.debug_show_command_log(),
             DEBUG_SHOW_PANE_TREE => self.debug_show_pane_tree(),
@@ -1943,6 +1946,24 @@ impl AppModel {
             return;
         }
         self.status = TEST_TASK_MISSING.to_string();
+    }
+
+    /// Run `go generate ./...` in the active terminal (spec v0.10 M10.5
+    /// `Go: Generate`). Detected Go projects only — the command is silently
+    /// a no-op when the project isn't a Go project to avoid running it in
+    /// the wrong toolchain.
+    fn run_go_generate(&mut self) {
+        use cockpit_project::ProjectSignalKind;
+        let is_go = self
+            .detection
+            .signals
+            .iter()
+            .any(|signal| signal.kind == ProjectSignalKind::Go);
+        if !is_go {
+            self.status = "Go: Generate only runs in Go projects (`go.mod` not detected).".into();
+            return;
+        }
+        self.send_command_to_terminal("go generate ./...", "Running `go generate ./...`.".into());
     }
 
     /// Project-relative path of the active document, normalised to forward
@@ -5592,6 +5613,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(TEST_RUN_ALL, "Test: Run All"),
         PaletteEntry::new(TEST_RUN_CURRENT_FILE, "Test: Run Current File"),
         PaletteEntry::new(TEST_RUN_NEAREST, "Test: Run Nearest"),
+        PaletteEntry::new(GO_GENERATE, "Go: Generate"),
         PaletteEntry::new(LSP_GOTO_DEFINITION, "LSP: Go to Definition"),
         PaletteEntry::new(LSP_SHOW_HOVER, "LSP: Show Hover"),
         PaletteEntry::new(LSP_RENAME, "LSP: Rename Symbol"),
@@ -6360,6 +6382,28 @@ mod tests {
         );
         assert!(
             !model.status.contains("No nearby test function found"),
+            "status: {}",
+            model.status,
+        );
+    }
+
+    #[test]
+    fn go_generate_refuses_outside_a_go_project() {
+        let mut model = rust_model();
+        model.run_go_generate();
+        assert!(
+            model.status.contains("only runs in Go projects"),
+            "status: {}",
+            model.status,
+        );
+    }
+
+    #[test]
+    fn go_generate_in_a_go_project_dispatches_the_command() {
+        let mut model = go_model();
+        model.run_go_generate();
+        assert!(
+            !model.status.contains("only runs in Go projects"),
             "status: {}",
             model.status,
         );
