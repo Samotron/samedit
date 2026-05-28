@@ -1564,6 +1564,1021 @@ M7.x (mux) ─┐
 
 ---
 
+## 8f. v0.10 — Go as a first-class language  (NEW — post-spec)
+
+Goal: bring Go to parity with Rust, TypeScript, and Python — highlighting,
+LSP, format-on-save, project detection, test runner. Smallest of the v0.10+
+features; uses existing patterns end to end. No new crates.
+
+### Scope
+
+Go-the-language only. **Out of scope:** debugging (`delve`), profiling
+hookups, build-tag-aware analysis, custom Go-template highlighting.
+Those are follow-ups; the v0.10 exit checklist intentionally mirrors
+"can I drive a Go project the way I drive a Rust one today".
+
+### M10.1 — Highlighting + extension routing
+
+- `cockpit-editor::highlight`: add `Language::Go`. Map `.go` (and the
+  `.tmpl` Go-template files? — **no**, out of scope) via
+  `Language::from_extension`. Dependency: `tree-sitter-go` (latest on
+  crates.io). Wire a `GO_CONFIG` `thread_local!` matching the existing
+  `RUST_CONFIG` lazy-init pattern (M6.3).
+- Highlight capture table: extend the dotted-prefix `KIND_MAP` so Go's
+  upstream highlight queries map to the existing `Kind` palette. Reuse
+  the table; do not invent a Go-specific kind without a real palette
+  need.
+- **Golden tests:** add `tests/golden/highlight/go_basic.snap` covering
+  imports, fn declarations, methods on receivers, struct + interface,
+  string interpolation (`fmt.Sprintf`), channels (`<-`), and a
+  `//go:generate` directive.
+- **Done when:** opening a `.go` file paints with the same kind set as
+  the existing Rust fixtures, snapshot tests green.
+
+### M10.2 — `gopls` LSP wiring
+
+- `cockpit-lsp::registry`: add a `Language::Go` arm returning
+  `ServerConfig { binary: "gopls", args: vec![], ... }`. Launch via
+  `mise exec` (M4.0 contract) so per-project Go toolchains win.
+- Defer-LSP-spawn (M6.5) applies unchanged: `gopls` only starts when a
+  `.go` file opens and the file is under `LSP_MAX_BYTES`.
+- All v0.4 LSP features — diagnostics (M4.1), definition/hover (M4.2),
+  rename (M4.3a), completion (M4.3b), code actions (M4.5) — light up
+  automatically once the registry knows about Go. No per-feature work.
+- **Tests:**
+  - Unit: `ServerConfig::for_language(Language::Go)` resolves.
+  - Integration (`integration` feature): scripted `gopls` exchange via
+    the existing fake JSON-RPC harness — `textDocument/definition` on
+    a stdlib symbol, `publishDiagnostics` from a deliberate type
+    error.
+- **Done when:** `cmd-click` on a Go symbol jumps to its definition;
+  type errors render in the gutter on a fixture project.
+
+### M10.3 — Project detection + mise
+
+- `cockpit-project::detect`: add `go.mod` to the signal-file list with
+  a confidence equal to `Cargo.toml` / `package.json`. The mise layer
+  already supports `[tools] go = "1.22"`; nothing new to parse.
+- New fixture: `tests/fixtures/go-basic/` — minimal `go.mod`, one
+  package, one `main.go`, one `_test.go`. Used by detection +
+  highlight tests.
+- **Done when:** opening the `go-basic` fixture lights up the project
+  launcher with `Go` as the project kind and `gopls` as the lazy LSP.
+
+### M10.4 — Format-on-save (mise task wins)
+
+- Reuse the M4.4 contract: if a `format` (or `format:go`) mise task
+  exists, that wins. If no task exists but `gofmt` or `goimports` is
+  detectable (in `[tools]` or on PATH), surface the M4.4 prompt:
+  *"Add `format` task to `mise.toml` running `gofmt -w .`? [Y/n]"*.
+  Never silently write.
+- Server-side `textDocument/formatting` via `gopls` is the fallback
+  when no formatter is detectable — same precedence as the existing
+  languages.
+- **Done when:** saving a deliberately mis-indented `.go` file in the
+  `go-basic` fixture rewrites to canonical `gofmt` style.
+
+### M10.5 — Test runner palette commands
+
+- Extend `cockpit-editor::nearest_test` with a `Language::Go` arm:
+  walk the AST (already available from tree-sitter-go) to find the
+  enclosing `func TestXxx(t *testing.T)`; return the test name.
+- `Test: Run Nearest` / `Test: Run Current File` / `Test: Run All`
+  (M3.3) gain Go resolution rules:
+  - All → mise `test` task if present, else `go test ./...`.
+  - Current file → `go test -run . ./<package-path>` (derive package
+    from `go list -f '{{.ImportPath}}' <file>` — cached per file via
+    `ProcessRunner` seam so repeated invocations don't re-spawn).
+  - Nearest → `go test -run '^<TestName>$' ./<package>`.
+- `Go: Generate` palette command runs `go generate ./...`. No
+  watch mode in v0.10.
+- **Tests:** golden `nearest_test` over `_test.go` fixtures; command
+  construction tests for the three test scopes.
+- **Done when:** every test scope works against the fixture; output
+  appears in the active mux pane via the existing M2.2 "run task in
+  the active pane" path.
+
+### M10.6 — Ignore list + status badges
+
+- `cockpit-project` default ignore list (spec §13): add `vendor/`
+  (Go's vendored deps) and `**/*.pb.go` (generated protobuf). Do
+  **not** ignore generated files broadly — users want to read them
+  occasionally.
+- Git status badges (M3.4) need no Go-specific work; `git
+  status --porcelain` already covers `.go` files.
+
+### v0.10 exit checklist
+
+- [ ] Opening the `go-basic` fixture detects it as a Go project and
+      lists the `go.mod`-defined toolchain.
+- [ ] Syntax highlighting on `main.go` matches the Rust-equivalent
+      coverage (functions, types, strings, comments, keywords,
+      operators).
+- [ ] `gd` jumps to a stdlib symbol; `K` shows hover docs.
+- [ ] Saving an unformatted `.go` file applies `gofmt` via the
+      mise task (or the M4.4 prompt fires once and never again).
+- [ ] `Test: Run Nearest` from inside a `func TestFoo` runs only
+      that test in the active mux pane.
+- [ ] `mise run ci` green; CI matrix Linux + macOS + Windows
+      includes a Go leg (CI installs Go via `mise install go@1.22`
+      in the matrix step).
+
+### Risk notes
+
+| Risk                                          | Mitigation                                              |
+|-----------------------------------------------|---------------------------------------------------------|
+| `tree-sitter-go` major version skew           | Pin via Cargo `=` constraint; document upgrade as a milestone-level change with a snapshot re-review. |
+| `gopls` startup cost dominates LSP perf       | Deferred spawn (M6.5) means cost is paid on first `.go` open, never on launch. The bench leg (M6.1) does not need a Go fixture in v0.10. |
+| `go list` is slow on cold caches              | Cache the file → package mapping in `ProjectCache::file_index` (M6.6); invalidate on `go.mod` mtime change. |
+| Generated files (`*.pb.go`) cause LSP noise   | `gopls` already filters by build tags; document the `gopls.directoryFilters` config knob in the user-facing docs but ship no in-app UI for it. |
+| CI installs of Go inflate matrix time         | Use `mise install` cache action in CI; expected +60 s per leg, acceptable for the value. |
+
+### Sequencing
+
+```diagram
+M10.1 (highlight) ──┐
+                    ├──▶ ready in parallel
+M10.3 (detect)  ────┘
+                    │
+                    ▼
+            M10.2 (gopls) ──▶ M10.4 (format) ──▶ M10.5 (tests) ──▶ M10.6 (ignore)
+```
+
+M10.1 + M10.3 are headless and independent — ship together as the first
+PR. M10.2 builds on M10.1 (highlight enum). M10.4–M10.6 each chain off
+M10.2 because the test/format flows can fall back to LSP when no mise
+task exists.
+
+---
+
+## 8g. v0.11 — HTTP request runner (Bruno-style, git-tracked)  (NEW — post-spec)
+
+Goal: a first-class HTTP client surface modelled on **Bruno** — requests
+live as plain-text `.bru` files in the repo, environments are separate
+files, results render inline beside the request. No proprietary store,
+no SaaS sync, no separate app to keep in sync. The repo is the source of
+truth.
+
+### Why Bruno-compatible
+
+- `.bru` files are git-friendly today, code-reviewable, and version
+  controllable — matches the spec's headless-first ethos and the
+  v0.5 notebook pattern (M5.2: files-as-source-of-truth).
+- Cross-tool: a teammate using the upstream Bruno desktop app can
+  open the same collection. We *consume* Bruno's format; we don't
+  fork it.
+- The format is small enough to parse ourselves — a custom grammar
+  in `cockpit-http::parse` rather than an upstream JS dep we'd have
+  to shell out to.
+
+### Architecture
+
+New crate `cockpit-http` (headless, AGENTS §2 #2). Splits into:
+
+- `parse` — `.bru` file parser + serialiser (round-trip preserves
+  comments and ordering, same constraint as `cockpit-config`'s
+  `toml_edit` work in M8.1).
+- `model` — `Request`, `Response`, `Collection`, `Environment`,
+  `Variable` data types. Pure data.
+- `engine` — `HttpEngine` trait + `ReqwestEngine` impl. **No tokio**
+  (AGENTS §2 #4); `reqwest::blocking` on a dedicated I/O thread,
+  responses flow back via a channel. A `FakeHttpEngine` records
+  scripted exchanges for tests.
+- `runner` — orchestrates pre-request scripts (Lua, reusing M9.x),
+  variable interpolation, and authenticated sends.
+
+`cockpit-notebook` is the *reference* — same shape (parser →
+view-model → inline result rendering), different domain. Cribbing
+its layering is the cheapest way to get this done.
+
+UI lives in `cockpit-ui::http` (view-model) and `cockpit-render`
+(painter). The "send" command goes through `cockpit-commands` like
+everything else (AGENTS §2 #5).
+
+### M11.1 — `.bru` parser + serialiser
+
+- Hand-rolled parser over the documented Bruno grammar
+  (block sections: `meta`, `<method>`, `headers`, `body:<kind>`,
+  `query`, `vars:pre-request`, `vars:post-response`, `auth:*`,
+  `script:pre-request`, `script:post-response`, `assert`, `docs`).
+  Tokenisation is line-oriented; bodies inside braces are
+  free-text until the matching `}` at column 0.
+- Round-trip preservation: parse → serialise must be a no-op on a
+  well-formed file (golden tests with `insta`). Adding a header
+  via the UI inserts at the documented position; never reorders
+  unrelated content.
+- **Tests:** `tests/fixtures/http/` — a small Bruno collection with
+  one GET, one POST with JSON body, one with auth, one with
+  pre-request script. Golden round-trip for each.
+- **Done when:** every fixture round-trips byte-identical; malformed
+  files surface a typed `ParseError` with line:col, never panic.
+
+### M11.2 — Collection + environment model
+
+- Detect a `bruno.json` or `cockpit-http/` directory at the project
+  root → `Collection { root, requests: Vec<Request>, environments:
+  Vec<Environment> }`. Collections nest: subdirectories become
+  folders.
+- `Environment` parses `environments/<name>.bru` (Bruno's spec) into
+  `{ name, vars: HashMap<String, String> }`. Active environment is
+  per-project state (persisted in `ProjectCache`, M6.6).
+- Variable interpolation: `{{varName}}` resolved against the active
+  environment, falling back to OS env when the env file declares
+  `process.env.FOO`. Cycles are detected and surfaced as a typed
+  error.
+- **Tests:** env switching, variable resolution, missing-var
+  diagnostics, cyclic references.
+
+### M11.3 — `HttpEngine` trait + reqwest impl
+
+- `trait HttpEngine { fn send(&self, req: PreparedRequest) ->
+  Result<Response, HttpError>; }` — blocking, synchronous on the
+  caller's perspective. Real impl uses `reqwest::blocking::Client`
+  on a dedicated thread with a channel boundary (so the UI thread
+  never blocks on network).
+- `PreparedRequest`: post-interpolation, post-script, ready-to-ship
+  HTTP. `Response`: status, headers, body bytes, timing, redirects.
+- TLS: default platform native-tls (reqwest default); document that
+  custom CA bundles work via `SSL_CERT_FILE`.
+- Cancellation: the engine returns a `CancelHandle` that the UI can
+  trip when the user hits `Ctrl-C` on an in-flight request.
+- **Tests:** `FakeHttpEngine` scripted exchanges; happy-path GET,
+  redirect chain, 4xx, 5xx, timeout, network error. Real reqwest
+  tests behind the `integration` feature against a local
+  `wiremock` server.
+
+### M11.4 — View-model + render
+
+- `cockpit-ui::http`: `HttpView` holds the active collection,
+  selected request, in-progress send state, latest response. Mirrors
+  the notebook view-model structure (`Notebook` → `Cell`s) — one
+  active request at a time, history is the file's git history.
+- Render layout (inside the editor pane when a `.bru` file is
+  active):
+  - Top half — request editor (Vim mode, normal editor surface —
+    no special key handling needed beyond `:HttpSend`).
+  - Bottom half — response panel. Tabs: **Body** (pretty-printed
+    JSON if `application/json`; XML if XML; raw otherwise),
+    **Headers**, **Timing**, **Raw**. Switching tabs is a palette
+    command (default `<leader>h1..h4`).
+- Resize the split with the existing M4.7 mouse-drag plumbing.
+- **Done when:** opening a `.bru` file shows the split; running
+  the request populates the response panel; tab switching works.
+
+### M11.5 — Commands + keybinds
+
+Registered in `cockpit-commands`:
+
+- `Http: Send Request` (default `<leader>hs`) — sends the active
+  request through the engine, populates the response panel.
+- `Http: Send All In Folder` — runs every request in the current
+  folder sequentially; results stream into a side log pane.
+- `Http: Switch Environment` (default `<leader>he`) — opens a
+  palette listing parsed environments.
+- `Http: Copy As cURL` — emits the equivalent curl command to the
+  clipboard for sharing.
+- `Http: Save Response To File` — writes the latest body to
+  `responses/<request-name>.<ext>`, never overwrites without
+  confirm.
+
+### M11.6 — Scripts (Lua, capability-gated)
+
+- Bruno's JS pre/post scripts don't run; cockpit substitutes
+  **Lua** scripts (reuses M9.x sandbox + capability model).
+- New script block `script:lua-pre-request` and
+  `script:lua-post-response`. Same env access as v0.9 extensions:
+  `cockpit.http.set_var(name, value)`,
+  `cockpit.http.response()` (read-only access to the just-received
+  response), with sandbox restrictions intact.
+- Capability `http.scripts` required to run any script; default-deny.
+  User grants per collection in `~/.config/cockpit/extensions.toml`.
+- **Out of scope:** JavaScript runtime, full Bruno script
+  compatibility. Users with JS scripts get a clear toast: *"Lua
+  scripting only; JS scripts skipped. See docs/http.md."*
+
+### M11.7 — Docs
+
+- `docs/http.md` — what's supported, what's not (JS scripts,
+  the OAuth2 device-code flow until v0.11.1, the GraphQL response
+  introspection panel), worked examples on the fixture
+  collection, security model (TLS, secrets via env vars, no
+  cleartext password storage).
+
+### v0.11 exit checklist
+
+- [ ] Cockpit recognises a Bruno collection at the project root;
+      the launcher shows it as a "Bruno collection" project kind.
+- [ ] Opening a `.bru` file shows the split request/response view.
+- [ ] `<leader>hs` sends; response renders in < 50 ms after the
+      network round-trip completes (excludes the network itself).
+- [ ] `{{baseUrl}}`-style interpolation works against the active
+      environment.
+- [ ] Switching environments via `<leader>he` survives a restart
+      (persisted in `ProjectCache`).
+- [ ] `Http: Copy As cURL` produces a valid curl invocation
+      including headers and body.
+- [ ] A Bruno collection that runs in the upstream Bruno desktop
+      app also runs in cockpit (round-trip parity on the fixture
+      collection).
+- [ ] `mise run ci` green; integration leg adds a `wiremock` test
+      hitting localhost.
+
+### Sequencing
+
+```diagram
+M11.1 (parse) ──▶ M11.2 (collection)
+                       │
+                       ▼
+              M11.3 (engine) ──▶ M11.4 (view) ──▶ M11.5 (commands)
+                                                      │
+                                                      ▼
+                                             M11.6 (lua) ──▶ M11.7 (docs)
+```
+
+M11.1 + M11.2 are pure-text-processing and ship as the first PR.
+M11.3 is independent (just needs the model from M11.2) and can run
+in parallel with M11.4 once the data shape is locked. M11.6 depends
+on the v0.9 Lua VM; if v0.9 lands first this is "free", otherwise
+it's the long pole.
+
+### Risk notes
+
+| Risk                                          | Mitigation                                              |
+|-----------------------------------------------|---------------------------------------------------------|
+| `.bru` format changes upstream                | Pin parser to a documented Bruno version; ship a `cockpit-http: format mismatch` toast on unknown blocks and skip them rather than crashing. |
+| `reqwest` brings in a chunky dep tree         | Use `reqwest` with `default-features = false` + `rustls-tls`, `json`, `gzip`, `stream` only. Measure binary-size delta against the v0.6 budget. |
+| Secret leakage via copy-as-curl               | Mask `Authorization:` headers in the clipboard output unless the user holds `Shift` (palette suffix variant); show a toast either way. |
+| Stuck requests block the UI                   | Engine runs on a dedicated thread; CancelHandle ships with every send. Test: a `wiremock` `delay(60s)` request cancels cleanly in <100 ms. |
+| JS-only Bruno scripts break user workflows    | Doc the gap loudly; provide a `Help: Translate Script To Lua` palette command that opens an issue template with the JS source pre-filled. |
+| Bruno auth flows (OAuth2 device-code)         | Ship Basic + Bearer + API-key in v0.11; OAuth2 device-code is v0.11.1, gated on a real user asking. |
+
+---
+
+## 8h. v0.12 — Ambient services + Org-mode jot  (NEW — post-spec)
+
+Goal: an Emacs-Org-compatible task/note surface that's reachable **even
+when the cockpit window is minimised or closed**, plus the shared
+infrastructure that the v0.13 launcher reuses. Users point cockpit at a
+folder of `.org` files (default `~/org/`); the same files open
+unchanged in Emacs, Logseq, Beorg, Orgzly, or any other Org tool. This
+is the first v0.x to ship a sibling binary with its own process,
+system-tray icon, and global hotkey.
+
+### Why Org-mode
+
+- Same pattern as v0.11's Bruno-compat: the **files on disk are the
+  source of truth**, in a format other tools already speak. No
+  proprietary store, no schema migrations to fear, no lock-in.
+- Org is decades-stable, plain-text, diff-friendly, and the agenda /
+  capture / scheduling vocabulary is already what most note-and-task
+  systems eventually converge on.
+- Storage is "a folder" — works with any sync layer the user already
+  runs (Syncthing, git, Dropbox, iCloud Drive). Sync is the user's
+  problem, not ours.
+
+### Why a sibling binary
+
+- AGENTS.md §1.7 ("M7.1: at most one `winit::EventLoop` per process")
+  is non-negotiable. A second always-on window means a second process.
+- A sibling binary keeps the cockpit's instant-load budget intact (M6.x)
+  — the tray app boots independently and is a few hundred kilobytes.
+- The split lets a user run jot/launcher without ever opening the
+  full cockpit, which is the whole point of the "even when minimised"
+  ask.
+- IPC is the boundary, not a shared `static`: same crate workspace, but
+  two binaries that talk via a documented Unix socket / Windows named
+  pipe protocol.
+
+### Architectural pieces
+
+| Piece                            | New crate / location                  |
+|----------------------------------|----------------------------------------|
+| System tray icon + menu          | `cockpit-tray` (wraps `tray-icon`)     |
+| Global hotkey registration       | `cockpit-hotkey` (wraps `global-hotkey`)|
+| IPC protocol + serde types       | `cockpit-ipc` (Unix socket + named pipe)|
+| Frameless floating window shell  | `cockpit-popover` (winit + glow, headless-tested view-models elsewhere) |
+| Org-mode parser + index          | `cockpit-org` (wraps `orgize`)         |
+| Capture template engine          | `cockpit-org::capture`                 |
+| Agenda query engine              | `cockpit-org::agenda`                  |
+
+The first four crates are **shared infrastructure** — v0.13 reuses
+them for the launcher. The `cockpit-org` crate is jot-specific and
+the only entirely new domain crate in v0.12.
+
+### Org-mode subset shipped in v0.12
+
+In scope:
+
+- Hierarchical headlines (`*`, `**`, `***`…) with title, tags
+  (`:work:urgent:`), and TODO keyword.
+- TODO state cycling on the default `TODO | DONE` workflow.
+  Custom workflows (`TODO | NEXT | WAIT | DONE`) are v0.12.x.
+- `SCHEDULED:` and `DEADLINE:` timestamps with the standard
+  `<2026-06-01 Mon>` / `<2026-06-01 Mon 09:00>` / repeater
+  (`+1w`, `++1d`) syntax.
+- Active vs inactive timestamps (`<...>` vs `[...]`).
+- Plain-text body paragraphs and lists.
+
+Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
+
+- `:PROPERTIES:` / `:END:` drawers, custom TODO workflows,
+  effort estimates, archive files.
+- Babel executable code blocks, org tables + table calc,
+  clocking (`CLOCK:` / time tracking), org-roam-style note
+  graphs, LaTeX/math rendering.
+- Emacs-style link resolution (`[[file:foo.org::Headline]]`).
+  External URLs render as links; org-internal links render as
+  inert text in v0.12.
+
+### M12.1 — `cockpit-ipc`: protocol + transport
+
+- Wire format: length-prefixed CBOR (small, fast, schema-evolution
+  friendly via `serde`). One newline-delimited JSON fallback for
+  debugging via `socat`.
+- Transport: Unix domain socket at `$XDG_RUNTIME_DIR/cockpit.sock`
+  (Linux/macOS), Windows named pipe `\\.\pipe\cockpit`. Single
+  socket; messages are tagged with a target service name.
+- Services: `jot`, `launcher`, `cockpit` — each is one channel.
+- Connection lifecycle: server (whichever process is the host)
+  registers services; clients open a connection and address messages.
+- Auth: the socket lives in a user-only directory; no cross-user
+  reach. Document explicitly that this is *not* a remote protocol.
+- **Tests:** scripted client/server pair in a tempdir; message
+  ordering, reconnect, malformed-frame handling, per-OS smoke.
+
+### M12.2 — `cockpit-tray`: system tray icon
+
+- Thin wrapper over `tray-icon` (the same crate Tauri uses; mature
+  on all three OSes).
+- Public API: `Tray::new(icon)`, `tray.set_menu(...)`,
+  `tray.on_left_click(...)`, `tray.on_menu_item(...)`. Headless
+  fake (`FakeTray`) for tests.
+- **Tests:** unit on the headless fake; smoke on real `tray-icon`
+  behind the `ui-smoke` feature (gated to non-headless CI legs).
+
+### M12.3 — `cockpit-hotkey`: global hotkey registration
+
+- Wrapper over `global-hotkey` (also Tauri-aligned). Maps chord
+  strings (`Ctrl+Alt+J`) to typed `Hotkey` records.
+- Conflict detection: if the requested chord is already owned by
+  another app at register time, the wrapper returns a typed error
+  and surfaces a toast in the tray. Never silently fails.
+- **Tests:** headless fake hotkey bus; integration tests behind
+  `ui-smoke` register a low-collision chord
+  (`Ctrl+Alt+F12`-class) and assert the callback fires.
+
+### M12.4 — `cockpit-popover`: frameless floating window
+
+- New `winit`+`glow` shell, **independent of `cockpit-render`** —
+  smaller, no editor / no mux / no tab-bar. AGENTS §1's "only one
+  crate uses winit" rule reads as *per binary* (M7.1: "one event
+  loop per process"); sibling binaries each get their own.
+- Frameless, always-on-top, centred or anchored to the active
+  display. ESC dismisses. Loses focus → dismisses (configurable).
+- Reuses `cockpit-render`'s glyph atlas + theme + painter via a
+  trimmed-down `Painter` extracted into a `cockpit-paint` crate
+  during this milestone (one-line job — the painter is already
+  decoupled). **Atlas disk cache (M6.4) is shared across both
+  binaries via the existing on-disk codec.**
+- The popover's *content* is a view-model implementing a small
+  `PopoverContent` trait (`tick`, `paint`, `on_key`, `wants_exit`).
+  The jot app and the launcher each provide an impl.
+- **Tests:** unit on `PopoverContent` impls (headless); smoke on
+  the real window behind `ui-smoke`.
+
+### M12.5 — `cockpit-org`: parser, store, view-model
+
+- New crate. Wraps `orgize` (`0.10`+) for parsing. Domain types
+  are thin layers over orgize's AST so we don't fight the upstream
+  model:
+  - `OrgFile { path, content_hash, headings: Vec<Heading> }`.
+  - `Heading { level, title, todo_state, tags, scheduled,
+    deadline, body, children, line_range }`.
+  - `Timestamp { date, time, repeater, is_active }`.
+  - `OrgRoot { root_dir, files: BTreeMap<PathBuf, OrgFile> }`.
+- **Round-trip preservation is non-negotiable.** Same constraint
+  as v0.11 / M8.1: parse → mutate → serialise leaves untouched
+  blocks byte-identical (whitespace, comments, blank lines). We
+  edit by **line-range replacement** on the original source
+  buffer, never by re-emitting the full AST. Golden round-trips
+  guard this on every fixture.
+- Storage: a single user-configured root folder, default `~/org/`.
+  Cockpit walks the folder once on start, watches it via `notify`
+  (already a dep — M9.5) for live updates, and keeps every
+  `.org` file's parsed form in memory. **No database.** No
+  separate "cockpit metadata" sidecar files — anything cockpit
+  needs is encoded in standard Org syntax.
+- Default folder layout written on first launch (only if the root
+  is empty, never overwrites):
+  ```
+  ~/org/
+    inbox.org       # capture default lands here
+    tasks.org       # project work, scheduled items
+    notes.org       # zettel-style notes
+    journal.org     # date-tree, one heading per day
+  ```
+  Users can repoint anywhere — the layout is a default, not a
+  requirement. A folder full of pre-existing `.org` files Just
+  Works.
+- View-models in `cockpit-ui::org` (reusable from both the main
+  cockpit and the popover): `OrgListView`, `AgendaView`,
+  `CaptureView`. All pure data — same shape used by notebooks
+  (M5.3).
+- **Tests:** `orgize` round-trip on a corpus of Emacs-authored
+  fixtures (committed in `tests/fixtures/org/`); headline
+  enumeration; timestamp parsing for every form documented in
+  the Org manual (active/inactive/date-only/with-time/repeater);
+  line-range edit preserves siblings byte-identical.
+
+### M12.5a — Capture templates
+
+- A capture template is a typed slot the user fills in once and
+  commits to a specific destination file + heading. The templates
+  themselves live in `~/.config/cockpit/org.toml`:
+  ```toml
+  [org]
+  root        = "~/org"
+  default_todo_keywords = ["TODO", "DONE"]
+
+  [[org.capture]]
+  key      = "t"
+  name     = "Todo"
+  target   = { file = "inbox.org", under = "Tasks" }
+  template = """
+  * TODO %?
+    :PROPERTIES:
+    :CREATED: %U
+    :END:
+  """
+
+  [[org.capture]]
+  key      = "n"
+  name     = "Note"
+  target   = { file = "notes.org", under = "Inbox" }
+  template = "* %? :note:\n  Captured %U from %a"
+
+  [[org.capture]]
+  key      = "j"
+  name     = "Journal"
+  target   = { file = "journal.org", datetree = true }
+  template = "* %U %?"
+  ```
+- Substitution tokens (mirrors Emacs `org-capture-templates`):
+  - `%?` — cursor position after expansion.
+  - `%U` / `%u` — inactive / active timestamp of now.
+  - `%t` / `%T` — active date / date-time.
+  - `%a` — annotation: the editor's `path:line` if a buffer is
+    active, otherwise empty. (Cockpit's contribution beyond
+    Emacs's `%a`: when capture fires from a launcher action that
+    carries context, the context becomes the annotation.)
+  - `%i` — initial content: the current selection if any.
+  - `%(lua-expr)` — Lua expression evaluated under the v0.9
+    sandbox (capability `org.capture.lua`, default-granted).
+- `target.datetree = true` slots the entry under
+  `* 2026` → `** 2026-05` → `*** 2026-05-28 Thu`, creating
+  missing levels.
+- **Tests:** each token's substitution against frozen-clock fakes
+  (the M4.10 `Clock` trait); date-tree insertion in an empty file
+  and in one with existing date headings; capture preserves
+  unrelated headings byte-identical.
+
+### M12.5b — Agenda
+
+- Agenda view aggregates SCHEDULED / DEADLINE items across every
+  org file under the root. View modes:
+  - **Today** — items due / scheduled for the current day,
+    overdue items (DEADLINE in the past, still TODO).
+  - **Next 7 days** — calendar-style week view, one block per
+    day.
+  - **TODO list** — every headline in a TODO state, grouped by
+    file, ignoring dates.
+- Filtering: by tag (`+work-personal`), by TODO keyword, by file.
+  The query syntax is a small subset of Org's agenda search
+  syntax — full Org agenda filtering is out of scope; ship the
+  common cases and let users fall through to in-cockpit search
+  for the rest.
+- Repeater handling: a repeating headline (`SCHEDULED: <2026-06-01
+  Mon +1w>`) marked DONE in cockpit bumps the timestamp forward
+  one period, exactly as Emacs does. Tested against a corpus of
+  repeater forms (`+1d`, `+1w`, `++1m`, `.+2d`).
+- Performance: agenda is computed from the in-memory `OrgRoot`,
+  not from disk on every paint. Re-index on `notify` events.
+  For 10k headlines across 100 files (a reasonable upper bound),
+  the agenda must render in < 50 ms — asserted in the bench leg
+  (M6.1's harness, new `agenda_perf` test).
+- **Tests:** agenda content for a fixture root containing every
+  scheduling permutation; today-view against a frozen clock;
+  repeater bump on DONE.
+
+### M12.6 — Sibling binary `cockpit-jot`
+
+- New binary in the workspace. Standalone.
+- Owns: tray icon (M12.2), global hotkey (M12.3), popover (M12.4)
+  hosting the Org view-models (M12.5/.5a/.5b), IPC server (M12.1)
+  exposing the `org` service so the main cockpit can drive the
+  same `OrgRoot`.
+- **Default hotkeys** (configurable in `~/.config/cockpit/org.toml`):
+  - `Ctrl+O` — **capture** (opens the capture-template picker;
+    pressing the template key triggers immediate quick-entry).
+  - `Ctrl+Alt+A` — **agenda** (opens the popover on today's
+    agenda).
+  - `Ctrl+Alt+O` — **org overview** (opens the popover on the
+    list-of-files view).
+
+  All three chords run through `cockpit-hotkey`'s conflict
+  detection (M12.3). `Ctrl+O` collides with "Open file" inside
+  most editors / browsers — the conflict detector flags this at
+  register time, and the docs explicitly call out that the
+  global override means apps lose their local `Ctrl+O`. Users
+  who don't want that pick a different chord.
+- Tray menu: *Capture…*, *Agenda*, *Open inbox*, *Open root in
+  cockpit*, *Settings*, *Quit*.
+- Capture flow:
+  1. Hotkey fires; popover opens on the template picker
+     (`t` Todo / `n` Note / `j` Journal / …).
+  2. User picks a key; the popover swaps to a single-field
+     editor with the template pre-expanded and the cursor at the
+     `%?` slot.
+  3. `Ctrl+Enter` commits — writes the entry to the right file
+     under the right heading, dismisses the popover, returns
+     focus to wherever it was. Sub-100 ms hotkey-to-focus-in-field
+     is the target (asserted under `--features bench`).
+- Agenda flow: popover opens on the Today view; arrow keys move
+  the cursor between headlines; `Enter` jumps into the
+  cockpit (via IPC) and opens the underlying `.org` file at the
+  right line. `Tab` cycles Today / Next-7 / TODO list. `/` filters.
+- Background behaviour: process keeps running after the popover
+  dismisses; tray icon + `notify` watcher are the only persistent
+  surfaces. The in-memory `OrgRoot` survives across popover
+  dismissals — re-opening agenda is instant.
+- Autostart: opt-in. Provide platform install scripts:
+  - Linux: `~/.config/autostart/cockpit-jot.desktop`.
+  - macOS: `~/Library/LaunchAgents/dev.cockpit.jot.plist`.
+  - Windows: registry `Run` key.
+  - The cockpit binary surfaces a *"Enable jot autostart"* palette
+    command that writes the right file with explicit confirm
+    (AGENTS §2 #6 spirit).
+
+### M12.7 — Main-cockpit integration
+
+- The cockpit already paints `.org` files via the editor (no new
+  language for the buffer — Org gets a `Language::Org` highlight
+  arm here, following the v0.10 pattern for Go: `tree-sitter-org`
+  for highlight, `cockpit-org` for structural ops).
+- New in-cockpit pane: **Agenda** (floating, reuses M8.2 floating-
+  pane primitive) shows the same view-model as the tray app via
+  the `org` IPC service.
+- Palette commands:
+  - `Org: Capture` (`<leader>oc`) — template picker, same flow
+    as `Ctrl+O` from the tray.
+  - `Org: Agenda` (`<leader>oa`) — floating agenda.
+  - `Org: Jump To Inbox` (`<leader>oi`).
+  - `Org: Refile` — move the headline under the cursor to a
+    chosen target (file + parent heading).
+  - `Org: Toggle TODO State` (`<leader>ot`) — cycles
+    TODO → DONE → no-keyword on the cursor's headline. Pure
+    editor-buffer operation; respects line-range round-trip rule.
+  - `Org: Schedule` / `Org: Deadline` — prompt for a date,
+    insert/update the timestamp on the cursor's headline.
+  - `Org: Toggle Project Filter` — scopes the agenda to org
+    files tagged with the current project's name. (Optional;
+    Org isn't intrinsically project-scoped the way the SQLite
+    plan was.)
+- When `cockpit-jot` isn't running, the cockpit reads/writes the
+  `.org` files directly. When it is, edits go through IPC so the
+  tray app's in-memory `OrgRoot` stays live and `notify` doesn't
+  trigger a redundant re-parse. Either path produces byte-
+  identical file contents — they share the M12.5 line-range
+  edit primitives.
+- **Tests:** in-cockpit pane scripted edits; IPC + direct-write
+  parity on the same fixture; round-trip preservation under
+  TOGGLE-TODO + SCHEDULE on a fixture authored in Emacs.
+
+### M12.8 — Sync (effectively free)
+
+- The org root is a folder of plain-text files. Sync is the
+  user's existing solution: git, Syncthing, iCloud Drive,
+  Dropbox, NextCloud — all work without cockpit doing anything.
+- Cockpit ships **no** sync engine. We document the patterns in
+  `docs/org.md`:
+  - **git** — point a working copy at the root; `git pull` /
+    `git push` from the cockpit's mux terminal (or via the v0.8
+    Lazygit recipe). Merge conflicts are resolved in the editor
+    like any other text file.
+  - **Syncthing / iCloud / Dropbox** — point the sync folder at
+    the org root. The `notify` watcher picks up remote writes
+    and re-indexes within ~1 s.
+- The only cockpit-side concern is graceful handling of
+  concurrent writes (remote sync touches a file while cockpit
+  has it open). Mitigation: every edit reloads the file's
+  on-disk content first, checks the recorded content hash, and
+  if it changed surfaces a *"file changed on disk; reload?"*
+  toast instead of clobbering. Same model the editor already
+  uses for external buffer changes.
+
+### v0.12 exit checklist
+
+- [ ] `cockpit-jot` runs as a separate process; tray icon present
+      on all three OSes.
+- [ ] `Ctrl+O` from any focused window opens the capture-template
+      picker in < 150 ms cold / < 50 ms warm on a low-end Linux
+      laptop.
+- [ ] Picking the `t` template, typing a title, and pressing
+      `Ctrl+Enter` appends a `* TODO ...` heading to `inbox.org`
+      under the configured parent heading; the file is immediately
+      readable in Emacs / Logseq with no syntax surprises.
+- [ ] `Ctrl+Alt+A` opens the agenda; SCHEDULED items for today and
+      DEADLINE items in the next 7 days appear in the correct
+      buckets; repeater on DONE bumps the timestamp.
+- [ ] Editing a `.org` file in the main cockpit shows up in the
+      tray app's in-memory `OrgRoot` within ~1 s (notify watcher).
+- [ ] An Emacs-authored `.org` file containing every fixture's
+      syntax (headlines, tags, TODO states, SCHEDULED/DEADLINE
+      with repeaters, active/inactive timestamps) round-trips
+      byte-identical through cockpit's edit-then-save path.
+- [ ] Closing the main cockpit does not disturb the tray app;
+      reopening picks up the same org root.
+- [ ] Autostart command writes the right file and survives a
+      reboot.
+- [ ] `mise run ci` green; new `ipc-smoke` CI leg exercises the
+      IPC protocol per OS; new `org_roundtrip` bench test gates
+      agenda perf (< 50 ms on a 10k-headline corpus).
+
+### Sequencing
+
+```diagram
+M12.1 (ipc) ───┐
+M12.2 (tray) ──┼──▶ M12.4 (popover) ──┐
+M12.3 (hotkey)─┘                       │
+                                       ▼
+                  M12.5 (org parse) ──▶ M12.5a (capture) ──▶ M12.5b (agenda)
+                                                                  │
+                                                                  ▼
+                                                M12.6 (jot bin) ──▶ M12.7 (cockpit) ──▶ M12.8 (sync docs)
+```
+
+M12.1–M12.3 ship as a single "infrastructure" PR — they're the v0.13
+launcher's foundation too. M12.4 + M12.5 are independent of the infra
+PR. M12.5a builds on M12.5; M12.5b can run in parallel with M12.5a
+once M12.5 is in. M12.6 + M12.7 close the loop.
+
+### Risk notes
+
+| Risk                                          | Mitigation                                              |
+|-----------------------------------------------|---------------------------------------------------------|
+| `tray-icon` quirks per OS                     | Stick to the API surface Tauri uses; CI smoke per OS catches regressions. Tray menu kept minimal — 6 items, no nested submenus. |
+| `global-hotkey` chord conflicts               | Detect at register; surface clearly; suggest alternatives in the toast. Never grab a chord behind the user's back. `Ctrl+O` collision with browser/editor "Open file" is documented loudly; users can remap. |
+| `orgize` API drift                            | Pin to a specific minor version; integration tests run against a fixture corpus that triggers every supported feature. Major-version bumps are a milestone-level change. |
+| Round-trip byte-identical edits drift         | Line-range replacement on the original source buffer (never AST re-emit) + golden fixture corpus authored in Emacs. Property test: parse → mutate-no-op → serialise == input on a generator of fuzzy `.org` strings. |
+| Two writers to the same `.org` file          | The editor's "file changed on disk" toast catches the race; cockpit reloads before overwriting. Plain-text + git-friendly format means worst case is a 3-way merge, not data loss. |
+| Process supervision (jot crashes)             | Tray app is intentionally simple; if it crashes the user notices because the tray icon vanishes. No respawner in v0.12 — out of scope, adds surface for very rare failure. |
+| Users want cloud sync                         | v0.12 documents the patterns. Plain-text org files mean any sync solution works without cockpit code. |
+| Agenda perf on large vaults                   | Bench leg asserts < 50 ms on 10k headlines. If perf regresses, the agenda index becomes a separate `BTreeMap<Date, Vec<HeadlineRef>>` recomputed on `notify` rather than per-paint. |
+| Two binaries means two release artifacts      | The release workflow already packages per-OS; add a `--bins cockpit cockpit-jot` flag. Document in `docs/install.md`. |
+| Bonus binary breaks `mise run run`            | `mise.toml` task list grows: `run` keeps launching the main cockpit, new `run-jot` launches the sibling, `run-all` starts both. |
+| Org user expects full Emacs parity            | Document the v0.12 subset loudly in `docs/org.md`. Out-of-scope features listed up front, with the "open in Emacs for X" escape hatch made explicit. |
+
+---
+
+## 8i. v0.13 — Quick-action launcher (Raycast-style)  (NEW — post-spec)
+
+Goal: a system-wide, frameless, hotkey-summoned launcher with **mise tasks
+and Lua extensions as backends**. Conceptually Raycast / Albert / Ulauncher
+— pop up from anywhere, fuzzy-search across action providers, hit Enter
+to dispatch. Reuses every piece of v0.12 infrastructure (tray, hotkey,
+popover, IPC).
+
+### Scope
+
+Three primary action providers in v0.13:
+
+1. **mise tasks** — every task across known mise projects becomes a
+   launcher entry; running it spawns through `mise exec` in the
+   right project root.
+2. **Lua extensions** — v0.9's `cockpit-lua` gets a new namespace
+   `cockpit.launcher.action { id, title, run }` that registers
+   actions visible to the launcher.
+3. **Built-ins** — `Open Project`, `Recent Files`, `Calculator`
+   (`=2+2*3`), `Switch Theme`, `Open URL` (paste a URL → open in
+   browser).
+
+**Out of scope:** web search, Spotify control, system actions
+(volume, brightness), Raycast's commercial AI assistant tier,
+extensions discovery / marketplace. AGENTS §2 #7's no-marketplace
+rule still binds.
+
+### Architecture
+
+```diagram
+╭───────────────╮     ╭─────────────────╮     ╭──────────────────╮
+│ cockpit-quick │────▶│ cockpit-        │────▶│  Providers       │
+│ (binary)      │ ipc │ launcher        │     │  - mise          │
+│  tray + hotkey│     │ (headless core) │     │  - lua           │
+│  popover      │     │  fuzzy match    │     │  - builtins      │
+╰───────────────╯     │  action exec    │     ╰──────────────────╯
+                       ╰─────────────────╯
+```
+
+New crates:
+
+- `cockpit-launcher` — headless core. Action registry, provider
+  trait, fuzzy matcher (`nucleo`, already a workspace dep), action
+  dispatch. Fully unit-testable.
+- `cockpit-quick` — sibling binary. Same shape as `cockpit-jot`:
+  tray icon, global hotkey, popover, IPC client. Hosts the
+  launcher view-model on top of `cockpit-popover` (M12.4).
+
+### M13.1 — `cockpit-launcher`: provider trait + matcher
+
+- `trait ActionProvider { fn id(&self) -> &str; fn search(&self,
+  query: &str) -> Vec<Action>; }`.
+- `struct Action { id: String, title: String, subtitle:
+  Option<String>, icon: ActionIcon, run: ActionRun }`.
+- `ActionRun` is a typed enum: `Command(CommandId,
+  Vec<ActionArg>)`, `Process(ProcessSpec)`, `OpenUrl(Url)`,
+  `OpenPath(PathBuf)`, `Lua(LuaActionHandle)`.
+  Crucially: every dispatch path lands on
+  `cockpit-commands::CommandId` eventually (AGENTS §2 #5) so the
+  palette and the launcher share one execution spine.
+- Matcher: `nucleo`-backed (the same crate the in-cockpit palette
+  uses). Multi-provider ranking: providers return scored
+  candidates; the launcher merges by total score with a per-
+  provider quota to avoid one provider drowning the list.
+- **Tests:** ranking with synthetic providers; quota enforcement;
+  empty-query "favourites" listing; query escaping.
+
+### M13.2 — Provider: mise tasks
+
+- Mise project discovery (independent of any cockpit window): walk
+  `~/.config/cockpit/launcher.toml`'s `[mise.projects]` table —
+  explicit list of project paths. **No filesystem crawl.** Users
+  add a project by running `Launcher: Add Mise Project` from the
+  cockpit (or editing the file).
+- For each known project, parse `mise.toml` (reuse
+  `cockpit-project::mise`) and expose every task as an
+  `Action { title: "<project>: <task>", run: Process(...) }`.
+- Re-scan trigger: file watcher on the listed `mise.toml`s (notify
+  crate, reused from M9.5).
+- **Out of scope:** running tasks against the cockpit's *open*
+  project specifically — that's the in-cockpit palette's job.
+
+### M13.3 — Provider: Lua extensions
+
+- Extends v0.9's `cockpit-lua` with a new `cockpit.launcher`
+  namespace:
+  ```lua
+  cockpit.launcher.action {
+    id     = "user.weather",
+    title  = "Today's weather",
+    run    = function(ctx)
+      ctx.toast("23°C, partly cloudy")
+    end,
+  }
+  ```
+- Capability: actions that need network / filesystem still go
+  through M9.4's capability gate. Pure-Lua actions (e.g.
+  calculator) need nothing.
+- **Discovery:** the sibling binary loads
+  `~/.config/cockpit/extensions/*.lua` on start, same as the
+  cockpit. They share the directory; an extension that registers
+  both palette commands and launcher actions appears in both
+  surfaces.
+- **Tests:** scripted Lua action registration; sandbox enforcement
+  identical to v0.9.
+
+### M13.4 — Provider: built-ins
+
+- `Open Project` → reads the cockpit's recent-projects cache (M2.7,
+  M6.6) via the IPC service, opens the selected project in the
+  cockpit (sending an `OpenProject(path)` IPC message — the
+  cockpit either focuses an existing project window or
+  launches one).
+- `Calculator` — query starting with `=` is parsed by a tiny
+  expression evaluator (no dep; ~100 LoC). Result is the action
+  itself ("Press Enter to copy `42` to clipboard").
+- `Open URL` — query matching a URL regex shows an action to open
+  in `$BROWSER`.
+- `Switch Theme` — same as the in-cockpit `Theme: Switch …`
+  palette, but dispatched over IPC.
+- `Org Capture: <Template>` — one launcher entry per template
+  configured in v0.12's `org.toml`. Hitting Enter routes through
+  the `org` IPC service to trigger the same capture flow the
+  tray app uses. Means the launcher's universal hotkey is a
+  second entry point to capture, complementing `Ctrl+O`.
+- `Org Agenda` — opens the agenda popover via the `org` IPC
+  service (or launches the tray app if it isn't running).
+
+### M13.5 — `cockpit-quick`: sibling binary
+
+- Same shape as `cockpit-jot`: tray icon (M12.2), global hotkey
+  (M12.3, default `Ctrl+Space`; collides with input-method
+  switchers on some setups — the conflict path from M12.3
+  surfaces a toast), popover (M12.4), IPC client (M12.1).
+- Popover content: text input on top, results list below (max 8
+  rows), provider tag per row, keyboard-only navigation. Enter
+  dispatches. `Tab` cycles secondary actions on the focused row
+  (Raycast convention).
+- Cold-start budget: ≤ 200 ms hotkey-to-popover-visible on a
+  low-end Linux laptop. Process is long-lived; the popover is
+  cheap to summon.
+- **Tests:** popover view-model goldens; provider integration
+  smoke per OS.
+
+### M13.6 — Settings + config
+
+- Single config file `~/.config/cockpit/launcher.toml`:
+  ```toml
+  [hotkey]
+  chord = "Ctrl+Space"
+
+  [providers]
+  mise     = true
+  lua      = true
+  builtins = true
+
+  [mise.projects]
+  paths = ["~/code/work", "~/code/personal"]
+
+  [launcher.ui]
+  max_rows = 8
+  position = "centred"   # centred | top
+  theme    = "inherit"   # inherit | catppuccin-mocha | …
+  ```
+- Schema lives in `cockpit-config`; reuses the M8.1 toml_edit
+  write-path for `Settings` palette flips.
+
+### M13.7 — Cockpit-side cross-launch hooks
+
+- New IPC messages on the `cockpit` service:
+  - `OpenProject(PathBuf)` — focus or launch.
+  - `DispatchCommand(CommandId, args)` — run an arbitrary
+    command in the cockpit.
+- These are the same surface v0.12 used to drive the jot pane,
+  extended with two new variants. Same auth model (user-only
+  socket).
+- **Security note:** `DispatchCommand` is intentionally
+  unrestricted (the user-only socket already implies trust).
+  Document explicitly that anyone with write access to the socket
+  can drive the cockpit, and that's by design.
+
+### v0.13 exit checklist
+
+- [ ] `Ctrl+Space` from any focused window opens the launcher in
+      < 200 ms cold / < 50 ms warm.
+- [ ] Typing `te` shows every mise `test*` task across registered
+      projects, ranked sensibly.
+- [ ] A Lua extension registering `cockpit.launcher.action` appears
+      in results within 1 s of writing the file (hot-reload).
+- [ ] `=2+2*3` shows `8`; Enter copies to clipboard.
+- [ ] Pasting a URL shows an "Open in browser" action.
+- [ ] `Open Project: <name>` in the launcher brings up that project
+      in the cockpit (focus or launch).
+- [ ] All providers survive the cockpit process being closed and
+      reopened; the launcher process is independent.
+- [ ] `mise run ci` green; the existing `ui-smoke` and new
+      `ipc-smoke` legs cover the launcher.
+
+### Sequencing
+
+```diagram
+v0.12 (infra) ──▶ M13.1 (launcher core)
+                       │
+                       ├──▶ M13.2 (mise)    ─┐
+                       ├──▶ M13.3 (lua)     ─┤
+                       ├──▶ M13.4 (builtins)─┤
+                       │                     ▼
+                       └──▶ M13.5 (binary) ──▶ M13.6 (config) ──▶ M13.7 (hooks)
+```
+
+v0.12's infra must ship before v0.13 starts — this is a hard
+dependency, not a soft one. M13.2/M13.3/M13.4 can ship in any
+order once M13.1 is in.
+
+### Risk notes
+
+| Risk                                          | Mitigation                                              |
+|-----------------------------------------------|---------------------------------------------------------|
+| `Ctrl+Space` collides with IME switchers      | M12.3's conflict detection fires loudly; default config falls back to `Ctrl+Alt+Space` on detection. |
+| Provider explosion (everyone wants their own) | Provider trait stays small; new built-ins require a plan update (same rule as v0.9 API surface). Lua is the escape hatch for one-off actions. |
+| Cold-start regression                         | Hotkey-to-popover budget asserted in CI under `--features bench`. Sibling binary stays small (no editor / no mux / no LSP). |
+| Fuzzy match quality                           | `nucleo` is the same matcher the in-cockpit palette uses; ranking-quality regressions show up there first. |
+| User expects deep system integration          | Document the v0.13 scope clearly: actions over text and processes, not OS-control. App-launcher / system-control providers are a deliberate non-goal. |
+| Two long-lived sibling binaries inflate RAM   | Measure on the v0.6 bench leg; each binary should land under 60 MB resident on Linux. If it doesn't, share the popover/atlas via a `cockpit-shell` daemon — a v0.14 question, not a v0.13 blocker. |
+
+### Future (not v0.13)
+
+- **`cockpit-shell` daemon** — collapse `cockpit-jot` and
+  `cockpit-quick` into one always-on tray process that hosts both
+  surfaces. Worth it if RAM becomes a complaint; not worth it
+  pre-emptively.
+- **Action history** — last-N dispatched actions float to the top
+  on empty query. Trivial; deferred until users ask.
+- **Multi-monitor anchoring** — popover follows the focused
+  display; today it centres on the primary. Single-monitor users
+  are the majority.
+
+---
+
 ## 9. Testing strategy realised  (maps spec §18)
 
 | Spec §        | Realisation                                                       |
