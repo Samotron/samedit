@@ -42,7 +42,7 @@ JetBrains project launcher
 + Vim-style editor
 + native file browser
 + termwiz-powered terminal
-+ Zellij workspace
++ embedded multiplexer (cockpit-mux)
 + mise project environment
 ```
 
@@ -50,9 +50,9 @@ Default layout:
 
 ```text
 ┌────────────────────┬────────────────────────────────────┬──────────────────────────────┐
-│ File Browser       │ Vim-style Editor                   │ Zellij Terminal Workspace    │
+│ File Browser       │ Vim-style Editor                   │ Embedded Multiplexer         │
 │                    │                                    │                              │
-│ project/           │ src/main.rs                        │ zellij                       │
+│ project/           │ src/main.rs                        │ cockpit-mux                  │
 │  src/              │                                    │ ┌ shell                    ┐ │
 │  tests/            │ fn main() {                        │ ├ git/lazygit              │ │
 │  mise.toml         │     println!("hi");                │ ├ test runner              │ │
@@ -71,7 +71,7 @@ The app has three permanent surfaces:
 ```text
 Left:   Project/file browser
 Middle: Vim-style text editor
-Right:  Integrated terminal running Zellij
+Right:  Integrated terminal driven by the embedded multiplexer
 ```
 
 The app owns:
@@ -84,10 +84,11 @@ layout
 keybindings
 project metadata
 mise integration
+embedded multiplexer (cockpit-mux)
 terminal bridge
 ```
 
-The terminal/Zellij workspace owns:
+The embedded multiplexer hosts:
 
 ```text
 git
@@ -114,7 +115,7 @@ This keeps the editor lean while still making it powerful.
 2. **Terminal-first, not terminal-as-afterthought.**
 3. **Project-based, like JetBrains IDEs.**
 4. **Vim-inspired editing in the centre.**
-5. **Zellij handles terminal workspace management.**
+5. **The embedded multiplexer (`cockpit-mux`) handles terminal workspace management.**
 6. **`mise` handles project tools, env vars, and tasks.**
 7. **Rust owns the app shell and editor core.**
 8. **Testing is a first-class design constraint.**
@@ -145,7 +146,13 @@ macOS:   Unix PTY
 Linux:   Unix PTY
 ```
 
-Zellij is preferred over tmux because Zellij 0.44.0 added native Windows support, along with CLI automation, a layout manager, file-path clicking, and related workspace improvements. ([zellij.dev][1])
+v0.7 onward ships an embedded multiplexer (`cockpit-mux`) instead of
+shelling out to Zellij. The decision is documented in
+[`IMPLEMENTATION_PLAN.md`] §8c — the short version is that the cockpit
+owns the multiplexer state directly so the user experience is the same
+on every OS and detach/attach happens in-process. Earlier drafts of
+this spec used Zellij; reference [zellij.dev][1] for that historical
+context.
 
 ---
 
@@ -160,7 +167,7 @@ Windowing:     winit
 Rendering:     OpenGL via glow
 Terminal:      termwiz
 PTY:           portable-pty
-Workspace:     Zellij
+Multiplexer:   embedded (cockpit-mux), tmux-style
 Project env:   mise
 Config:        TOML, KDL, or both
 Targets:       Windows, macOS, Linux
@@ -184,7 +191,7 @@ External tools and libraries should be integrated rather than reimplemented:
 
 ```text
 mise         → tools, env vars, tasks
-Zellij       → terminal workspace/session management
+cockpit-mux  → terminal workspace/session management (embedded, v0.7+)
 termwiz      → terminal emulation engine
 portable-pty → cross-platform PTY and shell hosting
 ```
@@ -263,7 +270,7 @@ active file
 pane widths
 recent files
 recent commands
-Zellij session name
+mux session name
 last selected mise task
 terminal profile
 workspace layout
@@ -372,10 +379,11 @@ The app should work with standard `mise.toml`, but may optionally recognise a me
 
 ```toml
 [metadata.cockpit]
-name = "Geotech Platform"
-default_task = "dev"
-terminal_workspace = "zellij"
-zellij_layout = ".config/zellij/dev.kdl"
+name           = "Geotech Platform"
+default_task   = "dev"
+cockpit_layout = ".config/cockpit/dev.kdl"
+# zellij_layout is the v0.1–v0.6 field and is now parsed for compat
+# but ignored at runtime.
 ```
 
 This should be optional.
@@ -384,15 +392,17 @@ The app should never require project-specific custom config to open a folder.
 
 ---
 
-## 10. Zellij Terminal Workspace
+## 10. Embedded Terminal Multiplexer (`cockpit-mux`)
 
-The right-hand terminal pane should default to **Zellij**.
+> **v0.7 update:** the original spec described an external Zellij hand-off.
+> v0.7 replaced it with an **embedded multiplexer** (`cockpit-mux`) modelled
+> on tmux. The right-hand terminal pane now spawns the host shell directly
+> and the cockpit owns sessions, windows, panes, and detach/attach in-process.
+> See [`IMPLEMENTATION_PLAN.md`] §8c for the active surface.
 
-The app should launch or attach to one Zellij session per project:
-
-```bash
-mise exec -- zellij attach --create <project-name>
-```
+The right-hand terminal pane embeds the multiplexer. Each project's
+workspace gets one default session that opens with a single live pane
+running the host shell (`$SHELL` on Unix, `powershell.exe` on Windows).
 
 Conceptually:
 
@@ -401,31 +411,37 @@ open project
   → detect mise
   → resolve project name
   → create terminal pane
-  → start PTY
-  → launch mise exec -- zellij attach --create project-name
+  → spawn host shell in cockpit-mux session
+  → optionally apply [metadata.cockpit].cockpit_layout
 ```
 
-Zellij handles internal terminal splitting:
+The multiplexer owns splits, windows, sessions, copy mode, and the
+mode-line:
 
 ```text
 Right pane
-  └── zellij
-        ├── shell
-        ├── git/lazygit
-        ├── tests
-        ├── dev server
-        └── AI/agent tools
+  └── cockpit-mux session
+        ├── window 0 (split tree)
+        │     ├── editor pane
+        │     ├── test runner pane
+        │     └── git/lazygit pane
+        ├── window 1 (logs)
+        └── floating overlay (lazygit / claude / codex on demand)
 ```
 
-The app should eventually support project-specific Zellij layouts.
+Project-specific layouts are configured via
+`[metadata.cockpit].cockpit_layout = "<path.kdl>"` (see §9). The legacy
+`zellij_layout` field is still parsed for compatibility but ignored at
+runtime.
 
 Recommended progression:
 
 ```text
-v0.1: start or attach Zellij session
-v0.2: choose terminal profile
-v0.3: open configured Zellij layout file
-v0.4: generate suggested layouts from mise tasks
+v0.1: spawn shell in default mux session
+v0.4: choose terminal profile
+v0.7: native splits / windows / detach / floating overlays
+v0.7: project-specific cockpit_layout KDL files
+v0.8: generate suggested layouts from mise tasks (future)
 ```
 
 ---
@@ -441,7 +457,7 @@ TerminalPane
   │     └── Unix PTY
   │
   ├── shell process
-  │     └── mise exec -- zellij attach --create project
+  │     └── host shell ($SHELL / powershell.exe) inside cockpit-mux
   │
   ├── terminal engine
   │     └── termwiz
@@ -470,7 +486,7 @@ The app-level layout is simple and stable:
 ```text
 Left pane:    file browser
 Centre pane:  Vim-style editor
-Right pane:   terminal running Zellij
+Right pane:   terminal driven by the embedded multiplexer
 ```
 
 Default widths:
@@ -496,9 +512,10 @@ Ctrl+Shift+p    command palette
 Ctrl+s          save
 ```
 
-When the terminal is focused, Zellij should own almost all keys.
-
-Only a very small set of global focus/toggle shortcuts should be intercepted.
+When the terminal is focused, the embedded multiplexer (`cockpit-mux`)
+owns almost all keys via the `Ctrl+b` prefix and its bindings. Only a
+small set of global focus/toggle shortcuts is intercepted before the
+prefix.
 
 ---
 
@@ -622,8 +639,9 @@ File: Save
 File: Reveal in Tree
 Editor: Toggle Relative Line Numbers
 Terminal: Focus
-Terminal: Restart Zellij
-Terminal: New Zellij Session
+Mux: New Session
+Mux: Detach / Re-attach
+Mux: Toggle Floating Pane
 Mise: Run Task
 Mise: Install Tools
 Mise: Open Config
@@ -639,7 +657,8 @@ The command palette should be backed by the same command system used by keybindi
 
 ## 17. Editor ↔ Terminal Bridge
 
-The most important workflow feature is the bridge between editor and Zellij.
+The most important workflow feature is the bridge between editor and
+the embedded multiplexer.
 
 Examples:
 
@@ -908,7 +927,7 @@ Terminal tests should be split into:
 ```text
 PTY backend tests
 terminal parser/engine tests
-Zellij launch tests
+embedded multiplexer (cockpit-mux) tests
 terminal bridge tests
 ```
 
@@ -926,20 +945,24 @@ can terminate process
 
 These should be platform-specific and may run only in integration CI.
 
-### Zellij tests
+### Multiplexer tests
 
-Zellij should be optional in tests unless available.
+`cockpit-mux` is headless: all session / window / pane / copy-mode /
+floating-overlay state lives in the data model and is unit-tested
+without a window or PTY.
 
 Test cases:
 
 ```text
-zellij binary missing → clean error
-zellij session command generated correctly
-project name converted to safe session name
-mise + zellij command generated correctly
+session create / detach / attach
+split / kill / focus pane operations
+copy-mode motions, selection, yank
+floating overlay open / toggle / close
+cockpit_layout KDL → session builder
+prefix dispatcher: Ctrl+b + key → CommandId
 ```
 
-Do not require a full interactive Zellij session in normal unit tests.
+The full multiplexer is fully exercised by `cargo test -p cockpit-mux`.
 
 ### Terminal bridge tests
 
@@ -1215,13 +1238,18 @@ use_for_lsp = true
 
 [terminal]
 engine = "termwiz"
-workspace = "zellij"
-default_profile = "project-zellij"
+workspace = "cockpit-mux"        # embedded multiplexer (v0.7+)
+default_profile = "project-shell"
 
-[terminal.profiles.project-zellij]
-label = "Project Zellij"
-command = "mise"
-args = ["exec", "--", "zellij", "attach", "--create", "{project_name}"]
+[terminal.profiles.project-shell]
+label = "Project shell"
+command = "{host_shell}"
+args = []
+
+# Optional mode-line template (v0.7 M7.7). Recognised tokens:
+# {session}, {windows}, {task}, {pane}.
+[terminal.status]
+format = "[{session}] {windows}"
 
 [keys.global]
 focus_files = "Ctrl+h"
@@ -1284,12 +1312,16 @@ cockpit/                          # Cargo workspace root
         search.rs
         syntax.rs
 
+    cockpit-mux/                  # embedded multiplexer state (v0.7+)
+      src/
+        lib.rs                    # sessions, windows, panes, copy mode, floating
+
     cockpit-terminal/
       src/
         lib.rs
-        terminal.rs
+        command.rs                # CommandSpec for PTY spawns
         engine.rs                 # termwiz-backed TerminalEngine
-        zellij.rs
+        live.rs                   # spawned PTY + reader thread
         pty.rs                    # portable-pty wrapper
         path_detect.rs
         bridge.rs
@@ -1366,7 +1398,7 @@ Three-pane layout
 File browser
 Basic Vim-style editor
 Integrated terminal
-Launch Zellij session
+Spawn host shell in embedded multiplexer
 Save/open files
 Basic command palette
 Pane focus shortcuts
@@ -1380,7 +1412,7 @@ Success criteria:
 ```text
 can open a real project
 can edit and save files
-can run Zellij in the right pane
+can spawn a shell in the embedded multiplexer
 can detect mise tasks
 can switch between panes quickly
 tests run on all target platforms
@@ -1391,7 +1423,7 @@ tests run on all target platforms
 ```text
 Fuzzy file open
 Mise task picker
-Run task in Zellij
+Run task in the embedded multiplexer
 Remember project layout
 Better Vim motions
 Syntax highlighting
@@ -1404,8 +1436,8 @@ PTY integration tests
 ### v0.3 — Strong workflow integration
 
 ```text
-Zellij layout support
-Open configured Zellij layout per project
+Per-project layout support (KDL)
+Open configured `cockpit_layout` on first attach
 Send selection/path to terminal
 Run current file
 Run nearest test
@@ -1469,16 +1501,21 @@ fragile manual-only testing
 
 ## 25. Risks
 
-### Zellij Windows maturity
+### Embedded multiplexer scope (v0.7+)
 
-Zellij's native Windows support is new, so the app should support fallback terminal profiles:
+The v0.7 work replaced the original Zellij hand-off with an in-process
+multiplexer (`cockpit-mux`) modelled on tmux. The risk pivots from
+"Zellij's Windows story is shallow" to "parity with tmux must be
+bounded": the multiplexer ships a curated subset and explicit
+non-features.
+
+Mitigation:
 
 ```text
-plain PowerShell
-WSL shell
-Git Bash
-MSYS2
-no multiplexer
+ship a tmux-style subset (splits, windows, copy mode, detach, floating)
+hard rule #7 still applies: no plugin marketplace
+host shell is the universal fallback (powershell.exe / $SHELL)
+no Unix-only sockets — portable-pty is the only OS abstraction
 ```
 
 ### termwiz API maturity
