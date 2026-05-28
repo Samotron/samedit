@@ -1647,7 +1647,7 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
 - **Done when:** saving a deliberately mis-indented `.go` file in the
   `go-basic` fixture rewrites to canonical `gofmt` style.
 
-### M10.5 — Test runner palette commands  ⚙ (nearest-name parser landed; runner integration WIP)
+### M10.5 — Test runner palette commands  ✅ (no `go list` cache; package = file's directory)
 
 - Extend `cockpit-editor::nearest_test` with a `Language::Go` arm:
   walk the AST (already available from tree-sitter-go) to find the
@@ -1659,10 +1659,18 @@ Those are follow-ups; the v0.10 exit checklist intentionally mirrors
     from `go list -f '{{.ImportPath}}' <file>` — cached per file via
     `ProcessRunner` seam so repeated invocations don't re-spawn).
   - Nearest → `go test -run '^<TestName>$' ./<package>`.
+- **Shipped behaviour vs plan:** package resolution skips the `go list`
+  cache — `fallback_test_command` uses the file's directory verbatim
+  as `./<dir>` (collapsing root-level files to `.`). This works for
+  the typical one-package-per-directory layout; tag-based or
+  multi-package directories fall back to the same `./<dir>` arg and
+  let `go test` filter. A `go list` cache via `ProcessRunner` remains
+  the right next step if real projects need it.
 - `Go: Generate` palette command runs `go generate ./...`. No
-  watch mode in v0.10.
+  watch mode in v0.10. **Not yet shipped** — track as a follow-up.
 - **Tests:** golden `nearest_test` over `_test.go` fixtures; command
-  construction tests for the three test scopes.
+  construction tests for the three test scopes (in
+  `cockpit-editor::test_runner`).
 - **Done when:** every test scope works against the fixture; output
   appears in the active mux pane via the existing M2.2 "run task in
   the active pane" path.

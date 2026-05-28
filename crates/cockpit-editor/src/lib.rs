@@ -12,6 +12,7 @@ pub mod editor;
 pub mod highlight;
 pub mod nearest_test;
 pub mod search;
+pub mod test_runner;
 pub mod undo;
 pub mod vim;
 
@@ -20,4 +21,5 @@ pub use cursor::Cursor;
 pub use editor::{Editor, EditorSignal};
 pub use highlight::{HighlightKind, HighlightSpan, Language};
 pub use nearest_test::nearest_test_name;
+pub use test_runner::{TestScope, fallback_test_command};
 pub use undo::History;
