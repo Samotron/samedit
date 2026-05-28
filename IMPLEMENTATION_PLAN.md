@@ -1806,7 +1806,7 @@ everything else (AGENTS §2 #5).
 - **Done when:** every fixture round-trips byte-identical; malformed
   files surface a typed `ParseError` with line:col, never panic.
 
-### M11.2 — Collection + environment model
+### M11.2 — Collection + environment model  ✅ (interpolation; OS-env fallback deferred)
 
 - Detect a `bruno.json` or `cockpit-http/` directory at the project
   root → `Collection { root, requests: Vec<Request>, environments:
@@ -1819,6 +1819,14 @@ everything else (AGENTS §2 #5).
   environment, falling back to OS env when the env file declares
   `process.env.FOO`. Cycles are detected and surfaced as a typed
   error.
+- **Shipped behaviour vs plan:** `detect_collection_root`,
+  `load_collection`, environment file parsing, transitive
+  interpolation with cycle detection, and disabled-row (`~`) skipping
+  are all in place. `process.env.FOO` style OS-env fallback is *not*
+  shipped — it lands with the M11.3 engine where the
+  environment-vs-process boundary actually matters. Active-environment
+  persistence in `ProjectCache` is left for the binary wiring (lands
+  with M11.4).
 - **Tests:** env switching, variable resolution, missing-var
   diagnostics, cyclic references.
 

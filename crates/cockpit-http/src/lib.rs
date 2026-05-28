@@ -18,10 +18,15 @@
 //! Stays headless and unit-tested per the AGENTS.md hard rules — no
 //! network, no async runtime, no UI dependencies.
 
+pub mod collection;
 pub mod model;
 pub mod parse;
 pub mod serialise;
 
+pub use collection::{
+    COLLECTION_DIR, COLLECTION_MARKER, CollectionError, CollectionRoot, ENVIRONMENTS_DIR,
+    InterpolateError, detect_collection_root, interpolate, load_collection,
+};
 pub use model::{
     Auth, BasicAuth, BearerAuth, Body, Collection, Environment, HttpMethod, Meta, Request,
 };

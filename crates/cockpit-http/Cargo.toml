@@ -16,3 +16,4 @@ thiserror = "2.0.17"
 
 [dev-dependencies]
 insta = "1.43.2"
+tempfile = "3.27.0"

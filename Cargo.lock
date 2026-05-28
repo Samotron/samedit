@@ -686,6 +686,7 @@ version = "0.0.1"
 dependencies = [
  "insta",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
