@@ -607,6 +607,62 @@ pub fn prepare_selected(view: &HttpView) -> Result<PreparedRequest, SendError> {
     cockpit_http::prepare_request(request, &env).map_err(SendError::Prepare)
 }
 
+/// Render the currently selected request as a `curl` invocation,
+/// against the active environment. Powers the M11.5 `Http: Copy As
+/// cURL` command — the binary takes this string and pushes it to the
+/// clipboard.
+pub fn copy_selected_as_curl(view: &HttpView) -> Result<String, SendError> {
+    let prepared = prepare_selected(view)?;
+    Ok(prepared.to_curl())
+}
+
+/// Stable command ids for the M11.5 HTTP commands. Kept in one place
+/// so the binary's dispatch table, the palette title source, and
+/// future Lua extension bindings all agree on the spellings.
+///
+/// IDs use the `http.` prefix to keep them clustered alongside the
+/// `pane.` / `editor.` / `file.` namespaces in `cockpit-ui::command_ids`.
+pub mod command_ids {
+    /// `Http: Send Request` — default `<leader>hs`.
+    pub const SEND_REQUEST: &str = "http.send_request";
+    /// `Http: Send All In Folder`.
+    pub const SEND_ALL_IN_FOLDER: &str = "http.send_all_in_folder";
+    /// `Http: Switch Environment` — default `<leader>he`.
+    pub const SWITCH_ENVIRONMENT: &str = "http.switch_environment";
+    /// `Http: Copy As cURL`.
+    pub const COPY_AS_CURL: &str = "http.copy_as_curl";
+    /// `Http: Save Response To File`.
+    pub const SAVE_RESPONSE: &str = "http.save_response";
+    /// `Http: Next Response Tab` — drives the cycling form of the tab
+    /// switcher; per-tab direct selects (`http.tab.body` etc.) below.
+    pub const NEXT_TAB: &str = "http.next_tab";
+    /// `Http: Previous Response Tab`.
+    pub const PREV_TAB: &str = "http.prev_tab";
+    /// `Http: Show Body Tab` — default `<leader>h1`.
+    pub const TAB_BODY: &str = "http.tab.body";
+    /// `Http: Show Headers Tab` — default `<leader>h2`.
+    pub const TAB_HEADERS: &str = "http.tab.headers";
+    /// `Http: Show Timing Tab` — default `<leader>h3`.
+    pub const TAB_TIMING: &str = "http.tab.timing";
+    /// `Http: Show Raw Tab` — default `<leader>h4`.
+    pub const TAB_RAW: &str = "http.tab.raw";
+}
+
+/// Default key chords for the M11.5 HTTP commands, as `(chord, command_id)`
+/// pairs ready to feed `InputRouter::bind_extra_chord`. Kept here so the
+/// binary doesn't hardcode chord strings — config layers (M11.5.x) can
+/// override by re-binding the same command id.
+pub fn default_keybindings() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Space h s", command_ids::SEND_REQUEST),
+        ("Space h e", command_ids::SWITCH_ENVIRONMENT),
+        ("Space h 1", command_ids::TAB_BODY),
+        ("Space h 2", command_ids::TAB_HEADERS),
+        ("Space h 3", command_ids::TAB_TIMING),
+        ("Space h 4", command_ids::TAB_RAW),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,5 +1045,49 @@ mod tests {
         assert!(prepared.headers.iter().any(|(k, v)| {
             k.eq_ignore_ascii_case("content-type") && v == "application/x-www-form-urlencoded"
         }));
+    }
+
+    #[test]
+    fn copy_selected_as_curl_uses_active_env() {
+        let collection = collection_with(
+            vec![{
+                let mut r = request("a", "{{base}}/users");
+                r.auth = cockpit_http::Auth::Bearer(BearerAuth {
+                    token: "{{tok}}".into(),
+                });
+                r
+            }],
+            vec![env(
+                "dev",
+                &[("base", "https://api.test"), ("tok", "secret")],
+            )],
+        );
+        let view = HttpView::new(collection);
+        let curl = copy_selected_as_curl(&view).unwrap();
+        assert!(curl.starts_with("curl \\\n  'https://api.test/users'"));
+        assert!(curl.contains("-H 'Authorization: Bearer secret'"));
+    }
+
+    #[test]
+    fn copy_selected_as_curl_propagates_no_selection() {
+        let view = HttpView::new(collection_with(Vec::new(), Vec::new()));
+        let err = copy_selected_as_curl(&view).unwrap_err();
+        assert!(matches!(err, SendError::NoSelection));
+    }
+
+    #[test]
+    fn default_keybindings_cover_send_environment_and_every_tab() {
+        let bindings = default_keybindings();
+        let ids: Vec<&str> = bindings.iter().map(|(_, id)| *id).collect();
+        assert!(ids.contains(&command_ids::SEND_REQUEST));
+        assert!(ids.contains(&command_ids::SWITCH_ENVIRONMENT));
+        for tab in [
+            command_ids::TAB_BODY,
+            command_ids::TAB_HEADERS,
+            command_ids::TAB_TIMING,
+            command_ids::TAB_RAW,
+        ] {
+            assert!(ids.contains(&tab), "missing chord for {tab}");
+        }
     }
 }

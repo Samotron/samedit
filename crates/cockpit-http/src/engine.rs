@@ -65,6 +65,99 @@ impl PreparedBody {
     pub fn is_none(&self) -> bool {
         matches!(self, PreparedBody::None)
     }
+
+    /// Render the body as bytes suitable for an HTTP request payload.
+    /// Returns `None` for the `None` variant; form bodies are URL-encoded
+    /// here so the caller doesn't need to thread the encoder through.
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            PreparedBody::None => None,
+            PreparedBody::Bytes { bytes, .. } => Some(bytes.clone()),
+            PreparedBody::Form(pairs) => {
+                let mut out = String::new();
+                for (i, (key, value)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        out.push('&');
+                    }
+                    out.push_str(&form_encode(key));
+                    out.push('=');
+                    out.push_str(&form_encode(value));
+                }
+                Some(out.into_bytes())
+            }
+        }
+    }
+}
+
+/// Form-urlencoded encoder for [`PreparedBody::to_bytes`] and
+/// [`PreparedRequest::to_curl`]. Same alphabet as the prepare-time
+/// percent-encoder; kept private here so we don't expose two competing
+/// public encoders.
+fn form_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+impl PreparedRequest {
+    /// Render this request as a copy-pasteable `curl` invocation. Used by
+    /// the M11.5 `Http: Copy As cURL` command.
+    ///
+    /// Single-quotes every shell argument and escapes embedded single
+    /// quotes the POSIX way (`'\''`) — that's the only shell metachar
+    /// that matters inside single quotes. The output is one logical
+    /// command; we use the standard backslash-newline continuation so
+    /// pasting into a terminal works whether the user wraps or not.
+    pub fn to_curl(&self) -> String {
+        let mut out = String::with_capacity(64);
+        out.push_str("curl");
+        // `-X METHOD` — only emit for non-GET; curl defaults to GET and
+        // listing it explicitly clutters the output.
+        if self.method != HttpMethod::Get {
+            out.push_str(" -X ");
+            out.push_str(self.method.block_name().to_uppercase().as_str());
+        }
+        // URL — first positional argument, always quoted in case it has
+        // a query string with `&` or `?`.
+        out.push_str(" \\\n  ");
+        out.push_str(&shell_quote(&self.url));
+        // Headers.
+        for (name, value) in &self.headers {
+            out.push_str(" \\\n  -H ");
+            out.push_str(&shell_quote(&format!("{name}: {value}")));
+        }
+        // Body.
+        if let Some(bytes) = self.body.to_bytes() {
+            out.push_str(" \\\n  --data-binary ");
+            out.push_str(&shell_quote(&String::from_utf8_lossy(&bytes)));
+        }
+        out
+    }
+}
+
+/// POSIX shell single-quoting: wrap in single quotes, replace each
+/// embedded single quote with `'\''` (close-quote, escaped-quote,
+/// reopen-quote). Single quotes inhibit all other shell expansion so
+/// nothing else needs escaping.
+fn shell_quote(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('\'');
+    for ch in input.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// A response delivered back to the caller.
@@ -336,5 +429,80 @@ mod tests {
         assert!(!b.is_cancelled());
         a.cancel();
         assert!(b.is_cancelled());
+    }
+
+    #[test]
+    fn to_curl_renders_get_with_url_only() {
+        let req = get_request("https://api.example.com/users");
+        assert_eq!(req.to_curl(), "curl \\\n  'https://api.example.com/users'");
+    }
+
+    #[test]
+    fn to_curl_emits_method_for_non_get() {
+        let mut req = get_request("https://api.example.com/users");
+        req.method = HttpMethod::Delete;
+        assert_eq!(
+            req.to_curl(),
+            "curl -X DELETE \\\n  'https://api.example.com/users'"
+        );
+    }
+
+    #[test]
+    fn to_curl_emits_headers_each_on_its_own_continuation_line() {
+        let mut req = get_request("https://api.example.com/users");
+        req.headers = vec![
+            ("Authorization".into(), "Bearer secret".into()),
+            ("Accept".into(), "application/json".into()),
+        ];
+        assert_eq!(
+            req.to_curl(),
+            "curl \\\n  'https://api.example.com/users' \\\n  -H 'Authorization: Bearer secret' \\\n  -H 'Accept: application/json'"
+        );
+    }
+
+    #[test]
+    fn to_curl_emits_body_with_data_binary() {
+        let req = PreparedRequest {
+            method: HttpMethod::Post,
+            url: "https://api.example.com/users".into(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: PreparedBody::Bytes {
+                content_type: "application/json".into(),
+                bytes: br#"{"name":"alice"}"#.to_vec(),
+            },
+            timeout: None,
+        };
+        assert_eq!(
+            req.to_curl(),
+            "curl -X POST \\\n  'https://api.example.com/users' \\\n  -H 'Content-Type: application/json' \\\n  --data-binary '{\"name\":\"alice\"}'"
+        );
+    }
+
+    #[test]
+    fn to_curl_escapes_embedded_single_quotes_the_posix_way() {
+        let mut req = get_request("https://api.example.com/it's");
+        req.headers = vec![("X-Token".into(), "won't break".into())];
+        // POSIX: 'it'\''s' — close quote, escaped quote, reopen quote.
+        assert_eq!(
+            req.to_curl(),
+            "curl \\\n  'https://api.example.com/it'\\''s' \\\n  -H 'X-Token: won'\\''t break'"
+        );
+    }
+
+    #[test]
+    fn form_body_to_bytes_url_encodes_pairs() {
+        let body = PreparedBody::Form(vec![
+            ("name".into(), "alice & bob".into()),
+            ("role".into(), "admin".into()),
+        ]);
+        assert_eq!(
+            body.to_bytes().unwrap(),
+            b"name=alice%20%26%20bob&role=admin"
+        );
+    }
+
+    #[test]
+    fn none_body_returns_no_bytes() {
+        assert_eq!(PreparedBody::None.to_bytes(), None);
     }
 }

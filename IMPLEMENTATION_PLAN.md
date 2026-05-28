@@ -1902,7 +1902,7 @@ everything else (AGENTS §2 #5).
 - **Done when:** opening a `.bru` file shows the split; running
   the request populates the response panel; tab switching works.
 
-### M11.5 — Commands + keybinds
+### M11.5 — Commands + keybinds  ◐ (IDs, default chords, cURL emitter; binary dispatch deferred to M11.5.1)
 
 Registered in `cockpit-commands`:
 
@@ -1917,6 +1917,21 @@ Registered in `cockpit-commands`:
 - `Http: Save Response To File` — writes the latest body to
   `responses/<request-name>.<ext>`, never overwrites without
   confirm.
+- **Shipped behaviour vs plan:** `cockpit_ui::http::command_ids`
+  defines every stable id (`http.send_request`,
+  `http.switch_environment`, `http.copy_as_curl`,
+  `http.save_response`, `http.next_tab`, `http.prev_tab`,
+  `http.tab.{body,headers,timing,raw}`) plus a
+  `default_keybindings()` table that ships `<leader>hs`, `<leader>he`,
+  and `<leader>h1..h4` ready for the binary to bind via
+  `InputRouter::bind_extra_chord`. `cockpit_http::PreparedRequest::to_curl`
+  emits POSIX-quoted curl invocations (URL + `-X METHOD` when non-GET
+  + `-H` per header + `--data-binary` for bodies; form bodies
+  url-encoded by `PreparedBody::to_bytes`). `cockpit_ui::http::copy_selected_as_curl`
+  wraps `prepare_selected` + `to_curl` so the binary's clipboard hook
+  is a one-liner. The actual command-registry registration and
+  palette wiring inside `crates/cockpit/src/app.rs` land in M11.5.1
+  alongside the M11.4.1 painter.
 
 ### M11.6 — Scripts (Lua, capability-gated)
 
