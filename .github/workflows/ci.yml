@@ -135,6 +135,36 @@ jobs:
       - name: UI smoke tests
         run: cargo test -p cockpit --features ui-smoke
 
+  bench:
+    # v0.9 M9.7 cold-start budget gate + M7.10 Windows-parity check
+    # for the new cockpit-lua surface. Failing this job means an
+    # extension change broke the 5 ms VM init / 50 ms total cold-start
+    # budget on at least one OS.
+    name: bench (${{ matrix.os }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cockpit-lua cold-start budget
+        run: cargo test -p cockpit-lua --features bench --release --test bench
+
   package:
     name: package (${{ matrix.os }})
     needs: check

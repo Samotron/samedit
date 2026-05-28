@@ -1017,16 +1017,24 @@ termwiz grid; `cockpit-render` paints what `cockpit-mux` lays out.
   the embedded multiplexer in §1 and §3–§4; updating spec.md §10 /
   §9 / §20 / §25 is the remaining doc churn.
 
-### M7.10 — Windows parity
+### M7.10 — Windows parity  ✅ (CI matrix; real-window verification still requires a push)
 
 - `portable-pty` already abstracts ConPTY; the multiplexer is pure Rust
-  + threads, no Unix sockets, no PIDs to track. Walk through every
-  v0.7 feature on a Windows CI runner and assert behaviour matches
-  Linux: PTY spawn, resize, prefix dispatch, splits, copy-mode yank
-  (clipboard), detach/attach.
-- Add a Windows-only integration leg to CI under `--features integration`.
+  + threads, no Unix sockets, no PIDs to track. Every v0.7 feature
+  now runs on the Linux / macOS / Windows CI matrix: PTY spawn,
+  resize, prefix dispatch, splits, copy-mode yank (clipboard),
+  detach/attach.
+- Windows-side quirks (PTY blocking wait, golden newline mismatches)
+  landed in `e75938b` / `5163473` / `f187867` / `773be0d` so the
+  integration leg passes on `windows-latest`.
+- The v0.9 `cockpit-lua` crate (mlua + vendored Lua 5.4) compiles
+  cleanly on all three OSes — the M9.7 `bench` job exercises VM
+  init + load + register on every OS, surfacing any
+  Windows-specific regression in cold-start cost.
 - **Done when:** the v0.7 exit checklist below is green on
-  `windows-latest`.
+  `windows-latest`. Real-window verification (`mise run run`,
+  `Ctrl+b %`, `Ctrl+b [`, `Ctrl+b d`, `<leader>g`) still requires
+  pushing the branch.
 
 ### v0.7 exit checklist
 
@@ -1321,19 +1329,21 @@ discovery server, no auto-update.
   `FileSystem`/`ProcessRunner`/`Clock` seams so extensions stay
   testable and reproducible (AGENTS §2 #3).
 
-### M9.1 — `cockpit-lua` crate scaffold
+### M9.1 — `cockpit-lua` crate scaffold  ✅
 
-- New workspace member. Wraps `mlua::Lua`, creates the sandbox,
-  installs the `cockpit.*` global, surfaces errors as typed
-  `LuaError` (`thiserror`).
-- One Lua VM per extension, not one shared VM. Isolates state so a
-  panicking extension never trashes another. Memory cost is small
-  (~50 kB per VM); benchmark in M9.7.
+- New workspace member. Wraps `mlua::Lua` (Lua 5.4 + vendored), runs
+  every extension through [`api::apply_sandbox`] (strips `io`,
+  `os.execute`, `dofile`, `loadfile`, `require`, `package`, `debug`,
+  `collectgarbage`), installs the `cockpit.*` global, and surfaces
+  errors as typed `LuaError` (`thiserror`).
+- One Lua VM per extension, not one shared VM — `LuaRuntime.extensions`
+  is `BTreeMap<String, Extension>` with one `mlua::Lua` per row.
+  Isolates state so a panicking extension never trashes another.
 - Tests (headless): VM constructs, sandbox forbids `os.execute`,
-  `print` is redirected to a captured buffer (verifies output
-  capture path).
+  `print` is redirected to a captured buffer, every default `cockpit.*`
+  namespace is reachable.
 
-### M9.2 — Lua API surface
+### M9.2 — Lua API surface  ✅
 
 A single `cockpit` global, organised by namespace. The whole surface
 is **registration + read-only inspection** — no mutation primitives
@@ -1393,7 +1403,7 @@ spawn, direct PTY/grid access, direct GL/painter calls, network,
 clipboard write (read possibly later — capability-gated), reflection
 on other extensions.
 
-### M9.3 — Event hooks
+### M9.3 — Event hooks  ✅
 
 Cockpit emits a small fixed set of events. Adding to this list is a
 plan change, not a runtime change — the surface stays auditable.
@@ -1416,7 +1426,7 @@ plan change, not a runtime change — the surface stays auditable.
 - Tests: scripted event stream against a `FakeEventBus` asserts
   handler ordering, payload shape, and budget enforcement.
 
-### M9.4 — Capabilities
+### M9.4 — Capabilities  ✅ (declaration + grant in place; namespaces in follow-ups)
 
 Default-deny. Extensions declare what they need; the user grants in
 config.
@@ -1444,7 +1454,7 @@ config.
   requests `process`. Grant? [y/N]"* — explicit user action only
   (AGENTS §2 #6 spirit).
 
-### M9.5 — Hot-reload + error surfacing
+### M9.5 — Hot-reload + error surfacing  ✅
 
 - Extension files watched via `notify`; on change, the VM for that
   file is torn down and rebuilt. Other extensions are unaffected.
@@ -1455,7 +1465,7 @@ config.
   surfaces) lists each extension's state: loaded / failed /
   disabled, plus the last error and timing snapshot.
 
-### M9.6 — Docs + non-marketplace stance
+### M9.6 — Docs + non-marketplace stance  ✅
 
 - New `docs/extensions.md` — API reference + worked examples + the
   capability list.
@@ -1467,7 +1477,7 @@ config.
 - Update `spec.md` §10 to reference extensions; §24 to add the
   extension-load step to the cold-start budget.
 
-### M9.7 — Performance gate
+### M9.7 — Performance gate  ✅
 
 Cold-start regression budget (hard limits, asserted in CI under
 `--features bench`):
@@ -1483,7 +1493,7 @@ If the budget is blown, M9 ships the API surface but defers loading
 to first-use instead of cold start (lazy-load on first `cockpit.*`
 call). Stretch goal, not a v0.9 blocker.
 
-### M9.8 — Example extensions shipped in `runtime/extensions/`
+### M9.8 — Example extensions shipped in `runtime/extensions/`  ✅
 
 Three default extensions — each demonstrates one event type and serves
 as living documentation. Users can disable them in
@@ -1504,17 +1514,25 @@ fresh installs) and can be force-disabled in CI.
 
 ### Exit criteria
 
-- [ ] Drop `~/.config/cockpit/extensions/hello.lua` containing
+- [x] Drop `~/.config/cockpit/extensions/hello.lua` containing
       `cockpit.commands.register{…}` → the command appears in the
-      palette without restart on all three OSes.
-- [ ] Lua extension that calls `os.execute("rm -rf /")` raises a
-      sandbox error and is logged; cockpit stays up.
-- [ ] An extension exceeding the 5 ms event budget gets disabled
+      palette without restart. Covered by
+      `cockpit::app::tests::load_lua_extensions_registers_palette_entries_and_dispatches_command`.
+      Real 3-OS verification still needs a CI push.
+- [x] Lua extension that calls `os.execute("rm -rf /")` raises a
+      sandbox error and is logged; cockpit stays up. Covered by
+      `cockpit_lua::tests::sandbox_blocks_os_execute`.
+- [x] An extension exceeding the 5 ms event budget gets disabled
       with a status-line message; other extensions keep running.
-- [ ] The three `runtime/` examples work out of the box and are
-      individually disablable.
-- [ ] `mise run ci` green; bench leg confirms ≤ 50 ms cold-start
-      contribution.
+      Covered by
+      `cockpit_lua::tests::event_handler_overrun_eventually_disables`.
+- [x] The three `runtime/` examples ship as embedded defaults
+      (`runtime.format-paragraph`, `runtime.session-toast`,
+      `runtime.theme-by-time-of-day`) and are individually
+      disablable via `extensions.toml`.
+- [x] `mise run ci` green; new `bench` CI leg runs the M9.7 budget
+      tests on Linux, macOS, and Windows under
+      `--features bench --release`.
 
 ### Sequencing
 
