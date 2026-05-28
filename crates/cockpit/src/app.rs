@@ -360,6 +360,14 @@ pub struct AppModel {
     /// Defaults to `cockpit_config::user_config_path()` when None; tests
     /// inject a temp path via [`AppModel::set_user_config_path`].
     user_config_path: Option<std::path::PathBuf>,
+    /// Configured leader chord (single stroke), used to substitute
+    /// `<leader>` in recipe keybinds and to detect leader presses
+    /// during dispatch (v0.8 M8.2).
+    leader_chord: Option<String>,
+    /// Buffered leader stroke captured by the previous keypress; the
+    /// next stroke is combined with this one and looked up as a
+    /// multi-stroke chord.
+    pending_leader: Option<cockpit_commands::KeyStroke>,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -475,6 +483,8 @@ impl AppModel {
             tool_recipes: std::collections::BTreeMap::new(),
             status_format: cockpit_config::TerminalStatusConfig::default().format,
             user_config_path: None,
+            leader_chord: None,
+            pending_leader: None,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -562,15 +572,15 @@ impl AppModel {
             }
         }
 
-        // v0.8 M8.2: capture tool-pane recipes. Each registered recipe
-        // shows up in the palette as `Tool: <name>` and dispatches to
-        // `run_tool_recipe`. Spawn semantics (floating overlay vs side
-        // pane) land in follow-up sub-tasks. Recipes that ship a real
-        // `KeyChord` (e.g. `Ctrl+Shift+G`) get bound on the global
-        // keymap so the chord and palette dispatch share the same
-        // command spine (AGENTS §2 hard rule #5). `<leader>…` notation
-        // isn't yet supported by the chord parser; those bindings stay
-        // palette-only with a tracing warning.
+        // v0.8 M8.2: capture the leader chord and tool-pane recipes.
+        // `<leader>…` in recipe keybinds is substituted with the
+        // configured leader chord so the default Lazyvim-style
+        // bindings work out of the box.
+        self.leader_chord = if config.keys.global.leader.is_empty() {
+            None
+        } else {
+            Some(config.keys.global.leader.clone())
+        };
         self.tool_recipes = config.panes.tools.clone();
         self.bind_tool_recipe_chords();
 
@@ -689,6 +699,32 @@ impl AppModel {
             return;
         }
         if focused == PaneId::Terminal && self.handle_mux_prefix(&chord) {
+            return;
+        }
+        // v0.8 M8.2: leader-key support. If the previous chord was the
+        // configured leader, combine it with the current chord to form
+        // a multi-stroke key and route the result. Resolved matches
+        // dispatch like a regular global; unresolved combos fall back
+        // to the current chord so the user doesn't lose the keystroke.
+        if let Some(leader) = self.pending_leader.take()
+            && let [stroke] = chord.strokes()
+        {
+            let combined = KeyChord::new(vec![leader, stroke.clone()]);
+            if let Some(command) = self.router.global_keymap().resolve(&combined) {
+                let id = command.clone();
+                self.status = "Leader chord dispatched.".to_string();
+                self.run_command(id.as_str());
+                return;
+            }
+            // No combo matched — drop the buffered leader silently and
+            // process the current chord normally.
+        }
+        if focused != PaneId::Terminal
+            && self.leader_chord.is_some()
+            && let Some(stroke) = leader_stroke_match(&chord, self.leader_chord.as_deref())
+        {
+            self.pending_leader = Some(stroke);
+            self.status = "Leader…".to_string();
             return;
         }
         match self.router.route(focused, chord) {
@@ -1481,10 +1517,13 @@ impl AppModel {
     }
 
     /// Bind every registered tool-pane recipe's `keybind` to its
-    /// `tool.<name>` command id on the global keymap (v0.8 M8.2). Bindings
-    /// that fail to parse (e.g. the placeholder `<leader>g` notation) are
-    /// skipped with a `tracing::debug!` — palette dispatch still works.
+    /// `tool.<name>` command id on the global keymap (v0.8 M8.2).
+    /// `<leader>` is replaced with the configured leader chord so
+    /// `<leader>g` becomes a two-stroke chord like `Space g`.
+    /// Bindings that still fail to parse are skipped with a
+    /// `tracing::debug!` — palette dispatch still works.
     fn bind_tool_recipe_chords(&mut self) {
+        let leader = self.leader_chord.clone();
         let bindings: Vec<(String, String)> = self
             .tool_recipes
             .iter()
@@ -1493,7 +1532,7 @@ impl AppModel {
                     None
                 } else {
                     Some((
-                        recipe.keybind.clone(),
+                        substitute_leader(&recipe.keybind, leader.as_deref()),
                         format!("{TOOL_RECIPE_PREFIX}{name}"),
                     ))
                 }
@@ -4558,6 +4597,46 @@ fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
 }
 
+/// Replace `<leader>` in `keybind` with the configured leader chord plus a
+/// space, so `<leader>g` becomes `Space g` when the leader is `Space`. Acts
+/// as a no-op when no leader is configured.
+fn substitute_leader(keybind: &str, leader: Option<&str>) -> String {
+    let Some(leader) = leader else {
+        return keybind.to_string();
+    };
+    if leader.is_empty() {
+        return keybind.to_string();
+    }
+    keybind.replace("<leader>", &format!("{leader} "))
+}
+
+/// Match a single-stroke `chord` against the configured leader chord string.
+/// Returns the matched stroke when the chord exactly equals the leader so
+/// the dispatcher can buffer it for a multi-stroke combo.
+fn leader_stroke_match(
+    chord: &cockpit_commands::KeyChord,
+    leader: Option<&str>,
+) -> Option<cockpit_commands::KeyStroke> {
+    let leader = leader?;
+    if leader.is_empty() {
+        return None;
+    }
+    let Ok(leader_chord) = leader.parse::<cockpit_commands::KeyChord>() else {
+        return None;
+    };
+    let [leader_stroke] = leader_chord.strokes() else {
+        return None;
+    };
+    let [chord_stroke] = chord.strokes() else {
+        return None;
+    };
+    if leader_stroke == chord_stroke {
+        Some(chord_stroke.clone())
+    } else {
+        None
+    }
+}
+
 /// Substitute `{token}` references in `template` using `lookup`. Tokens that
 /// `lookup` doesn't recognise are left verbatim (`{unknown}` stays as
 /// `{unknown}`) so users can spot typos. Escapes: a literal `{` is written
@@ -5986,6 +6065,30 @@ cockpit_layout = "missing.kdl"
         );
         let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
         assert!(titles.contains(&"Tool: lazygit"));
+    }
+
+    #[test]
+    fn leader_chord_substitution_lets_default_lazygit_keybind_fire() {
+        let mut model = model();
+        // The default config ships lazygit on `<leader>g` with `leader =
+        // "Space"`, so a focused-non-terminal `Space g` keystream should
+        // dispatch the `tool.lazygit` command.
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        // Space alone buffers as a pending leader.
+        model.dispatch(chord("Space"));
+        assert!(model.pending_leader.is_some(), "expected leader buffered");
+
+        // The leader still wasn't routed to any local handler.
+        model.dispatch(chord("g"));
+        assert!(model.pending_leader.is_none(), "leader should be consumed");
+        assert!(
+            model.command_log.iter().any(|cmd| cmd == "tool.lazygit"),
+            "log: {:?}",
+            model.command_log,
+        );
     }
 
     #[test]

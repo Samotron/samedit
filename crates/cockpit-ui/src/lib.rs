@@ -283,6 +283,12 @@ impl InputRouter {
             .map_err(InputRouterError::Command)
     }
 
+    /// Borrow the underlying keymap for direct multi-stroke chord
+    /// resolution (v0.8 M8.2 leader path).
+    pub fn global_keymap(&self) -> &Keymap {
+        &self.global
+    }
+
     /// Route a key chord based on the currently focused pane.
     pub fn route(&self, focused: PaneId, chord: KeyChord) -> RoutedInput {
         if let Some(command) = self.global.resolve(&chord) {

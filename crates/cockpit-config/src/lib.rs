@@ -403,6 +403,11 @@ pub struct GlobalKeys {
     pub toggle_files: String,
     pub command_palette: String,
     pub fuzzy_open: String,
+    /// Leader key prefix for multi-stroke chords like `<leader>g`
+    /// (v0.8 M8.2). Defaults to `Space` so the Lazyvim convention works
+    /// out of the box. Set to an empty string to disable leader
+    /// substitution entirely.
+    pub leader: String,
 }
 
 impl Default for GlobalKeys {
@@ -415,6 +420,7 @@ impl Default for GlobalKeys {
             toggle_files: "Ctrl+b".to_string(),
             command_palette: "Ctrl+Shift+p".to_string(),
             fuzzy_open: "Ctrl+p".to_string(),
+            leader: "Space".to_string(),
         }
     }
 }

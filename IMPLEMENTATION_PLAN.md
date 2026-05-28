@@ -1163,6 +1163,14 @@ running upstream CLIs the user already has. That is the whole point.
   PTY keeps running; the third press resumes it without respawning.
 - Side-right and bottom slotted layouts still type the command into
   the active pane today — dedicated docked panes are a follow-up.
+- ✅ Leader chord support: `keys.global.leader` (default `Space`) is
+  substituted into recipe keybinds, so the default `<leader>g`
+  Lazygit binding becomes the two-stroke chord `Space g` and fires
+  from the keymap without needing the palette. The dispatch path
+  buffers the leader stroke when it lands as a single chord and
+  combines it with the next chord to look up multi-stroke matches.
+  Tools that don't carry a real `<leader>` substitution still work
+  via their palette entry.
 - Mux gains two primitives on top of M7.4's split tree:
   - **Floating pane** — overlay rectangle centred over the project,
     sized 80% × 80%, drawn above the regular layout. Single floating
