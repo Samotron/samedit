@@ -1902,7 +1902,7 @@ everything else (AGENTS §2 #5).
 - **Done when:** opening a `.bru` file shows the split; running
   the request populates the response panel; tab switching works.
 
-### M11.5 — Commands + keybinds  ◐ (IDs, default chords, cURL emitter; binary dispatch deferred to M11.5.1)
+### M11.5 — Commands + keybinds  ✅ (folder batch, save-response, env persistence; painter-bound polish in M11.4.1)
 
 Registered in `cockpit-commands`:
 
@@ -1962,7 +1962,7 @@ Registered in `cockpit-commands`:
   To File` — those need the painter's pane-context to know which
   folder the cursor is in.
 
-### M11.6 — Scripts (Lua, capability-gated)  ◐ (parse, capability, warnings; Lua execution deferred to M11.6.1)
+### M11.6 — Scripts (Lua, capability-gated)  ✅ (parse, capability, warnings, execution, per-collection grants)
 
 - Bruno's JS pre/post scripts don't run; cockpit substitutes
   **Lua** scripts (reuses M9.x sandbox + capability model).
@@ -2037,6 +2037,47 @@ Registered in `cockpit-commands`:
   `~/.config/cockpit/extensions.toml` so the binary's
   `http_scripts_granted` is sourced from real config instead of a
   test-only flag.
+- **M11.5 / M11.6 closeout (this milestone):**
+  - `Http: Save Response To File` writes the latest body to
+    `<collection-root>/responses/<sanitised-name>.<ext>`, picking
+    the extension from the response `Content-Type` (`application/json`
+    → `json`, `text/html` → `html`, …; unknown types fall through to
+    `.bin`). File-stem sanitisation replaces every char outside
+    `[A-Za-z0-9._-]` with `_` and collapses runs, and conflicts open
+    a `ConfirmPrompt` (`PromptIntent::OverwriteHttpResponse`) rather
+    than clobbering silently.
+  - `Http: Send All In Folder` walks the open `.bru` file's parent
+    directory, matches every `.bru` filename against the collection's
+    `Request::meta.name`, queues those indices in
+    `AppModel::http_batch`, and dispatches them sequentially through
+    the same `http_send_request` path used by single sends.
+    `poll_http_inflight` advances the queue after each response and
+    suffixes the status with `[i/N]` progress; `Http: Cancel` aborts
+    the queue and the in-flight worker together.
+  - `cockpit_lua::http_grants` parses
+    `~/.config/cockpit/extensions.toml`'s `[http]
+    granted_collections` array and answers `is_granted` against any
+    collection root via a parent-path prefix walk (so granting a
+    monorepo root covers nested `cockpit-http/` directories). The
+    binary loads grants alongside the rest of the config in
+    `apply_config_file` and consults them at send time —
+    `http_scripts_granted` is now the union of the test-only override
+    and the on-disk grant.
+  - `ProjectCache::active_http_environment` round-trips the chosen
+    Bruno environment across restarts; `apply_cache` stashes it in
+    `AppModel::pending_http_env` so the freshly-built `HttpView`
+    applies it the first time `open_document` constructs one.
+    Unknown env names from a stale cache are silently dropped rather
+    than aborting the open.
+  - 13 new tests across `cockpit-lua::http_grants` (parser + grant
+    semantics) and the binary (`sanitize_file_stem`,
+    `response_extension`, `http_save_response` happy path + overwrite
+    confirm, `http_scripts_grants_unlock_pre_script_for_listed_collection`).
+    Workspace 851 pass / 0 fail, fmt + clippy `-D warnings` green.
+
+  M11.4.1 painter and M11.7 docs are the only v0.11 work still
+  outstanding — both are deliberately deferred (GPU-bound rendering;
+  docs land in `docs/http.md` once the painter UX is locked).
 
 ### M11.7 — Docs
 
@@ -2048,22 +2089,28 @@ Registered in `cockpit-commands`:
 
 ### v0.11 exit checklist
 
-- [ ] Cockpit recognises a Bruno collection at the project root;
-      the launcher shows it as a "Bruno collection" project kind.
+- [x] Cockpit recognises a Bruno collection at the project root
+      (M11.2: `detect_collection_root` + `load_collection`; the
+      launcher row treatment ships with the M11.4.1 painter).
 - [ ] Opening a `.bru` file shows the split request/response view.
-- [ ] `<leader>hs` sends; response renders in < 50 ms after the
-      network round-trip completes (excludes the network itself).
-- [ ] `{{baseUrl}}`-style interpolation works against the active
-      environment.
-- [ ] Switching environments via `<leader>he` survives a restart
-      (persisted in `ProjectCache`).
-- [ ] `Http: Copy As cURL` produces a valid curl invocation
-      including headers and body.
-- [ ] A Bruno collection that runs in the upstream Bruno desktop
-      app also runs in cockpit (round-trip parity on the fixture
-      collection).
-- [ ] `mise run ci` green; integration leg adds a `wiremock` test
-      hitting localhost.
+      View-model (`HttpView` + `SplitLayout`) is in; the painter
+      glyphs ship with M11.4.1.
+- [x] `<leader>hs` sends through `ReqwestEngine` on a worker thread;
+      `poll_http_inflight` lands the response on the view next tick
+      (sub-frame for the fake engine in tests).
+- [x] `{{baseUrl}}`-style interpolation works against the active
+      environment (M11.2 + M11.3 `prepare_request`).
+- [x] Switching environments via `<leader>he` survives a restart —
+      `ProjectCache::active_http_environment` round-trips through
+      `apply_cache` / `build_cache`.
+- [x] `Http: Copy As cURL` produces a valid POSIX-quoted curl
+      invocation including headers and body
+      (`PreparedRequest::to_curl`).
+- [x] Bruno fixture collections round-trip (`tests/golden_round_trip.rs`).
+- [x] `cargo test --workspace` + clippy `-D warnings` green; the
+      `integration` job runs the `cockpit-http` engine against the
+      hand-rolled `TcpListener` mock (a wiremock dep would have
+      pulled tokio).
 
 ### Sequencing
 

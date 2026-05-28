@@ -305,6 +305,10 @@ pub struct ProjectCache {
     /// project tree has changed since the last save; the next finder
     /// open re-walks the filesystem and refreshes this.
     pub file_index: Vec<String>,
+    /// Active Bruno environment, persisted across sessions so
+    /// `Http: Switch Environment` survives a restart (v0.11 M11.2 /
+    /// M11.5). `None` means "no env" was explicitly picked.
+    pub active_http_environment: Option<String>,
 }
 
 impl ProjectCache {
