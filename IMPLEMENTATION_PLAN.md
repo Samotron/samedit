@@ -2300,6 +2300,15 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   fake (`FakeTray`) for tests.
 - **Tests:** unit on the headless fake; smoke on real `tray-icon`
   behind the `ui-smoke` feature (gated to non-headless CI legs).
+- **Impl notes (M12.2):** shipped as `cockpit-tray` — the
+  backend-free half. A flat [`Menu`] of `Action`/`Separator` items
+  (no submenus), a [`Tray`] seam (`set_menu`/`set_tooltip`), and a
+  `TrayEvent` stream (`LeftClick` / `MenuItem(id)`). `FakeTray`
+  records the menu/tooltip and simulates clicks; activating a
+  missing or disabled item is a no-op. The real `tray-icon` backend
+  is deferred behind the `ui-smoke` feature (needs a tray host to
+  smoke-test); it isn't a dependency yet, so the default build pulls
+  no GUI crates.
 
 ### M12.3 — `cockpit-hotkey`: global hotkey registration
 
@@ -2311,6 +2320,15 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
 - **Tests:** headless fake hotkey bus; integration tests behind
   `ui-smoke` register a low-collision chord
   (`Ctrl+Alt+F12`-class) and assert the callback fires.
+- **Impl notes (M12.3):** shipped as `cockpit-hotkey` — the
+  backend-free half. `Hotkey::parse` normalises chords
+  (case-insensitive; `cmd`/`win`/`meta`→super; chars upper-cased;
+  `F1`..=`F24`; named keys) so conflict comparison is by value, with
+  typed `HotkeyError`s (`EmptyChord`/`MissingKey`/`UnknownToken`/
+  `UnknownKey`/`Conflict`). The `HotkeyBus` seam + `FakeHotkeyBus`
+  model external ownership (conflict fires, never silent) and
+  simulated presses. The real `global-hotkey` backend is deferred
+  behind `ui-smoke` (needs a windowing leg); not a dependency yet.
 
 ### M12.4 — `cockpit-popover`: frameless floating window
 
