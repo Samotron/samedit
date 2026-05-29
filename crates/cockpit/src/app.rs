@@ -56,7 +56,7 @@ use cockpit_terminal::session::TerminalStatus;
 // `cockpit-terminal`.
 use cockpit_http::{Collection as HttpCollection, load_collection as load_http_collection};
 use cockpit_ui::http::{
-    HttpView, ResponseTab, command_ids as http_command_ids,
+    HttpView, ResponseTab, ResponseView, command_ids as http_command_ids,
     copy_selected_as_curl as http_copy_selected_as_curl,
     default_keybindings as http_default_keybindings,
 };
@@ -512,6 +512,13 @@ enum DragState {
         last_x: f32,
         last_y: f32,
         extent: f32,
+    },
+    /// Dragging the request/response divider of an open `.bru` view
+    /// (v0.11 M11.4.1). `content_y` / `content_h` anchor the editor pane's
+    /// content area so the pointer maps straight to a split ratio.
+    HttpSplit {
+        content_y: f32,
+        content_h: f32,
     },
 }
 
@@ -1079,6 +1086,7 @@ impl AppModel {
         }
         if pane_contains(layout.editor, position) {
             self.layout.focus(PaneId::Editor);
+            self.handle_http_click(layout.editor, position);
             return;
         }
         if let Some(rect) = layout.terminal
@@ -1143,6 +1151,15 @@ impl AppModel {
                     last_y: position.y,
                     extent,
                 });
+            }
+            DragState::HttpSplit {
+                content_y,
+                content_h,
+            } => {
+                if let Some(view) = self.http.as_mut() {
+                    let viewport = UiRect::new(0, content_y as u32, 1, content_h.max(1.0) as u32);
+                    view.drag_split_to(viewport, position.y);
+                }
             }
         }
     }
@@ -1283,6 +1300,48 @@ impl AppModel {
         }
         self.browser.select_row(index);
         self.activate_selection();
+    }
+
+    /// Route a click inside the editor pane when a `.bru` view is open
+    /// (v0.11 M11.4.1): a click on the divider starts a split-resize drag; a
+    /// click on a response tab activates it. Clicks elsewhere fall through to
+    /// the request editor (already focused by the caller).
+    fn handle_http_click(&mut self, editor_rect: UiRect, position: PointerPosition) {
+        let Some(view) = self.http.as_mut() else {
+            return;
+        };
+        let content = editor_content_rect(editor_rect);
+        let layout = http_layout(&content, view.split_ratio());
+
+        // Divider drag — a 6 px band centred on the divider line.
+        if (position.y - layout.divider_y).abs() <= 3.0
+            && position.x >= content.x
+            && position.x < content.x + content.w
+        {
+            self.drag = Some(DragState::HttpSplit {
+                content_y: content.y,
+                content_h: content.h,
+            });
+            return;
+        }
+
+        // Response tab strip.
+        let response = &layout.response;
+        let pane = UiRect::new(
+            response.x as u32,
+            response.y as u32,
+            response.w as u32,
+            response.h as u32,
+        );
+        if let Some(tab) = view.click_response_tab(
+            pane,
+            http_tab_cell_width(),
+            ROW_H as u32,
+            position.x,
+            position.y,
+        ) {
+            self.status = format!("Http: showing {} tab.", tab.label());
+        }
     }
 
     fn select_mux_pane_at(&mut self, rect: UiRect, position: PointerPosition) {
@@ -4975,9 +5034,96 @@ impl AppModel {
         };
         let content = self.paint_pane(canvas, rect, &title, focused);
 
-        match &self.document {
-            Some(doc) => self.paint_document(canvas, &content, doc),
-            None => self.paint_welcome(canvas, &content),
+        match (&self.document, &self.http) {
+            (Some(doc), Some(view)) => self.paint_http(canvas, &content, doc, view),
+            (Some(doc), None) => self.paint_document(canvas, &content, doc),
+            (None, _) => self.paint_welcome(canvas, &content),
+        }
+    }
+
+    /// Paint an open `.bru` request: the request editor in the top half, a
+    /// draggable divider, and the response panel (tab strip + active tab
+    /// body) below (v0.11 M11.4.1). The split + tab rectangles come from
+    /// `cockpit-ui` so the painter and the mouse hit-tests stay in lockstep.
+    fn paint_http(
+        &self,
+        canvas: &mut Canvas<'_>,
+        content: &ContentRect,
+        doc: &OpenDocument,
+        view: &HttpView,
+    ) {
+        let layout = http_layout(content, view.split_ratio());
+
+        // Top half — the request editor, rendered into its own sub-rect.
+        self.paint_document(canvas, &layout.request, doc);
+
+        // Divider line.
+        canvas.rect(
+            content.x,
+            layout.divider_y,
+            content.w,
+            HTTP_DIVIDER_H,
+            self.theme.accent,
+        );
+
+        // Tab strip — one rect per tab, geometry shared with hit-testing.
+        let response = &layout.response;
+        let pane = UiRect::new(
+            response.x as u32,
+            response.y as u32,
+            response.w as u32,
+            response.h as u32,
+        );
+        let cell_w = http_tab_cell_width();
+        let strip = view.tab_strip(pane, cell_w, ROW_H as u32);
+        canvas.rect(
+            response.x,
+            response.y,
+            response.w,
+            ROW_H,
+            self.theme.pane_border,
+        );
+        for (tab, rect) in strip.tabs {
+            let active = tab == strip.active;
+            if active {
+                canvas.rect(
+                    rect.x as f32,
+                    rect.y as f32,
+                    rect.width as f32,
+                    rect.height as f32,
+                    self.theme.selection,
+                );
+            }
+            let color = if active {
+                self.theme.text
+            } else {
+                self.theme.muted_text
+            };
+            canvas.text(
+                rect.x as f32 + cell_w as f32,
+                rect.y as f32 + 3.0,
+                tab.label(),
+                color,
+                FONT - 1.0,
+            );
+        }
+
+        // Active tab body below the strip.
+        let body_y = response.y + ROW_H + PAD * 0.5;
+        let body_h = (response.h - ROW_H - PAD * 0.5).max(0.0);
+        let visible = (body_h / ROW_H).max(0.0) as usize;
+        let lines = match view.response_view() {
+            Some(rendered) => response_view_lines(&rendered),
+            None => vec!["No response yet — press <leader>hs to send.".to_string()],
+        };
+        for (row, line) in lines.iter().take(visible).enumerate() {
+            canvas.text(
+                response.x + PAD,
+                body_y + row as f32 * ROW_H,
+                line.clone(),
+                self.theme.text,
+                FONT,
+            );
         }
     }
 
@@ -5647,6 +5793,90 @@ struct ContentRect {
     y: f32,
     w: f32,
     h: f32,
+}
+
+/// Thickness (logical px) of the request/response divider line in the
+/// HTTP view. Matches the 6 px hit band [`HttpView`] reserves for it.
+const HTTP_DIVIDER_H: f32 = 2.0;
+
+/// The editor pane's content rectangle (below the pane header) in window
+/// coordinates. Mirrors [`AppModel::paint_pane`]'s return value so mouse
+/// hit-testing and the painter agree on where the `.bru` split lives.
+fn editor_content_rect(rect: UiRect) -> ContentRect {
+    let x = rect.x as f32;
+    let y = rect.y as f32 + TOP_BAR_H;
+    ContentRect {
+        x,
+        y: y + HEADER_H,
+        w: rect.width as f32,
+        h: (rect.height as f32 - HEADER_H).max(0.0),
+    }
+}
+
+/// The request (top) and response (bottom) rectangles for a `.bru` view,
+/// plus the divider's y. Pure geometry so the painter and the mouse
+/// handlers compute an identical split from `ratio`.
+struct HttpLayout {
+    request: ContentRect,
+    divider_y: f32,
+    response: ContentRect,
+}
+
+fn http_layout(content: &ContentRect, ratio: f32) -> HttpLayout {
+    // Keep at least the tab strip + one body row visible in the response.
+    let min_response = ROW_H * 2.0;
+    let max_request = (content.h - min_response - HTTP_DIVIDER_H).max(ROW_H);
+    let request_h = (content.h * ratio).round().clamp(ROW_H, max_request);
+    let divider_y = content.y + request_h;
+    let resp_y = divider_y + HTTP_DIVIDER_H;
+    HttpLayout {
+        request: ContentRect {
+            x: content.x,
+            y: content.y,
+            w: content.w,
+            h: request_h,
+        },
+        divider_y,
+        response: ContentRect {
+            x: content.x,
+            y: resp_y,
+            w: content.w,
+            h: (content.y + content.h - resp_y).max(0.0),
+        },
+    }
+}
+
+/// Integer cell advance used for the response tab strip, shared by the
+/// painter and [`HttpView::tab_strip`] hit-testing so their rectangles
+/// line up exactly.
+fn http_tab_cell_width() -> u32 {
+    (FONT * CHAR_W_RATIO).round().max(1.0) as u32
+}
+
+/// Flatten a [`ResponseView`] into display lines for the response body. Pure
+/// formatting — the view-model already did the pretty-printing.
+fn response_view_lines(view: &ResponseView<'_>) -> Vec<String> {
+    match view {
+        ResponseView::Body { content_type, text } => {
+            let mut lines = vec![format!("Content-Type: {content_type}"), String::new()];
+            lines.extend(text.lines().map(str::to_string));
+            lines
+        }
+        ResponseView::Headers(rows) => rows
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect(),
+        ResponseView::Timing {
+            elapsed,
+            redirects,
+            final_url,
+        } => vec![
+            format!("elapsed:   {:.1} ms", elapsed.as_secs_f64() * 1000.0),
+            format!("redirects: {redirects}"),
+            format!("final url: {final_url}"),
+        ],
+        ResponseView::Raw(text) => text.lines().map(str::to_string).collect(),
+    }
 }
 
 /// Painter wrapper that scales logical coordinates to physical pixels.
@@ -10097,6 +10327,98 @@ format_on_save = true
             model.status
         );
         pump_until(&mut model, |m| m.http_in_flight.is_none());
+    }
+
+    /// A model with a `.bru` view injected and one frame painted so
+    /// `last_layout` is populated for mouse hit-testing (v0.11 M11.4.1).
+    fn primed_http_model() -> AppModel {
+        let mut model = model();
+        install_fake_http(&mut model);
+        let mut painter = Painter::new();
+        model.paint(
+            &mut painter,
+            Viewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        );
+        model
+    }
+
+    #[test]
+    fn clicking_a_response_tab_activates_it() {
+        let mut model = primed_http_model();
+        let editor = model.last_layout.as_ref().unwrap().editor;
+        let content = editor_content_rect(editor);
+        let view = model.http.as_ref().unwrap();
+        let layout = http_layout(&content, view.split_ratio());
+        let pane = UiRect::new(
+            layout.response.x as u32,
+            layout.response.y as u32,
+            layout.response.w as u32,
+            layout.response.h as u32,
+        );
+        // Aim for the centre of the Headers tab (index 1).
+        let headers = view
+            .tab_strip(pane, http_tab_cell_width(), ROW_H as u32)
+            .tabs[1]
+            .1;
+        let x = (headers.x + headers.width / 2) as f32;
+        let y = (headers.y + headers.height / 2) as f32;
+
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(x, y));
+
+        assert_eq!(
+            model.http.as_ref().unwrap().response_tab(),
+            ResponseTab::Headers
+        );
+        assert!(
+            model.status.contains("Headers"),
+            "status = {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn dragging_the_http_divider_grows_the_request_half() {
+        let mut model = primed_http_model();
+        let editor = model.last_layout.as_ref().unwrap().editor;
+        let content = editor_content_rect(editor);
+        let initial = model.http.as_ref().unwrap().split_ratio();
+        let layout = http_layout(&content, initial);
+        let x = content.x + content.w / 2.0;
+
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(x, layout.divider_y));
+        model.on_pointer_move(PointerPosition::new(x, layout.divider_y + 120.0));
+        model.on_pointer_up(
+            MouseButton::Left,
+            PointerPosition::new(x, layout.divider_y + 120.0),
+        );
+
+        assert!(
+            model.http.as_ref().unwrap().split_ratio() > initial,
+            "dragging the divider down should grow the request half: {} !> {initial}",
+            model.http.as_ref().unwrap().split_ratio()
+        );
+    }
+
+    #[test]
+    fn clicking_inside_the_request_half_leaves_the_tab_unchanged() {
+        let mut model = primed_http_model();
+        let editor = model.last_layout.as_ref().unwrap().editor;
+        let content = editor_content_rect(editor);
+        // A point well inside the request editor, clear of the divider.
+        let x = content.x + content.w / 2.0;
+        let y = content.y + 10.0;
+
+        model.on_pointer_down(MouseButton::Left, PointerPosition::new(x, y));
+
+        assert_eq!(
+            model.http.as_ref().unwrap().response_tab(),
+            ResponseTab::Body
+        );
+        assert!(model.drag.is_none());
     }
 
     #[test]
