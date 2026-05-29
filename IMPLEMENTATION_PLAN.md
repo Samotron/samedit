@@ -1868,7 +1868,7 @@ everything else (AGENTS §2 #5).
   CI runs them on Ubuntu/macOS/Windows via the existing `integration`
   job; mirrored in `mise run test-integration`.
 
-### M11.4 — View-model + render  ◐ (view-model + tabs + send pipeline; painter wiring deferred to M11.4.1)
+### M11.4 — View-model + render  ✅ (view-model + tabs + send pipeline + M11.4.1 painter)
 
 - `cockpit-ui::http`: `HttpView` holds the active collection,
   selected request, in-progress send state, latest response. Mirrors
@@ -1917,13 +1917,25 @@ everything else (AGENTS §2 #5).
   pointer (right/bottom edges exclusive so adjacent tabs never both
   claim a column). 7 new unit tests (handle centring, `handle_contains`
   band, `drag_split_to` clamp, gap-free strip layout, click-activates-
-  hit, click-misses-below). Remaining for M11.4.1: the actual
-  `cockpit-render` glyph painter (drawing the divider + tab strip and
-  feeding `on_mouse_*` into these helpers) and `cockpit::hydration`
-  recognising `.bru` files to construct the `HttpView` on open — both
-  GPU/binary-bound.
+  hit, click-misses-below).
+- **M11.4.1 update (painter wired — M11.4 closed):** the binary now
+  paints the `.bru` split and routes its mouse. `AppModel::paint_http`
+  splits the editor content with `http_layout` (shared pure geometry:
+  request half on top, a 2 px divider, response panel below), renders
+  the request through the existing `paint_document` into the top sub-
+  rect, then draws the tab strip from `HttpView::tab_strip` (so the
+  painted rectangles are byte-identical to the hit-test rectangles via a
+  shared integer `http_tab_cell_width`) and the active tab body from
+  `response_view_lines`. Mouse: `handle_http_click` starts a
+  `DragState::HttpSplit` on the divider band or activates a tab via
+  `HttpView::click_response_tab`; `on_pointer_move` feeds the drag into
+  `drag_split_to`. `.bru` recognition was already wired in
+  `open_document` (`recognise_http_request`). 3 binary tests
+  (tab-click activates, divider-drag grows the request half, request-
+  half click is a no-op) on top of the 7 view-model tests. Workspace
+  green: fmt + clippy `-D warnings` + full test suite.
 - **Done when:** opening a `.bru` file shows the split; running
-  the request populates the response panel; tab switching works.
+  the request populates the response panel; tab switching works. ✅
 
 ### M11.5 — Commands + keybinds  ✅ (folder batch, save-response, env persistence; painter-bound polish in M11.4.1)
 
@@ -2098,26 +2110,32 @@ Registered in `cockpit-commands`:
     confirm, `http_scripts_grants_unlock_pre_script_for_listed_collection`).
     Workspace 851 pass / 0 fail, fmt + clippy `-D warnings` green.
 
-  M11.4.1 painter and M11.7 docs are the only v0.11 work still
-  outstanding — both are deliberately deferred (GPU-bound rendering;
-  docs land in `docs/http.md` once the painter UX is locked).
+  M11.4.1 painter and M11.7 docs were the last v0.11 work outstanding;
+  both are now done (see the M11.4.1 painter note above and M11.7 below),
+  closing v0.11.
 
-### M11.7 — Docs
+### M11.7 — Docs  ✅
 
-- `docs/http.md` — what's supported, what's not (JS scripts,
-  the OAuth2 device-code flow until v0.11.1, the GraphQL response
-  introspection panel), worked examples on the fixture
-  collection, security model (TLS, secrets via env vars, no
-  cleartext password storage).
+- `docs/http.md` — collection layout/detection, opening the split,
+  the command + keybinding table, environments + `{{var}}`
+  interpolation, the Lua scripting model (capability-gated,
+  default-deny; JS skipped), what's not supported (JS scripts, the
+  OAuth2 device-code flow until v0.11.1, the GraphQL response
+  introspection panel), the security model (verified TLS, secrets via
+  env vars, no cleartext password storage, sandboxed scripts), and a
+  worked example on the `tests/fixtures/http/` collection.
 
 ### v0.11 exit checklist
 
 - [x] Cockpit recognises a Bruno collection at the project root
-      (M11.2: `detect_collection_root` + `load_collection`; the
-      launcher row treatment ships with the M11.4.1 painter).
-- [ ] Opening a `.bru` file shows the split request/response view.
-      View-model (`HttpView` + `SplitLayout`) is in; the painter
-      glyphs ship with M11.4.1.
+      (M11.2: `detect_collection_root` + `load_collection`; `.bru`
+      files open straight into the split via `recognise_http_request`.
+      A dedicated launcher row/badge for HTTP collections is a small
+      cosmetic follow-up, not on the v0.11 critical path).
+- [x] Opening a `.bru` file shows the split request/response view.
+      View-model (`HttpView` + `SplitLayout`) plus the M11.4.1 painter
+      (`AppModel::paint_http`) draw the request half, divider, tab
+      strip, and active-tab body; the divider drags and tabs click.
 - [x] `<leader>hs` sends through `ReqwestEngine` on a worker thread;
       `poll_http_inflight` lands the response on the view next tick
       (sub-frame for the fake engine in tests).
