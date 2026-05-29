@@ -22,6 +22,7 @@ cockpit-terminal = { path = "crates/cockpit-terminal" }
 cockpit-ui = { path = "crates/cockpit-ui" }
 cockpit-analytics = { path = "crates/cockpit-analytics" }
 cockpit-notebook = { path = "crates/cockpit-notebook" }
+cockpit-org = { path = "crates/cockpit-org" }
 cockpit-render = { path = "crates/cockpit-render" }
 cockpit-sql = { path = "crates/cockpit-sql" }
 cockpit-testkit = { path = "crates/cockpit-testkit" }

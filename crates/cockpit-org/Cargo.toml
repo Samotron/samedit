@@ -1,0 +1,17 @@
+[package]
+name = "cockpit-org"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Org-mode subset parser, domain model, and line-range edit primitives for the Coding Cockpit jot surface (v0.12)."
+
+[dependencies]
+# Parse-only: orgize handles the fiddly title/tag/keyword/planning grammar.
+# We deliberately disable default features (`ser` -> serde/indexmap) since we
+# only consume the parsed AST; round-trip is done via our own line-range edits,
+# never orgize's serialiser.
+orgize = { version = "0.9.0", default-features = false }
+
+[dev-dependencies]
+insta = "1.43.2"

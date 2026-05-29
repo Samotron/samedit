@@ -2318,9 +2318,27 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
 
 ### M12.5 — `cockpit-org`: parser, store, view-model
 
-- New crate. Wraps `orgize` (`0.10`+) for parsing. Domain types
+- New crate. Wraps `orgize` for parsing. Domain types
   are thin layers over orgize's AST so we don't fight the upstream
   model:
+  - **Version deviation (M12.5 impl):** pinned to **`orgize 0.9`**
+    (stable), not `0.10`. The only published `0.10` is an
+    `alpha` rewrite with an unstable, undocumented API; the stable
+    `0.9` parses the v0.12 headline grammar (title / keyword /
+    priority / tags) cleanly. Round-trip is unaffected — we never
+    use orgize's serialiser (see the line-range rule below).
+  - **Timestamp deviation (M12.5 impl):** orgize `0.9`'s timestamp
+    parser silently *drops* any stamp carrying a repeater/delay
+    cookie (`<2026-06-01 Mon +1w>` fails to parse, losing the whole
+    `SCHEDULED`). Since the agenda (M12.5b) needs repeaters, the
+    `SCHEDULED:/DEADLINE:/CLOSED:` planning grammar is parsed by a
+    small in-crate parser (`timestamp.rs`) instead. orgize still
+    owns the inline headline grammar.
+  - **Position deviation (M12.5 impl):** orgize `0.9` exposes no
+    source ranges, so `line_range`s are computed by scanning
+    headline lines (`^\*+(space|eol)`) and zipping them, in
+    document order, against orgize's pre-order headlines (1:1 for
+    the v0.12 subset, which has no code/example blocks).
   - `OrgFile { path, content_hash, headings: Vec<Heading> }`.
   - `Heading { level, title, todo_state, tags, scheduled,
     deadline, body, children, line_range }`.
@@ -2598,7 +2616,7 @@ once M12.5 is in. M12.6 + M12.7 close the loop.
 |-----------------------------------------------|---------------------------------------------------------|
 | `tray-icon` quirks per OS                     | Stick to the API surface Tauri uses; CI smoke per OS catches regressions. Tray menu kept minimal — 6 items, no nested submenus. |
 | `global-hotkey` chord conflicts               | Detect at register; surface clearly; suggest alternatives in the toast. Never grab a chord behind the user's back. `Ctrl+O` collision with browser/editor "Open file" is documented loudly; users can remap. |
-| `orgize` API drift                            | Pin to a specific minor version; integration tests run against a fixture corpus that triggers every supported feature. Major-version bumps are a milestone-level change. |
+| `orgize` API drift                            | Pinned to stable `0.9` (not the `0.10` alpha); fixture corpus triggers every supported feature. orgize owns only the inline headline grammar — timestamps and positions are parsed in-crate, so an orgize bump can't silently change scheduling/round-trip behaviour. Major-version bumps are a milestone-level change. |
 | Round-trip byte-identical edits drift         | Line-range replacement on the original source buffer (never AST re-emit) + golden fixture corpus authored in Emacs. Property test: parse → mutate-no-op → serialise == input on a generator of fuzzy `.org` strings. |
 | Two writers to the same `.org` file          | The editor's "file changed on disk" toast catches the race; cockpit reloads before overwriting. Plain-text + git-friendly format means worst case is a 3-way merge, not data loss. |
 | Process supervision (jot crashes)             | Tray app is intentionally simple; if it crashes the user notices because the tray icon vanishes. No respawner in v0.12 — out of scope, adds surface for very rare failure. |
