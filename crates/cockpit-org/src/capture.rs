@@ -102,7 +102,34 @@ fn default_keywords() -> Vec<String> {
     vec!["TODO".to_string(), "DONE".to_string()]
 }
 
+impl Default for OrgConfig {
+    fn default() -> Self {
+        OrgConfig {
+            root: None,
+            default_todo_keywords: default_keywords(),
+            capture: Vec::new(),
+        }
+    }
+}
+
 impl OrgConfig {
+    /// Parse an `org.toml` source string into the `[org]` config.
+    ///
+    /// The grammar matches `docs/org.md`: a top-level `[org]` table with
+    /// `root` / `default_todo_keywords`, plus `[[org.capture]]` template
+    /// blocks. Sections **other than** `[org]` are tolerated — the file is
+    /// shared with the rest of the cockpit (cf. `extensions.toml`), so the
+    /// parser must not reject foreign tables. A file with no `[org]` table
+    /// yields [`OrgConfig::default`].
+    pub fn from_toml_str(source: &str) -> Result<Self, toml::de::Error> {
+        #[derive(Deserialize)]
+        struct OrgFile {
+            #[serde(default)]
+            org: Option<OrgConfig>,
+        }
+        Ok(toml::from_str::<OrgFile>(source)?.org.unwrap_or_default())
+    }
+
     /// The TODO workflow these keywords describe.
     pub fn keywords(&self) -> Keywords {
         Keywords::from_sequence(self.default_todo_keywords.clone())
@@ -638,5 +665,64 @@ mod tests {
         };
         let pasted = paste_subtree(to, &target, &subtree);
         assert_eq!(pasted, "* Tasks\n** TODO ship\n");
+    }
+
+    #[test]
+    fn config_parses_org_table_and_capture_blocks() {
+        // The exact shape documented in docs/org.md.
+        let cfg = OrgConfig::from_toml_str(
+            r#"
+[org]
+root = "~/org"
+default_todo_keywords = ["TODO", "NEXT", "DONE"]
+
+[[org.capture]]
+key = "t"
+name = "Todo"
+target = { file = "inbox.org", under = "Tasks" }
+template = "* TODO %?"
+
+[[org.capture]]
+key = "j"
+name = "Journal"
+target = { file = "journal.org", datetree = true }
+template = "* %U %?"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.root.as_deref(), Some("~/org"));
+        assert_eq!(cfg.default_todo_keywords, ["TODO", "NEXT", "DONE"]);
+        assert_eq!(cfg.capture.len(), 2);
+
+        let t = cfg.template("t").unwrap();
+        assert_eq!(t.name, "Todo");
+        assert_eq!(t.target.file, "inbox.org");
+        assert_eq!(t.target.under.as_deref(), Some("Tasks"));
+        assert!(!t.target.datetree);
+
+        let j = cfg.template("j").unwrap();
+        assert!(j.target.datetree);
+        assert_eq!(j.target.under, None);
+    }
+
+    #[test]
+    fn config_missing_org_table_yields_defaults() {
+        // A file with only foreign sections (other cockpit subsystems share
+        // org.toml) must not error — it falls back to defaults.
+        let cfg = OrgConfig::from_toml_str("[http]\ngranted_collections = []\n").unwrap();
+        assert_eq!(cfg, OrgConfig::default());
+        assert_eq!(cfg.default_todo_keywords, ["TODO", "DONE"]);
+        assert!(cfg.capture.is_empty());
+    }
+
+    #[test]
+    fn config_empty_string_is_default() {
+        assert_eq!(OrgConfig::from_toml_str("").unwrap(), OrgConfig::default());
+    }
+
+    #[test]
+    fn config_rejects_malformed_toml() {
+        assert!(OrgConfig::from_toml_str("[org\nroot =").is_err());
     }
 }

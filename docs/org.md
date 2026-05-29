@@ -194,11 +194,23 @@ produce byte-identical files** — they share the same line-range edit
 primitives.
 
 > **Status.** The headless engine (parser, capture, agenda, repeaters,
-> the IPC service, and the controller) ships in this release. The tray
-> icon, global-hotkey registration, and the floating popover window are
-> wired up on platforms with a desktop session; on a headless build the
-> same controller is reachable via the `cockpit-jot` CLI
-> (`cockpit-jot [--root DIR] [agenda|overview]`).
+> the IPC service, the controller, and `org.toml` loading) ships in this
+> release. The tray icon, global-hotkey registration, and the floating
+> popover window are wired up on platforms with a desktop session; on a
+> headless build the same controller is reachable via the `cockpit-jot`
+> CLI, which reads `~/.config/cockpit/org.toml` by default:
+>
+> ```
+> cockpit-jot [--root DIR] [--config org.toml] agenda
+> cockpit-jot [--root DIR] [--config org.toml] overview
+> cockpit-jot [--root DIR] [--config org.toml] \
+>     capture <key> [--annotate <s>] [--initial <s>] [title...]
+> ```
+>
+> `capture` runs a configured template to completion and writes the
+> entry to disk — handy from scripts or an editor keybinding even before
+> the popover exists. `--annotate` / `--initial` fill the template's
+> `%a` / `%i` tokens (e.g. pass the editor's `path:line` as `--annotate`).
 
 ---
 

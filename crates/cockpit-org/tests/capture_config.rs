@@ -2,13 +2,6 @@
 //! capture types, and that a configured template captures end-to-end.
 
 use cockpit_org::{CaptureContext, NowStamp, OrgConfig, OrgDate, OrgTime, run_capture};
-use serde::Deserialize;
-
-/// The whole `org.toml` is `[org]` plus `[[org.capture]]` tables.
-#[derive(Deserialize)]
-struct OrgToml {
-    org: OrgConfig,
-}
 
 /// Verbatim from IMPLEMENTATION_PLAN.md M12.5a.
 const ORG_TOML: &str = r#"
@@ -45,9 +38,7 @@ fn now() -> NowStamp {
 }
 
 fn config() -> OrgConfig {
-    toml::from_str::<OrgToml>(ORG_TOML)
-        .expect("org.toml parses")
-        .org
+    OrgConfig::from_toml_str(ORG_TOML).expect("org.toml parses")
 }
 
 #[test]
