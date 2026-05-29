@@ -797,6 +797,7 @@ dependencies = [
 name = "cockpit-org"
 version = "0.0.1"
 dependencies = [
+ "cockpit-ipc",
  "insta",
  "orgize",
  "serde",

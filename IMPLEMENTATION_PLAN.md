@@ -2523,6 +2523,19 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   hosting the Org view-models (M12.5/.5a/.5b), IPC server (M12.1)
   exposing the `org` service so the main cockpit can drive the
   same `OrgRoot`.
+- **Impl note (org service contract):** the `org` service
+  request/response protocol ships ahead of the binary in
+  `cockpit-org::service` — `OrgRequest` (`Reload` / `Today` /
+  `TodoList` / `Complete`) and `OrgResponse` (`Reloaded` / `Agenda`
+  / `Updated` / `Error`), plain `serde` types that ride as the
+  payload of `cockpit_ipc::Envelope`. The pure `handle(&mut OrgRoot,
+  req)` applies a request to the live root and (for `Complete`)
+  returns the new file source for the caller to persist — so the
+  jot-IPC and cockpit-direct-write paths share the same edit
+  primitives and stay byte-identical. An integration test round-trips
+  the messages through the real `cockpit-ipc` CBOR codec. The jot
+  binary's event loop / winit popover that hosts this is the
+  remaining (display-bound) work.
 - **Default hotkeys** (configurable in `~/.config/cockpit/org.toml`):
   - `Ctrl+O` — **capture** (opens the capture-template picker;
     pressing the template key triggers immediate quick-entry).

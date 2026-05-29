@@ -46,6 +46,7 @@ pub mod edit;
 pub mod keywords;
 pub mod model;
 pub mod parse;
+pub mod service;
 pub mod store;
 pub mod timestamp;
 
@@ -64,5 +65,8 @@ pub use edit::{
 pub use keywords::Keywords;
 pub use model::{Heading, OrgFile};
 pub use parse::{headline_line_indices, parse_file, parse_file_with, parse_headings};
+pub use service::{
+    AgendaItemDto, AgendaItemKind, OrgRequest, OrgResponse, handle as handle_request,
+};
 pub use store::{DEFAULT_LAYOUT, OrgRoot};
 pub use timestamp::{OrgDate, OrgTime, Timestamp};

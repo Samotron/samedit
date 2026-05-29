@@ -12,7 +12,9 @@
 //! and well specified, so a focused parser is both correct and hermetic.
 
 /// A calendar date (`year-month-day`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct OrgDate {
     pub year: i32,
     pub month: u32,
@@ -26,7 +28,9 @@ impl OrgDate {
 }
 
 /// A wall-clock time of day (`hour:minute`), 24-hour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct OrgTime {
     pub hour: u8,
     pub minute: u8,
