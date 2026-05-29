@@ -203,12 +203,14 @@ primitives.
 > ```
 > cockpit-jot [--root DIR] [--config org.toml] agenda
 > cockpit-jot [--root DIR] [--config org.toml] overview
-> cockpit-jot [--root DIR] [--config org.toml] capture <key> [title...]
+> cockpit-jot [--root DIR] [--config org.toml] \
+>     capture <key> [--annotate <s>] [--initial <s>] [title...]
 > ```
 >
 > `capture` runs a configured template to completion and writes the
 > entry to disk — handy from scripts or an editor keybinding even before
-> the popover exists.
+> the popover exists. `--annotate` / `--initial` fill the template's
+> `%a` / `%i` tokens (e.g. pass the editor's `path:line` as `--annotate`).
 
 ---
 

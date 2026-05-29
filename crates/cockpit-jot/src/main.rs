@@ -8,11 +8,13 @@
 //!
 //!   cockpit-jot [--root <dir>] [--config <org.toml>] agenda
 //!   cockpit-jot [--root <dir>] [--config <org.toml>] overview
-//!   cockpit-jot [--root <dir>] [--config <org.toml>] capture <key> [title...]
+//!   cockpit-jot [--root <dir>] [--config <org.toml>] \
+//!       capture <key> [--annotate <s>] [--initial <s>] [title...]
 //!
 //! `agenda` / `overview` print the corresponding view; `capture` runs a
 //! configured template to completion and writes the entry to disk — the same
-//! `WriteFile` intent the popover would carry out.
+//! `WriteFile` intent the popover would carry out. `--annotate` / `--initial`
+//! supply the template's `%a` / `%i` tokens (e.g. an editor's `path:line`).
 
 use std::fs;
 use std::path::PathBuf;
@@ -22,12 +24,14 @@ use cockpit_jot::app::{HotkeyAction, JotController, JotIntent, Surface};
 use cockpit_jot::loader::{
     default_config_path, load_config, load_root, now_stamp, resolve_org_root,
 };
+use cockpit_org::CaptureContext;
 use cockpit_ui::AgendaRowKind;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut root_dir: Option<PathBuf> = None;
     let mut config_path: Option<PathBuf> = None;
+    let mut ctx = CaptureContext::default();
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -40,6 +44,14 @@ fn main() -> Result<()> {
             "--config" => {
                 i += 1;
                 config_path = args.get(i).map(PathBuf::from);
+            }
+            "--annotate" => {
+                i += 1;
+                ctx.annotation = args.get(i).cloned();
+            }
+            "--initial" => {
+                i += 1;
+                ctx.initial = args.get(i).cloned();
             }
             flag if flag.starts_with("--") => bail!("unknown flag: {flag}"),
             _ => positional.push(args[i].clone()),
@@ -62,7 +74,7 @@ fn main() -> Result<()> {
     let mut controller = JotController::new(config, root, now_stamp());
 
     match command.as_str() {
-        "capture" => run_capture(&mut controller, &positional[1..])?,
+        "capture" => run_capture(&mut controller, &positional[1..], ctx)?,
         "overview" => print_overview(&mut controller),
         "agenda" => print_agenda(&mut controller),
         other => bail!("unknown command: {other} (expected agenda | overview | capture)"),
@@ -72,9 +84,10 @@ fn main() -> Result<()> {
 }
 
 /// `capture <key> [title...]`: pick the template, drop the joined title into
-/// the `%?` slot, commit, and execute the resulting `WriteFile` intent.
-fn run_capture(controller: &mut JotController, rest: &[String]) -> Result<()> {
-    controller.on_hotkey(HotkeyAction::Capture);
+/// the `%?` slot, commit, and execute the resulting `WriteFile` intent. `ctx`
+/// carries the `%a` / `%i` tokens from `--annotate` / `--initial`.
+fn run_capture(controller: &mut JotController, rest: &[String], ctx: CaptureContext) -> Result<()> {
+    controller.open_capture_with(ctx);
 
     // The keys available from the loaded config, for help / error messages.
     let available = available_templates(controller);

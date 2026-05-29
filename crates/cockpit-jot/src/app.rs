@@ -84,6 +84,12 @@ pub struct JotController {
     root: OrgRoot,
     now: NowStamp,
     surface: Surface,
+    /// Context applied to the next template expansion: `%a` (annotation) and
+    /// `%i` (initial content). A bare hotkey capture has none; a capture
+    /// triggered from the cockpit (over IPC) or the CLI supplies the editor's
+    /// `path:line` and selection here. Scoped to the capture session — every
+    /// `open_capture*` resets it.
+    pending_ctx: CaptureContext,
 }
 
 impl JotController {
@@ -95,6 +101,7 @@ impl JotController {
             root,
             now,
             surface: Surface::Hidden,
+            pending_ctx: CaptureContext::default(),
         }
     }
 
@@ -165,6 +172,18 @@ impl JotController {
     // ---- surface openers ----------------------------------------------------
 
     fn open_capture(&mut self) -> Vec<JotIntent> {
+        // A bare hotkey/tray capture carries no editor context.
+        self.pending_ctx = CaptureContext::default();
+        self.surface = Surface::Capture(CaptureView::from_config(&self.config));
+        vec![JotIntent::ShowPopover]
+    }
+
+    /// Open the capture picker with editor context (`%a` annotation, `%i`
+    /// initial content) for the template expansion. Used by the cockpit-driven
+    /// (IPC) and CLI capture paths, where a source location / selection is
+    /// known; the bare hotkey uses [`HotkeyAction::Capture`] instead.
+    pub fn open_capture_with(&mut self, ctx: CaptureContext) -> Vec<JotIntent> {
+        self.pending_ctx = ctx;
         self.surface = Surface::Capture(CaptureView::from_config(&self.config));
         vec![JotIntent::ShowPopover]
     }
@@ -193,8 +212,9 @@ impl JotController {
     /// in the editing phase).
     pub fn capture_pick(&mut self, key: &str) -> bool {
         let now = self.now.clone();
+        let ctx = self.pending_ctx.clone();
         if let Surface::Capture(view) = &mut self.surface {
-            view.pick(key, &now, &CaptureContext::default())
+            view.pick(key, &now, &ctx)
         } else {
             false
         }
@@ -470,6 +490,48 @@ mod tests {
         // No capture open: inserting is a silent no-op, not a panic.
         c.capture_insert_str("ignored");
         assert_eq!(c.surface().name(), "hidden");
+    }
+
+    #[test]
+    fn open_capture_with_context_expands_annotation() {
+        // A template with %a should pick up the supplied annotation; the bare
+        // hotkey path leaves it empty.
+        let mut c = JotController::new(
+            OrgConfig {
+                root: Some("/org".into()),
+                default_todo_keywords: vec!["TODO".into(), "DONE".into()],
+                capture: vec![CaptureTemplate {
+                    key: "n".into(),
+                    name: "Note".into(),
+                    target: CaptureTarget {
+                        file: "notes.org".into(),
+                        under: None,
+                        datetree: false,
+                    },
+                    template: "* %? from %a".into(),
+                }],
+            },
+            OrgRoot::from_files("/org", [("/org/notes.org", "")]),
+            now(),
+        );
+
+        c.open_capture_with(CaptureContext {
+            annotation: Some("src/lib.rs:10".into()),
+            ..Default::default()
+        });
+        assert!(c.capture_pick("n"));
+        if let Surface::Capture(v) = c.surface() {
+            assert_eq!(v.buffer(), "*  from src/lib.rs:10");
+        } else {
+            panic!("expected capture surface");
+        }
+
+        // The bare hotkey path resets context: %a expands to empty.
+        c.on_hotkey(HotkeyAction::Capture);
+        assert!(c.capture_pick("n"));
+        if let Surface::Capture(v) = c.surface() {
+            assert_eq!(v.buffer(), "*  from ");
+        }
     }
 
     #[test]

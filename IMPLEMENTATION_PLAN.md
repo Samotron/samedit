@@ -2548,12 +2548,16 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   `cockpit-org::date`, no `chrono`). Until the `ui-smoke` event loop
   lands, `main.rs` is a headless CLI over the same controller:
   `agenda` / `overview` print the view, and `capture <key>
-  [title...]` runs a configured template to completion and writes the
-  entry (the same `WriteFile` intent the popover carries out) — usable
-  from scripts / editor keybindings today. A `tests/capture_cli.rs`
-  integration test drives the real binary end-to-end. The real
-  `tray-icon` + `global-hotkey` + winit popover loop is the
-  display-bound follow-up.
+  [--annotate S] [--initial S] [title...]` runs a configured template
+  to completion and writes the entry (the same `WriteFile` intent the
+  popover carries out) — usable from scripts / editor keybindings
+  today. The capture context (`%a` annotation / `%i` initial) is no
+  longer hardcoded empty: `JotController::open_capture_with(ctx)` feeds
+  it into the next pick (the bare hotkey path resets it), so the
+  cockpit-driven (IPC) and CLI captures can supply the editor's
+  `path:line` / selection. A `tests/capture_cli.rs` integration test
+  drives the real binary end-to-end. The real `tray-icon` +
+  `global-hotkey` + winit popover loop is the display-bound follow-up.
 - **Impl note (`org.toml` loading):** `OrgConfig::from_toml_str`
   parses the documented `[org]` + `[[org.capture]]` grammar
   (foreign sections tolerated, missing `[org]` → defaults) as a

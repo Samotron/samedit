@@ -65,6 +65,29 @@ fn capture_unknown_key_fails_and_lists_templates() {
 }
 
 #[test]
+fn capture_annotation_flows_into_template() {
+    // A %a template picks up --annotate.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("notes.org"), "* Inbox\n").unwrap();
+    let toml = format!(
+        "[org]\nroot = \"{root}\"\n\n[[org.capture]]\nkey = \"n\"\nname = \"Note\"\n\
+         target = {{ file = \"notes.org\", under = \"Inbox\" }}\n\
+         template = \"* %? from %a\"\n",
+        root = dir.path().display()
+    );
+    std::fs::write(dir.path().join("org.toml"), &toml).unwrap();
+
+    let out = run(
+        &dir.path().join("org.toml"),
+        &["capture", "n", "--annotate", "src/lib.rs:42", "look", "here"],
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    let notes = std::fs::read_to_string(dir.path().join("notes.org")).unwrap();
+    assert_eq!(notes, "* Inbox\n** look here from src/lib.rs:42\n");
+}
+
+#[test]
 fn capture_missing_key_reports_usage() {
     let dir = fixture();
     let out = run(&dir.path().join("org.toml"), &["capture"]);
