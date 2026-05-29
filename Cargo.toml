@@ -13,6 +13,7 @@ license = "MIT OR Apache-2.0"
 cockpit-config = { path = "crates/cockpit-config" }
 cockpit-commands = { path = "crates/cockpit-commands" }
 cockpit-project = { path = "crates/cockpit-project" }
+cockpit-quick = { path = "crates/cockpit-quick" }
 cockpit-editor = { path = "crates/cockpit-editor" }
 cockpit-hotkey = { path = "crates/cockpit-hotkey" }
 cockpit-http = { path = "crates/cockpit-http" }

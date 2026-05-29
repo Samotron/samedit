@@ -2931,6 +2931,18 @@ New crates:
   surfaces.
 - **Tests:** scripted Lua action registration; sandbox enforcement
   identical to v0.9.
+- **Impl note (M13.3, launcher side):** the provider ships as
+  `cockpit_launcher::lua::LuaActionsProvider` over plain `LuaAction
+  { extension, id, title }` descriptors — so `cockpit-launcher` does
+  **not** depend on `cockpit-lua`; the `cockpit-quick` binary bridges
+  the two. Each action emits `ActionRun::Lua(LuaActionHandle{extension,
+  id})`; the binary routes Enter back to the owning VM via the existing
+  `LuaRuntime::dispatch_command` path (same sandbox + capability gate,
+  so a pure-Lua action needs nothing and a network/fs one still hits
+  M9.4). The `cockpit.launcher.action {…}` registrar in `cockpit-lua`'s
+  sandbox (harvesting into `Registrations`) and the shared
+  `extensions/*.lua` hot-reload are the binary-side follow-up, behind
+  the same `ui-smoke`-gated event loop as the rest of M13.5.
 
 ### M13.4 — Provider: built-ins
 
@@ -2982,6 +2994,27 @@ New crates:
   cheap to summon.
 - **Tests:** popover view-model goldens; provider integration
   smoke per OS.
+- **Impl note (M13.5):** shipped split like `cockpit-jot` — a tested,
+  backend-free `QuickController` (event → intent) plus a thin
+  `main.rs`. The controller owns the live `Launcher` and the
+  query/results/selection, mapping `QuickEvent`
+  (`SetQuery`/`MoveUp`/`MoveDown`/`Submit`/`Dismiss`) onto `QuickIntent`
+  (`CopyToClipboard`/`OpenUrl`/`OpenPath`/`DispatchCommand`/`RunLua`/
+  `RunProcess`/`Dismiss`). Every `ActionRun` lowers to exactly one
+  intent — the calculator's `clipboard.copy` command becomes a local
+  `CopyToClipboard`, every other `Command` becomes a `DispatchCommand`
+  the binary sends over the `cockpit`/`org` IPC service. `loader.rs` is
+  the config glue: `build_launcher(config, inputs, home, fs)` assembles
+  the enabled providers from `launcher.toml` (expanding a leading `~`
+  in project paths) over an injected `FileSystem`, taking the
+  IPC-sourced runtime data (recent projects, themes, org templates, Lua
+  actions) as plain `ProviderInputs`. Until the `ui-smoke` event loop
+  lands, `main.rs` is a headless CLI over the same controller —
+  `search` / `run` / `providers` — usable from scripts today. The real
+  `tray-icon` + `global-hotkey` + winit popover (text input on top,
+  results list, `Tab` secondary actions, cold-start budget) is the
+  display-bound follow-up behind the `ui-smoke` feature, same staging
+  as `cockpit-jot`'s shell.
 
 ### M13.6 — Settings + config
 

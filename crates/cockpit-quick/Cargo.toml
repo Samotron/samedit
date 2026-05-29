@@ -1,0 +1,33 @@
+[package]
+name = "cockpit-quick"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The cockpit-quick sibling tray app: a Raycast-style quick-action launcher reachable from any window (v0.13 M13.5)."
+
+[features]
+default = []
+# The real winit popover + tray-icon + global-hotkey event loop lands behind
+# this flag once it can be smoke-tested on a windowing CI leg — same staging as
+# cockpit-jot. The headless QuickController (event -> intent) is backend-free
+# and tested in the fast leg.
+ui-smoke = []
+
+[lib]
+name = "cockpit_quick"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cockpit-quick"
+path = "src/main.rs"
+
+[dependencies]
+cockpit-launcher.workspace = true
+cockpit-config.workspace = true
+cockpit-project.workspace = true
+cockpit-commands.workspace = true
+anyhow = "1.0.102"
+
+[dev-dependencies]
+tempfile = "3.27.0"

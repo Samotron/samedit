@@ -14,3 +14,7 @@ path = "src/lib.rs"
 cockpit-commands.workspace = true
 cockpit-project.workspace = true
 nucleo-matcher = "0.3.1"
+serde = { version = "1.0.228", features = ["derive"] }
+
+[dev-dependencies]
+cockpit-ipc.workspace = true

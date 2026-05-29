@@ -35,14 +35,21 @@ pub mod action;
 pub mod builtins;
 pub mod calc;
 pub mod launcher;
+pub mod lua;
 pub mod mise;
 pub mod provider;
+pub mod service;
 
 pub use action::{Action, ActionArg, ActionIcon, ActionRun, LuaActionHandle};
-pub use builtins::{CLIPBOARD_COPY_COMMAND, CalculatorProvider, UrlProvider};
+pub use builtins::{
+    CLIPBOARD_COPY_COMMAND, CalculatorProvider, ORG_AGENDA_COMMAND, ORG_CAPTURE_COMMAND,
+    OrgProvider, RecentProjectsProvider, THEME_SWITCH_COMMAND, ThemeProvider, UrlProvider,
+};
 pub use launcher::{DEFAULT_MAX_ROWS, Launcher, RankedAction};
+pub use lua::{LuaAction, LuaActionsProvider};
 pub use mise::MiseTasksProvider;
 pub use provider::{ActionProvider, DEFAULT_PROVIDER_QUOTA};
+pub use service::{CockpitOutcome, CockpitRequest, CockpitResponse};
 
 #[cfg(test)]
 mod tests {
