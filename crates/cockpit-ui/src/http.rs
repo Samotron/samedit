@@ -27,6 +27,17 @@ use cockpit_http::{
 
 use crate::Rect;
 
+/// Vertical thickness (logical px) of the draggable divider band straddling
+/// the request/response boundary. Mirrors the 6 px pane-border hit band the
+/// workspace splitter uses (binary `detect_border_drag`, M4.7) so the HTTP
+/// view's split feels identical to dragging a side pane.
+pub const SPLIT_HANDLE_THICKNESS: u32 = 6;
+
+/// Horizontal padding, in cells, on each side of a tab label in the response
+/// tab strip. The strip is monospaced (terminal-first), so a tab's pixel
+/// width is `(label.chars().count() + 2 * TAB_PADDING_CELLS) * cell_width`.
+pub const TAB_PADDING_CELLS: u32 = 1;
+
 /// The four tabs in the response panel. Matches `<leader>h1..h4` in M11.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResponseTab {
@@ -359,6 +370,13 @@ impl HttpView {
             .max(1.0) as u32;
         let request_height = request_height.min(viewport.height.saturating_sub(1));
         let response_height = viewport.height.saturating_sub(request_height);
+        let boundary = viewport.y + request_height;
+        // Centre the drag band on the boundary, clamped inside the viewport so
+        // the band never spills past either edge on a tiny pane.
+        let half = SPLIT_HANDLE_THICKNESS / 2;
+        let handle_top = boundary.saturating_sub(half).max(viewport.y);
+        let handle_bottom =
+            (boundary + (SPLIT_HANDLE_THICKNESS - half)).min(viewport.y + viewport.height);
         SplitLayout {
             request: Rect::new(viewport.x, viewport.y, viewport.width, request_height),
             response: Rect::new(
@@ -367,7 +385,63 @@ impl HttpView {
                 viewport.width,
                 response_height,
             ),
+            handle: Rect::new(
+                viewport.x,
+                handle_top,
+                viewport.width,
+                handle_bottom.saturating_sub(handle_top),
+            ),
         }
+    }
+
+    /// Map a pointer `y` (logical px) inside `viewport` to a split ratio and
+    /// apply it (clamped to the viable band). Returns the applied ratio. The
+    /// painter calls this while a [`SplitLayout::handle`] drag is in flight.
+    pub fn drag_split_to(&mut self, viewport: Rect, pointer_y: f32) -> f32 {
+        let span = viewport.height.max(1) as f32;
+        let ratio = (pointer_y - viewport.y as f32) / span;
+        self.set_split_ratio(ratio);
+        self.split_ratio
+    }
+
+    /// Lay out the response-pane tab strip: one clickable rectangle per
+    /// [`ResponseTab`], left-to-right across the top row of `response_pane`.
+    /// `cell_width` / `row_height` are the painter's monospaced glyph metrics
+    /// (logical px); the strip is exactly one row tall.
+    pub fn tab_strip(&self, response_pane: Rect, cell_width: u32, row_height: u32) -> TabStrip {
+        let mut x = response_pane.x;
+        let y = response_pane.y;
+        let height = row_height.min(response_pane.height);
+        let tabs = ResponseTab::all().map(|tab| {
+            let cells = tab.label().chars().count() as u32 + 2 * TAB_PADDING_CELLS;
+            let width = cells * cell_width;
+            let rect = Rect::new(x, y, width, height);
+            x = x.saturating_add(width);
+            (tab, rect)
+        });
+        TabStrip {
+            tabs,
+            active: self.tab,
+        }
+    }
+
+    /// Hit-test a pointer against the response tab strip and, on a hit,
+    /// activate that tab. Returns the newly-active tab when the click landed
+    /// on one, or `None` when it missed the strip. The painter's single mouse
+    /// entry point for the response panel header.
+    pub fn click_response_tab(
+        &mut self,
+        response_pane: Rect,
+        cell_width: u32,
+        row_height: u32,
+        x: f32,
+        y: f32,
+    ) -> Option<ResponseTab> {
+        let hit = self
+            .tab_strip(response_pane, cell_width, row_height)
+            .hit(x, y)?;
+        self.set_response_tab(hit);
+        Some(hit)
     }
 
     /// Render the active tab's content for the selected request. Returns
@@ -388,6 +462,51 @@ pub struct SplitLayout {
     pub request: Rect,
     /// Bottom half — the response panel (tab strip + active tab body).
     pub response: Rect,
+    /// Draggable divider band straddling the request/response boundary
+    /// ([`SPLIT_HANDLE_THICKNESS`] tall). The painter hit-tests this to start
+    /// a resize drag, then feeds the pointer into [`HttpView::drag_split_to`].
+    pub handle: Rect,
+}
+
+impl SplitLayout {
+    /// True when the logical-pixel pointer `(x, y)` falls in the divider band.
+    pub fn handle_contains(&self, x: f32, y: f32) -> bool {
+        rect_contains(self.handle, x, y)
+    }
+}
+
+/// Response-pane tab strip layout: one clickable rectangle per
+/// [`ResponseTab`] laid left-to-right across the top row. Produced by
+/// [`HttpView::tab_strip`]; the painter draws each rect and routes clicks
+/// through [`TabStrip::hit`] (or [`HttpView::click_response_tab`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabStrip {
+    /// Each tab paired with its on-screen rectangle, in display order.
+    pub tabs: [(ResponseTab, Rect); 4],
+    /// The currently-active tab, so the painter can highlight it without a
+    /// second call into the view.
+    pub active: ResponseTab,
+}
+
+impl TabStrip {
+    /// Which tab, if any, contains the logical-pixel pointer `(x, y)`.
+    pub fn hit(&self, x: f32, y: f32) -> Option<ResponseTab> {
+        self.tabs
+            .iter()
+            .find(|(_, rect)| rect_contains(*rect, x, y))
+            .map(|(tab, _)| *tab)
+    }
+}
+
+/// Point-in-rectangle test for an `f32` logical pointer against a `u32`
+/// rectangle. Right/bottom edges are exclusive so adjacent tab rectangles
+/// never both claim the same pixel column.
+fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
+    let left = rect.x as f32;
+    let top = rect.y as f32;
+    let right = (rect.x + rect.width) as f32;
+    let bottom = (rect.y + rect.height) as f32;
+    x >= left && x < right && y >= top && y < bottom
 }
 
 /// Headless render of the selected tab's content. Plain data so the
@@ -908,6 +1027,86 @@ mod tests {
         assert!((view.split_ratio() - 0.15).abs() < 1e-6);
         view.set_split_ratio(0.99);
         assert!((view.split_ratio() - 0.85).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compute_split_centres_the_handle_band_on_the_boundary() {
+        let view = HttpView::new(collection_with(vec![request("a", "https://a")], Vec::new()));
+        // Default 0.5 ratio of a 600px-tall pane → boundary at 300.
+        let split = view.compute_split(Rect::new(0, 0, 800, 600));
+        let boundary = split.request.height; // y of the response top
+        assert_eq!(boundary, split.response.y);
+        assert_eq!(split.handle.height, SPLIT_HANDLE_THICKNESS);
+        assert_eq!(split.handle.width, 800);
+        // Band straddles the boundary.
+        assert!(split.handle.y <= boundary);
+        assert!(split.handle.y + split.handle.height >= boundary);
+    }
+
+    #[test]
+    fn handle_contains_matches_the_drag_band() {
+        let view = HttpView::new(collection_with(vec![request("a", "https://a")], Vec::new()));
+        let split = view.compute_split(Rect::new(0, 0, 800, 600));
+        let boundary = split.request.height as f32;
+        assert!(split.handle_contains(400.0, boundary));
+        // Well above the boundary is in the request body, not the handle.
+        assert!(!split.handle_contains(400.0, boundary - 50.0));
+    }
+
+    #[test]
+    fn drag_split_to_maps_pointer_y_to_a_clamped_ratio() {
+        let mut view = HttpView::new(collection_with(vec![request("a", "https://a")], Vec::new()));
+        let viewport = Rect::new(0, 0, 800, 600);
+        // Drag to 25% down the pane.
+        let ratio = view.drag_split_to(viewport, 150.0);
+        assert!((ratio - 0.25).abs() < 1e-6);
+        // Dragging past the top clamps to the viable floor (0.15).
+        let clamped = view.drag_split_to(viewport, 0.0);
+        assert!((clamped - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tab_strip_lays_tabs_left_to_right_without_gaps() {
+        let view = HttpView::new(collection_with(vec![request("a", "https://a")], Vec::new()));
+        let pane = Rect::new(10, 200, 800, 400);
+        let strip = view.tab_strip(pane, 8, 16);
+        assert_eq!(strip.active, ResponseTab::Body);
+        // First tab starts flush with the pane's left edge / top.
+        assert_eq!(strip.tabs[0].1.x, 10);
+        assert_eq!(strip.tabs[0].1.y, 200);
+        assert_eq!(strip.tabs[0].1.height, 16);
+        // "Body" = 4 chars + 2 padding cells = 6 cells * 8px = 48px wide.
+        assert_eq!(strip.tabs[0].1.width, 48);
+        // Tabs butt up against each other with no overlap or gap.
+        for pair in strip.tabs.windows(2) {
+            let (_, prev) = pair[0];
+            let (_, next) = pair[1];
+            assert_eq!(prev.x + prev.width, next.x);
+        }
+    }
+
+    #[test]
+    fn click_response_tab_activates_the_hit_tab() {
+        let mut view = HttpView::new(collection_with(vec![request("a", "https://a")], Vec::new()));
+        let pane = Rect::new(0, 0, 800, 400);
+        let strip = view.tab_strip(pane, 8, 16);
+        // Click in the middle of the Headers tab.
+        let headers_rect = strip.tabs[1].1;
+        let cx = (headers_rect.x + headers_rect.width / 2) as f32;
+        let cy = (headers_rect.y + headers_rect.height / 2) as f32;
+        let hit = view.click_response_tab(pane, 8, 16, cx, cy);
+        assert_eq!(hit, Some(ResponseTab::Headers));
+        assert_eq!(view.response_tab(), ResponseTab::Headers);
+    }
+
+    #[test]
+    fn click_below_the_strip_is_a_miss_and_leaves_the_tab_unchanged() {
+        let mut view = HttpView::new(collection_with(vec![request("a", "https://a")], Vec::new()));
+        let pane = Rect::new(0, 0, 800, 400);
+        // y far below the one-row strip.
+        let hit = view.click_response_tab(pane, 8, 16, 20.0, 300.0);
+        assert_eq!(hit, None);
+        assert_eq!(view.response_tab(), ResponseTab::Body);
     }
 
     #[test]

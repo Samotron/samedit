@@ -1899,6 +1899,29 @@ everything else (AGENTS §2 #5).
   `cockpit::hydration` recognising `.bru` files and constructing
   `HttpView` on open) lands in M11.4.1 — same pattern as how the
   notebook view-model shipped before its painter.
+- **M11.4.1 update (headless hit-testing geometry):** the painter's
+  mouse maths is now headless-testable in `cockpit-ui::http`, ahead of
+  the GPU glyph work (AGENTS §2 #9 — mouse goes through layout
+  rectangles, not `winit` types outside `cockpit-render`).
+  `SplitLayout` gained a `handle: Rect` — a `SPLIT_HANDLE_THICKNESS`
+  (6 px, matching the M4.7 pane-border band) divider band centred on
+  the request/response boundary and clamped inside the viewport — plus
+  `SplitLayout::handle_contains(x, y)`. `HttpView::drag_split_to(viewport,
+  pointer_y)` maps a live drag's pointer-y to a clamped split ratio.
+  For the tab strip, `HttpView::tab_strip(response_pane, cell_width,
+  row_height)` lays out one `Rect` per `ResponseTab` left-to-right
+  (monospaced: width = `(label.len() + 2 * TAB_PADDING_CELLS) *
+  cell_width`, gap-free), returning a `TabStrip { tabs, active }`;
+  `TabStrip::hit(x, y)` and the binary-facing
+  `HttpView::click_response_tab(...)` route a click to the tab under the
+  pointer (right/bottom edges exclusive so adjacent tabs never both
+  claim a column). 7 new unit tests (handle centring, `handle_contains`
+  band, `drag_split_to` clamp, gap-free strip layout, click-activates-
+  hit, click-misses-below). Remaining for M11.4.1: the actual
+  `cockpit-render` glyph painter (drawing the divider + tab strip and
+  feeding `on_mouse_*` into these helpers) and `cockpit::hydration`
+  recognising `.bru` files to construct the `HttpView` on open — both
+  GPU/binary-bound.
 - **Done when:** opening a `.bru` file shows the split; running
   the request populates the response panel; tab switching works.
 
