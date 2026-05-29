@@ -1,0 +1,16 @@
+[package]
+name = "cockpit-launcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless core for the v0.13 quick-action launcher: provider trait, fuzzy matcher, action dispatch model (M13.1)."
+
+[lib]
+name = "cockpit_launcher"
+path = "src/lib.rs"
+
+[dependencies]
+cockpit-commands.workspace = true
+cockpit-project.workspace = true
+nucleo-matcher = "0.3.1"

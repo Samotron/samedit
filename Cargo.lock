@@ -759,6 +759,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-launcher"
+version = "0.0.1"
+dependencies = [
+ "cockpit-commands",
+ "cockpit-project",
+ "nucleo-matcher",
+]
+
+[[package]]
 name = "cockpit-lsp"
 version = "0.0.1"
 dependencies = [

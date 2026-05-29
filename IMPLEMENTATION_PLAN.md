@@ -2860,6 +2860,25 @@ New crates:
   provider quota to avoid one provider drowning the list.
 - **Tests:** ranking with synthetic providers; quota enforcement;
   empty-query "favourites" listing; query escaping.
+- **Impl note (M13.1):** shipped as the headless `cockpit-launcher`
+  crate. `ActionProvider` gained two defaulted methods beyond the
+  plan sketch — `quota()` (the per-provider cap, default 5) and
+  `fuzzy_filtered()`. The latter resolves the "providers return
+  scored candidates" tension cleanly: list providers (mise) return
+  every candidate and let the launcher fuzzy-score titles, while
+  *verbatim* providers (calculator, URL) emit one already-relevant
+  action that the launcher keeps at a high base score so it floats
+  to the top, Raycast-style. `Launcher::search` is the two-stage
+  merge: score → per-provider quota → cross-provider sort by score,
+  then title, then id (fully deterministic, no dependence on
+  provider iteration order), capped to `max_rows` (default 8).
+  Ranking reuses `nucleo-matcher` exactly as `cockpit_ui::file_finder`
+  does. `ActionRun::OpenUrl` carries a `String` (validated at
+  provider time) rather than a `url::Url`, avoiding a new dep; the
+  enum is otherwise as specified, with `Lua(LuaActionHandle)` modelled
+  now so the binary (M13.5) only has to wire the runtime. The
+  crate stays backend-free — the only seam it touches is
+  `cockpit-project::env` for `ProcessSpec` and the test `FakeFileSystem`.
 
 ### M13.2 — Provider: mise tasks
 
@@ -2875,6 +2894,19 @@ New crates:
   crate, reused from M9.5).
 - **Out of scope:** running tasks against the cockpit's *open*
   project specifically — that's the in-cockpit palette's job.
+- **Impl note (M13.2):** `MiseTasksProvider::from_projects(fs, roots)`
+  parses each root's `mise.toml` through `cockpit_project::
+  detect_mise_project_with` over an injected `FileSystem` — no real
+  disk, fully testable. The mise-availability probe is stubbed with a
+  never-spawning `ProcessRunner` (discovery only reads the config, it
+  never runs `mise --version`). Tasks are emitted as
+  `Action { title: "<project>: <task>", run: Process(mise run <task>,
+  cwd = project root) }`; the project label prefers `[metadata.cockpit]
+  name`, else the directory name. A stale/missing root is skipped, not
+  fatal. Entries are sorted (project, task) so the empty-query listing
+  is stable. The disk-watch re-scan (`notify`) and the
+  `Launcher: Add Mise Project` cockpit command are binary-side wiring,
+  deferred with M13.5/M13.7.
 
 ### M13.3 — Provider: Lua extensions
 
@@ -2921,6 +2953,19 @@ New crates:
   second entry point to capture, complementing `Ctrl+O`.
 - `Org Agenda` — opens the agenda popover via the `org` IPC
   service (or launches the tray app if it isn't running).
+- **Impl note (M13.4, headless subset):** the two self-contained
+  built-ins ship now in `cockpit_launcher::builtins`. `Calculator` is
+  a verbatim provider: `=<expr>` runs a dependency-free recursive-descent
+  evaluator (`calc.rs` — `+ - * /`, parentheses, unary minus, correct
+  precedence so `=2+2*3` → `8`; div-by-zero / malformed → no row) and
+  emits one action whose Enter dispatches `clipboard.copy` with the
+  result (so even the calculator rides the `CommandId` spine). `Open URL`
+  recognises an `http(s)://` query with a real host (conservative,
+  regex-free) and emits an `OpenUrl` action. The IPC-backed built-ins —
+  `Open Project`, `Switch Theme`, `Org Capture: <Template>`,
+  `Org Agenda` — need a live IPC client, so they land with the
+  `cockpit-quick` binary (M13.5) alongside the `cockpit` IPC service
+  variants (M13.7).
 
 ### M13.5 — `cockpit-quick`: sibling binary
 
