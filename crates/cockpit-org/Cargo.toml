@@ -19,9 +19,11 @@ bench = []
 # never orgize's serialiser.
 orgize = { version = "0.9.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
+# Capture templates + the org root are declared in `org.toml`; we parse the
+# `[org]` table straight into `OrgConfig`.
+toml = "0.9.8"
 
 [dev-dependencies]
 # Proves the OrgRequest/OrgResponse contract rides over the real IPC codec.
 cockpit-ipc.workspace = true
 insta = "1.43.2"
-toml = "0.9.8"

@@ -2547,10 +2547,21 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   derives the calendar date from `SystemTime` via
   `cockpit-org::date`, no `chrono`). Until the `ui-smoke` event loop
   lands, `main.rs` is a headless CLI (`cockpit-jot [--root D]
-  [agenda|overview]`) over the same controller — it loads the root
-  and prints the agenda, proving the wiring without a window. The
-  real `tray-icon` + `global-hotkey` + winit popover loop is the
-  display-bound follow-up.
+  [--config org.toml] [agenda|overview]`) over the same controller —
+  it loads the root and prints the agenda, proving the wiring without
+  a window. The real `tray-icon` + `global-hotkey` + winit popover
+  loop is the display-bound follow-up.
+- **Impl note (`org.toml` loading):** `OrgConfig::from_toml_str`
+  parses the documented `[org]` + `[[org.capture]]` grammar
+  (foreign sections tolerated, missing `[org]` → defaults) as a
+  first-class API in `cockpit-org`, replacing the integration
+  test's ad-hoc wrapper. `loader::{load_config, default_config_path,
+  resolve_org_root}` is the binary glue: a missing file is not an
+  error (defaults apply) but a malformed one is, and the org root
+  resolves `--root` > config `root` (leading `~` expanded) > `~/org`.
+  `main.rs` reads `~/.config/cockpit/org.toml` by default, so
+  configured capture templates now flow into the controller instead
+  of the previous hardcoded empty set.
 - **Default hotkeys** (configurable in `~/.config/cockpit/org.toml`):
   - `Ctrl+O` — **capture** (opens the capture-template picker;
     pressing the template key triggers immediate quick-entry).

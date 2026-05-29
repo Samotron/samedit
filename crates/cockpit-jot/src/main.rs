@@ -8,19 +8,21 @@
 //! without a window.
 //!
 //! Usage:
-//!   cockpit-jot [--root <dir>] [agenda|overview]
+//!   cockpit-jot [--root <dir>] [--config <org.toml>] [agenda|overview]
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use cockpit_jot::app::{HotkeyAction, JotController, Surface};
-use cockpit_jot::loader::{load_root, now_stamp};
-use cockpit_org::OrgConfig;
+use cockpit_jot::loader::{
+    default_config_path, load_config, load_root, now_stamp, resolve_org_root,
+};
 use cockpit_ui::AgendaRowKind;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut root_dir: Option<PathBuf> = None;
+    let mut config_path: Option<PathBuf> = None;
     let mut command = "agenda".to_string();
 
     let mut i = 0;
@@ -30,20 +32,25 @@ fn main() -> Result<()> {
                 i += 1;
                 root_dir = args.get(i).map(PathBuf::from);
             }
+            "--config" => {
+                i += 1;
+                config_path = args.get(i).map(PathBuf::from);
+            }
             "agenda" | "overview" => command = args[i].clone(),
             other => anyhow::bail!("unknown argument: {other}"),
         }
         i += 1;
     }
 
-    let root_dir = root_dir.unwrap_or_else(default_org_root);
-    // org.toml wiring is a follow-up; default workflow + no templates for now.
-    let config = OrgConfig {
-        root: Some(root_dir.display().to_string()),
-        default_todo_keywords: vec!["TODO".into(), "DONE".into()],
-        capture: Vec::new(),
+    // Load capture templates + workflow from `org.toml` (default
+    // `~/.config/cockpit/org.toml`); a missing file falls back to defaults.
+    let config = match config_path.or_else(default_config_path) {
+        Some(path) => load_config(&path)?,
+        None => cockpit_org::OrgConfig::default(),
     };
 
+    // Root precedence: `--root` > config `root` > `~/org`.
+    let root_dir = resolve_org_root(root_dir, &config);
     let root = load_root(&root_dir, &config)?;
     let mut controller = JotController::new(config, root, now_stamp());
 
@@ -85,13 +92,4 @@ fn main() -> Result<()> {
          the `ui-smoke` follow-up — this CLI exercises the headless controller.)"
     );
     Ok(())
-}
-
-/// `$XDG_DATA_HOME/../org`? No — the plan default is `~/org`.
-fn default_org_root() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join("org")
-    } else {
-        PathBuf::from("org")
-    }
 }

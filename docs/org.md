@@ -194,11 +194,12 @@ produce byte-identical files** — they share the same line-range edit
 primitives.
 
 > **Status.** The headless engine (parser, capture, agenda, repeaters,
-> the IPC service, and the controller) ships in this release. The tray
-> icon, global-hotkey registration, and the floating popover window are
-> wired up on platforms with a desktop session; on a headless build the
-> same controller is reachable via the `cockpit-jot` CLI
-> (`cockpit-jot [--root DIR] [agenda|overview]`).
+> the IPC service, the controller, and `org.toml` loading) ships in this
+> release. The tray icon, global-hotkey registration, and the floating
+> popover window are wired up on platforms with a desktop session; on a
+> headless build the same controller is reachable via the `cockpit-jot`
+> CLI (`cockpit-jot [--root DIR] [--config org.toml] [agenda|overview]`),
+> which reads `~/.config/cockpit/org.toml` by default.
 
 ---
 
