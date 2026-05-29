@@ -59,7 +59,10 @@ fn main() -> Result<()> {
         i += 1;
     }
 
-    let command = positional.first().cloned().unwrap_or_else(|| "agenda".into());
+    let command = positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "agenda".into());
 
     // Load capture templates + workflow from `org.toml` (default
     // `~/.config/cockpit/org.toml`); a missing file falls back to defaults.
@@ -93,11 +96,17 @@ fn run_capture(controller: &mut JotController, rest: &[String], ctx: CaptureCont
     let available = available_templates(controller);
 
     let Some(key) = rest.first() else {
-        bail!("capture needs a template key.{}", available_hint(&available));
+        bail!(
+            "capture needs a template key.{}",
+            available_hint(&available)
+        );
     };
 
     if !controller.capture_pick(key) {
-        bail!("no capture template with key '{key}'.{}", available_hint(&available));
+        bail!(
+            "no capture template with key '{key}'.{}",
+            available_hint(&available)
+        );
     }
 
     let title = rest[1..].join(" ");

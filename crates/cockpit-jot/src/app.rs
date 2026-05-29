@@ -228,6 +228,30 @@ impl JotController {
         }
     }
 
+    /// Delete the char before the capture editor's cursor (Backspace). No-op
+    /// unless an editing capture is open.
+    pub fn capture_backspace(&mut self) {
+        if let Surface::Capture(view) = &mut self.surface {
+            view.backspace();
+        }
+    }
+
+    /// Move the capture editor's cursor one char left. No-op off a capture
+    /// surface.
+    pub fn capture_move_left(&mut self) {
+        if let Surface::Capture(view) = &mut self.surface {
+            view.move_left();
+        }
+    }
+
+    /// Move the capture editor's cursor one char right. No-op off a capture
+    /// surface.
+    pub fn capture_move_right(&mut self) {
+        if let Surface::Capture(view) = &mut self.surface {
+            view.move_right();
+        }
+    }
+
     /// Commit the capture being edited: expand → file under the template's
     /// target → persist. Returns the write + dismiss intents, or empty if the
     /// surface isn't an editing capture.
@@ -266,6 +290,15 @@ impl JotController {
         let today = self.today();
         if let Surface::Agenda(view) = &mut self.surface {
             view.cycle_mode(&self.root, today);
+        }
+    }
+
+    /// Replace the agenda's filter query (the `/` filter) and rebuild its rows.
+    /// No-op unless the agenda is open.
+    pub fn agenda_set_filter(&mut self, query: impl Into<String>) {
+        let today = self.today();
+        if let Surface::Agenda(view) = &mut self.surface {
+            view.set_filter(query, &self.root, today);
         }
     }
 

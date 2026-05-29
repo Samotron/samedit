@@ -749,8 +749,10 @@ name = "cockpit-jot"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "cockpit-commands",
  "cockpit-hotkey",
  "cockpit-org",
+ "cockpit-paint",
  "cockpit-tray",
  "cockpit-ui",
  "tempfile",

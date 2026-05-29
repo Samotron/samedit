@@ -2364,8 +2364,11 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   helper encodes the "unconsumed bare `Escape` dismisses" shell policy
   (focus-loss dismissal stays the shell's concern). A reference
   `PopoverContent` impl in the unit tests exercises every method.
-  Remaining display-bound work: the `winit`+`glow` popover shell that
-  hosts a `PopoverContent`, and the concrete jot/launcher content impls.
+  The concrete jot content impl shipped alongside as
+  `cockpit_jot::JotPopover` (see M12.6) — proving the trait hosts a real
+  multi-surface view-model. Remaining display-bound work: the
+  `winit`+`glow` popover shell that hosts a `PopoverContent`, and the
+  v0.13 launcher's content impl.
 
 ### M12.5 — `cockpit-org`: parser, store, view-model
 
@@ -2576,6 +2579,22 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   `path:line` / selection. A `tests/capture_cli.rs` integration test
   drives the real binary end-to-end. The real `tray-icon` +
   `global-hotkey` + winit popover loop is the display-bound follow-up.
+- **Impl note (popover content):** the popover's brain shipped as
+  `cockpit_jot::JotPopover`, a headless `cockpit_paint::PopoverContent`
+  impl (M12.4) wrapping the `JotController`. It maps the popover's
+  key/text events onto the controller for every surface — capture
+  (template picker → editor → `Ctrl+Enter` commit), agenda
+  (`↑↓`/`j`/`k` navigation, `Tab` mode cycle, `Enter` jump-to-cockpit,
+  `/` filter), and overview — paints each surface with the shared
+  `Painter`, and queues the resulting `JotIntent`s for the shell to
+  drain. The `on_key`/`on_text` split matches `cockpit-render`'s shell
+  (a plain printable arrives on both channels; each surface reads only
+  the one it needs, and a one-shot guard swallows the `/` that the shell
+  echoes when opening the filter). Fully unit-tested; the controller
+  gained `capture_backspace`/`capture_move_left`/`capture_move_right`/
+  `agenda_set_filter` to back the editor and filter keys. The winit
+  shell that hosts this `PopoverContent` is the remaining display-bound
+  glue.
 - **Impl note (`org.toml` loading):** `OrgConfig::from_toml_str`
   parses the documented `[org]` + `[[org.capture]]` grammar
   (foreign sections tolerated, missing `[org]` → defaults) as a
