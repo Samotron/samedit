@@ -825,6 +825,7 @@ dependencies = [
  "cockpit-commands",
  "cockpit-config",
  "cockpit-http",
+ "cockpit-org",
  "cockpit-project",
  "cockpit-testkit",
  "insta",
