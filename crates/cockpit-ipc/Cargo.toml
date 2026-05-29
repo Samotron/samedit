@@ -1,0 +1,16 @@
+[package]
+name = "cockpit-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IPC protocol + transport (length-prefixed CBOR over a Unix socket / named pipe) for Coding Cockpit's sibling binaries (v0.12)."
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+ciborium = "0.2.2"
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -2275,6 +2275,21 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   reach. Document explicitly that this is *not* a remote protocol.
 - **Tests:** scripted client/server pair in a tempdir; message
   ordering, reconnect, malformed-frame handling, per-OS smoke.
+- **Impl notes (M12.1):** shipped as `cockpit-ipc`. Frame =
+  4-byte BE length + 1-byte encoding tag + body; the tag (`0`=CBOR,
+  `1`=JSON) lets one socket accept either, so a `socat`/JSON poke and
+  the production CBOR stream interoperate (tested). CBOR via
+  `ciborium`, JSON via `serde_json`. The transport is **generic over
+  the payload** (`Envelope<T> { service: ServiceId, payload: T }`),
+  so each service defines its own message enum. Unix-socket transport
+  (`IpcListener`/`Connection`) is `#[cfg(unix)]` and fully tested
+  (round-trip, ordering, reconnect, stale-socket cleanup); the wire
+  types + codec are platform-independent. `MAX_FRAME` (16 MiB) guards
+  against a hostile length prefix. **Windows named-pipe transport is
+  a documented follow-up** (`WINDOWS_PIPE_NAME` constant exists; the
+  sandbox is Linux-only, so the pipe impl ships when it can be
+  smoke-tested). The `ipc-smoke` CI leg / per-OS smoke is pending the
+  Windows impl.
 
 ### M12.2 — `cockpit-tray`: system tray icon
 
