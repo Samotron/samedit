@@ -54,6 +54,12 @@ use cockpit_terminal::session::TerminalStatus;
 // multiplexer handles all spawn / split / window concerns; cockpit
 // pulls only `CommandSpec` (now at the crate root) from
 // `cockpit-terminal`.
+use cockpit_http::{Collection as HttpCollection, load_collection as load_http_collection};
+use cockpit_ui::http::{
+    HttpView, ResponseTab, command_ids as http_command_ids,
+    copy_selected_as_curl as http_copy_selected_as_curl,
+    default_keybindings as http_default_keybindings,
+};
 use cockpit_ui::{
     CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, FileBrowser, FileBrowserAction,
     FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput,
@@ -76,6 +82,12 @@ pub const CHAR_W_RATIO: f32 = 0.6;
 
 /// Command id for "quit the application" — handled directly by the shell.
 const APP_QUIT: &str = "app.quit";
+
+/// Sentinel id used by the `Http: Switch Environment` palette to
+/// represent the "no environment" choice. Picked so it can't clash
+/// with a real environment name (those are file stems —
+/// alphanumeric).
+const HTTP_ENVIRONMENT_NONE_ID: &str = "(none)";
 /// Command id for "pick and run a mise task".
 const MISE_RUN_TASK: &str = "mise.run_task";
 /// Command id for "open a file path from the terminal output".
@@ -177,6 +189,10 @@ enum PaletteMode {
     MiseTasks,
     /// Entries are `path:line:col` references opened in the editor.
     TerminalPaths,
+    /// Entries are Bruno environment names (id is `<env-name>` or `(none)`).
+    /// Selecting one switches the active environment on the open
+    /// [`HttpView`]. v0.11 M11.5.2.
+    HttpEnvironments,
 }
 
 /// The document open in the editor pane: an [`Editor`] plus its file path.
@@ -184,6 +200,30 @@ struct OpenDocument {
     editor: Editor,
     path: PathBuf,
     name: String,
+}
+
+/// One in-flight `Http: Send Request` worker (v0.11 M11.5.2).
+///
+/// Spawned by [`AppModel::http_send_request`]: the worker thread calls
+/// `engine.send` on the [`PreparedRequest`] and posts the
+/// `Result<Response, HttpError>` back through `rx`. The UI thread checks
+/// the channel each `tick()` and applies the result to the active
+/// [`HttpView`]. The clonable `cancel` handle lets the UI trip the
+/// engine's cooperative-cancel path (e.g. on Esc).
+struct HttpInFlight {
+    rx: std::sync::mpsc::Receiver<Result<cockpit_http::Response, cockpit_http::HttpError>>,
+    cancel: cockpit_http::CancelHandle,
+    /// Logged for the status bar so the user sees what's still pending.
+    summary: cockpit_ui::http::SentSummary,
+    /// `script:lua-post-response` body to run when the engine succeeds.
+    /// Captured at send-time so a mid-flight selection change can't
+    /// silently swap which script runs against this response.
+    /// v0.11 M11.6.2.
+    post_script: Option<String>,
+    /// Name of the environment whose vars the post-response script may
+    /// mutate via `cockpit.http.set_var`. `None` ⇒ no active env at
+    /// send time; mutations land in a discarded scratch map.
+    post_script_env: Option<String>,
 }
 
 /// What an in-flight LSP request was asking for, so its [`Response`] can be
@@ -235,6 +275,9 @@ enum PromptIntent {
         snippet: String,
         retry_trigger: FormatTrigger,
     },
+    /// Overwrite an existing `responses/<name>.<ext>` file with the
+    /// most recent HTTP response body. v0.11 M11.5.
+    OverwriteHttpResponse { path: PathBuf, body: Vec<u8> },
 }
 
 /// The most recently received hover result (M4.2). Cleared when a new
@@ -318,6 +361,41 @@ pub struct AppModel {
     /// wire-up). Populated when [`open_document`] detects a Jupytext
     /// `.sql` / `.ggsql` source or any `.qmd` file; `None` otherwise.
     notebook: Option<Notebook>,
+    /// Bruno HTTP collection view (v0.11 M11.4). Populated when the
+    /// open document is a `.bru` request file; cleared on close.
+    http: Option<HttpView>,
+    /// HTTP engine — lazily built on first `Http: Send Request`. Held as
+    /// a shared `Arc` so the worker thread spawned for each send can
+    /// clone its handle without taking ownership. v0.11 M11.5.2.
+    http_engine: Option<std::sync::Arc<dyn cockpit_http::HttpEngine + Send + Sync>>,
+    /// Currently in-flight send, if any. Polled each `tick()` until the
+    /// channel resolves; cleared back to `None` once the result has
+    /// been applied to [`Self::http`]. v0.11 M11.5.2.
+    http_in_flight: Option<HttpInFlight>,
+    /// `http.scripts` capability grant (v0.11 M11.6.1). When `true`,
+    /// `Http: Send Request` runs `script:lua-pre-request` blocks before
+    /// preparing the request. Test-only override; production reads from
+    /// [`Self::http_scripts_grants`].
+    http_scripts_granted: bool,
+    /// Per-collection `http.scripts` grant set (v0.11 M11.6.x). Loaded
+    /// from `~/.config/cockpit/extensions.toml` at startup. `is_granted`
+    /// is checked at send time against the active collection's root —
+    /// keeps the grant default-deny without making the binary
+    /// recompute the policy at every dispatch.
+    http_scripts_grants: cockpit_lua::HttpScriptsGrants,
+    /// Bruno environment name loaded from `ProjectCache` and applied
+    /// to the [`HttpView`] the first time one is constructed. v0.11
+    /// M11.5 (env persistence across restart).
+    pending_http_env: Option<String>,
+    /// Pending requests to send sequentially as part of an
+    /// `Http: Send All In Folder` batch (v0.11 M11.5). Each entry is
+    /// the request's index into `view.collection().requests`. The
+    /// front of the queue is the next to fire after the current send
+    /// completes; the batch is consumed in `poll_http_inflight`.
+    http_batch: std::collections::VecDeque<usize>,
+    /// Total batch size for status reporting (`(i/N)`); reset to 0
+    /// when the queue drains or `Http: Cancel` fires.
+    http_batch_total: usize,
     /// Detected analytics project (v0.5 M5.6 wire-up). Built once during
     /// [`new`] when a `models/` directory is present and refreshed by
     /// `Models: Build All`.
@@ -502,6 +580,14 @@ impl AppModel {
             confirm_intent: None,
             format_on_save: false,
             notebook: None,
+            http: None,
+            http_engine: None,
+            http_in_flight: None,
+            http_scripts_granted: false,
+            http_scripts_grants: cockpit_lua::HttpScriptsGrants::default(),
+            pending_http_env: None,
+            http_batch: std::collections::VecDeque::new(),
+            http_batch_total: 0,
             analytics: None,
             editor_pending_g: false,
             editor_pending_leader: 0,
@@ -621,6 +707,8 @@ impl AppModel {
         };
         self.tool_recipes = config.panes.tools.clone();
         self.bind_tool_recipe_chords();
+        self.bind_http_chords();
+        self.load_http_scripts_grants();
 
         // v0.7 M7.7: pick up the configured mode-line format. An empty
         // template falls back to the default so users never see a blank
@@ -831,6 +919,12 @@ impl AppModel {
             self.file_index = Some(cache.file_index);
         }
 
+        // v0.11 M11.5: remember the cached HTTP environment so the
+        // freshly-constructed HttpView (built when open_document picks
+        // up a .bru file below) can restore it. Survives a restart per
+        // the exit-checklist item.
+        self.pending_http_env = cache.active_http_environment;
+
         if let Some(active) = cache.active_file
             && active.is_file()
         {
@@ -844,12 +938,17 @@ impl AppModel {
     fn build_cache(&self) -> ProjectCache {
         let active_file = self.document.as_ref().map(|doc| doc.path.clone());
         let prefs = self.layout.preferences();
+        let active_http_environment = self
+            .http
+            .as_ref()
+            .and_then(|view| view.active_environment_name().map(str::to_string));
         ProjectCache {
             open_files: active_file.clone().into_iter().collect(),
             active_file,
             left_width: Some(prefs.left_width as u16),
             right_width: Some(prefs.right_width as u16),
             file_index: self.file_index.clone().unwrap_or_default(),
+            active_http_environment,
             ..ProjectCache::default()
         }
     }
@@ -1282,6 +1381,18 @@ impl AppModel {
             NOTEBOOK_NEXT_CELL => self.notebook_next_cell(),
             NOTEBOOK_PREVIOUS_CELL => self.notebook_previous_cell(),
             NOTEBOOK_INSERT_CELL_BELOW => self.notebook_insert_cell_below(),
+            http_command_ids::COPY_AS_CURL => self.http_copy_as_curl(),
+            http_command_ids::TAB_BODY => self.http_set_tab(ResponseTab::Body),
+            http_command_ids::TAB_HEADERS => self.http_set_tab(ResponseTab::Headers),
+            http_command_ids::TAB_TIMING => self.http_set_tab(ResponseTab::Timing),
+            http_command_ids::TAB_RAW => self.http_set_tab(ResponseTab::Raw),
+            http_command_ids::NEXT_TAB => self.http_cycle_tab(true),
+            http_command_ids::PREV_TAB => self.http_cycle_tab(false),
+            http_command_ids::SEND_REQUEST => self.http_send_request(),
+            http_command_ids::SWITCH_ENVIRONMENT => self.http_switch_environment(),
+            http_command_ids::CANCEL => self.http_cancel_inflight(),
+            http_command_ids::SAVE_RESPONSE => self.http_save_response(),
+            http_command_ids::SEND_ALL_IN_FOLDER => self.http_send_all_in_folder(),
             MODELS_BUILD_ALL => self.run_build_all_models(),
             MODELS_SHOW_DAG => self.show_dag_summary(),
             QUARTO_RENDER => self.render_quarto_document(),
@@ -1747,6 +1858,71 @@ impl AppModel {
             return true;
         }
         FormatPathLookup.exists(binary)
+    }
+
+    /// Load per-collection `http.scripts` grants from
+    /// `~/.config/cockpit/extensions.toml`. Missing file is fine
+    /// (default-deny); malformed TOML degrades to empty grants + a
+    /// `tracing::warn` so the user sees the problem via
+    /// `Debug: Show Command Log` without breaking startup. v0.11 M11.6.
+    fn load_http_scripts_grants(&mut self) {
+        let Some(path) = self
+            .user_config_path
+            .as_ref()
+            .map(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| {
+                cockpit_config::user_config_path().and_then(|p| p.parent().map(Path::to_path_buf))
+            })
+        else {
+            return;
+        };
+        let extensions_path = path.join("extensions.toml");
+        let source = match self.fs.read_to_string(&extensions_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.http_scripts_grants = cockpit_lua::HttpScriptsGrants::default();
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %extensions_path.display(),
+                    "extensions.toml read failed; http.scripts default-deny stays",
+                );
+                return;
+            }
+        };
+        match cockpit_lua::parse_extensions_toml(&source) {
+            Ok(grants) => {
+                tracing::info!(
+                    granted = grants.len(),
+                    "loaded http.scripts grants from extensions.toml",
+                );
+                self.http_scripts_grants = grants;
+            }
+            Err(err) => tracing::warn!(
+                error = %err,
+                path = %extensions_path.display(),
+                "extensions.toml parse failed; http.scripts default-deny stays",
+            ),
+        }
+    }
+
+    /// Bind the v0.11 HTTP command chords (`<leader>hs`, `<leader>he`,
+    /// `<leader>h1..h4`) onto the global keymap. Failures are silent
+    /// (palette dispatch still works) — same policy as tool-recipe
+    /// chord binding.
+    fn bind_http_chords(&mut self) {
+        for (chord, command) in http_default_keybindings() {
+            if let Err(err) = self.router.bind_extra_chord(chord, *command) {
+                tracing::debug!(
+                    ?err,
+                    chord = %chord,
+                    command = %command,
+                    "http command keybind not bound (parser/conflict)",
+                );
+            }
+        }
     }
 
     /// Bind every registered tool-pane recipe's `keybind` to its
@@ -2307,6 +2483,9 @@ impl AppModel {
                 (Some(id), PaletteMode::Commands) => self.run_command(id.as_str()),
                 (Some(id), PaletteMode::MiseTasks) => self.run_mise_task(id.as_str()),
                 (Some(id), PaletteMode::TerminalPaths) => self.open_path_reference(id.as_str()),
+                (Some(id), PaletteMode::HttpEnvironments) => {
+                    self.apply_http_environment(id.as_str())
+                }
                 (None, _) => self.status = "Nothing selected.".to_string(),
             }
             return;
@@ -2846,9 +3025,23 @@ impl AppModel {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 self.notebook = recognise_notebook(&path, &content);
-                let suffix = match &self.notebook {
-                    Some(nb) => format!(" — notebook ({} cells)", nb.cells.len()),
-                    None => String::new(),
+                self.http = recognise_http_request(&path, &self.detection.root_path);
+                // v0.11 M11.5: restore the cached active env on the
+                // freshly-built view. Unknown env name (deleted since
+                // the cache was written) is silently ignored — we
+                // don't want stale ProjectCache to abort the open.
+                if let Some(view) = self.http.as_mut()
+                    && let Some(name) = self.pending_http_env.take()
+                {
+                    let _ = view.switch_environment(Some(name.as_str()));
+                }
+                let suffix = match (&self.notebook, &self.http) {
+                    (Some(nb), _) => format!(" — notebook ({} cells)", nb.cells.len()),
+                    (_, Some(view)) => format!(
+                        " — http collection ({} requests)",
+                        view.collection().requests.len()
+                    ),
+                    (None, None) => String::new(),
                 };
                 self.status = format!("Opened {name}{suffix}");
                 let language = Language::from_path(&path);
@@ -3700,6 +3893,9 @@ impl AppModel {
                 snippet,
                 retry_trigger,
             } => self.add_format_task_and_retry(&snippet, retry_trigger),
+            PromptIntent::OverwriteHttpResponse { path, body } => {
+                self.write_http_response_file(&path, &body);
+            }
         }
     }
 
@@ -3831,6 +4027,540 @@ impl AppModel {
             notebook.active + 1,
             notebook.cells.len()
         );
+    }
+
+    /// `Http: Copy As cURL` (v0.11 M11.5). Renders the selected request
+    /// against the active environment and pushes the curl invocation to
+    /// the OS clipboard. Status surfaces missing-var / no-selection
+    /// errors so the user knows why the clipboard didn't change.
+    fn http_copy_as_curl(&mut self) {
+        let Some(view) = self.http.as_ref() else {
+            self.status = "Http: Copy As cURL — open a .bru file first.".to_string();
+            return;
+        };
+        match http_copy_selected_as_curl(view) {
+            Ok(curl) => match copy_to_os_clipboard(&curl) {
+                Ok(()) => {
+                    self.status = "Http: copied curl invocation to clipboard.".to_string();
+                }
+                Err(err) => {
+                    self.status = format!("Http: clipboard error — {err}");
+                }
+            },
+            Err(err) => {
+                self.status = format!("Http: Copy As cURL — {err}");
+            }
+        }
+    }
+
+    /// `Http: Show {Body|Headers|Timing|Raw} Tab` (v0.11 M11.5).
+    fn http_set_tab(&mut self, tab: ResponseTab) {
+        let Some(view) = self.http.as_mut() else {
+            self.status = "Http: open a .bru file to use the response panel.".to_string();
+            return;
+        };
+        view.set_response_tab(tab);
+        self.status = format!("Http: showing {} tab.", tab.label());
+    }
+
+    /// `Http: Next/Previous Response Tab` (v0.11 M11.5).
+    fn http_cycle_tab(&mut self, forward: bool) {
+        let Some(view) = self.http.as_mut() else {
+            self.status = "Http: open a .bru file to use the response panel.".to_string();
+            return;
+        };
+        if forward {
+            view.next_tab();
+        } else {
+            view.prev_tab();
+        }
+        self.status = format!("Http: showing {} tab.", view.response_tab().label());
+    }
+
+    /// `Http: Send Request` (v0.11 M11.5.2). Spawns a worker thread
+    /// that drives the (synchronous) [`HttpEngine`] off the UI thread;
+    /// the result lands on `self.http` in [`tick`](Self::poll_http_inflight)
+    /// once the channel resolves. If a send is already in flight the
+    /// command no-ops with a status — the user can hit Esc on the
+    /// editor pane to trip the cancel handle.
+    fn http_send_request(&mut self) {
+        if self.http_in_flight.is_some() {
+            self.status = "Http: a send is already in flight (Esc to cancel).".to_string();
+            return;
+        }
+        if self.http.is_none() {
+            self.status = "Http: open a .bru file before sending.".to_string();
+            return;
+        }
+        // Prepare before touching the engine — preparation only needs an
+        // immutable borrow on `self.http`, and we want to surface
+        // missing-var errors before paying the engine-init cost.
+        let view = self.http.as_ref().expect("guarded above");
+        let scripts_granted = self.http_scripts_granted
+            || self.http_scripts_grants.is_granted(&view.collection().root);
+        // v0.11 M11.6: emit one-time toasts for JS scripts we don't run
+        // and for ungranted Lua scripts. Logged via `tracing` because
+        // the status line is about to advertise the in-flight send;
+        // `tracing` keeps the warning visible via Debug: Show Command Log.
+        for warning in cockpit_ui::http::script_warnings(view, scripts_granted) {
+            tracing::warn!(http_script_warning = %warning);
+        }
+        // v0.11 M11.6.1: if the request carries a Lua pre-request script
+        // *and* `http.scripts` is granted, run it. The script can mutate
+        // the env via `cockpit.http.set_var`; the mutated env is what
+        // `prepare_request` sees, so `{{var}}` interpolation picks up
+        // the script's writes.
+        let request = match view.selected_request() {
+            Some(req) => req.clone(),
+            None => {
+                self.status = "Http: no request selected.".to_string();
+                return;
+            }
+        };
+        let mut env =
+            view.active_environment()
+                .cloned()
+                .unwrap_or_else(|| cockpit_http::Environment {
+                    name: String::new(),
+                    vars: Default::default(),
+                });
+        if scripts_granted
+            && let Some(source) = request.pre_script.as_deref()
+            && let Err(err) = cockpit_lua::run_pre_request(source, &mut env.vars)
+        {
+            self.status = format!("Http: pre-request script failed — {err}");
+            return;
+        }
+        let prepared = match cockpit_http::prepare_request(&request, &env) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.status = format!("Http: cannot send — {err}");
+                return;
+            }
+        };
+        let summary = cockpit_ui::http::SentSummary {
+            method: prepared.method,
+            url: prepared.url.clone(),
+        };
+        let engine = match self.http_engine() {
+            Ok(engine) => engine,
+            Err(err) => {
+                self.status = format!("Http: engine init failed — {err}");
+                return;
+            }
+        };
+        self.http.as_mut().expect("guarded above").mark_sending();
+        let cancel = cockpit_http::CancelHandle::new();
+        let cancel_for_worker = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let redraw = self.redraw.clone();
+        match std::thread::Builder::new()
+            .name("cockpit-http-send".into())
+            .spawn(move || {
+                let result = engine.send(prepared, &cancel_for_worker);
+                let _ = tx.send(result);
+                // Nudge the event loop so `tick()` polls the channel
+                // promptly instead of waiting for the next user input.
+                if let Some(handle) = redraw {
+                    handle.request();
+                }
+            }) {
+            Ok(_) => {
+                self.status = format!(
+                    "Http: sending {} {} …",
+                    summary.method.block_name().to_uppercase(),
+                    summary.url
+                );
+                self.http_in_flight = Some(HttpInFlight {
+                    rx,
+                    cancel,
+                    summary,
+                    post_script: if scripts_granted {
+                        request.post_script.clone()
+                    } else {
+                        None
+                    },
+                    post_script_env: self
+                        .http
+                        .as_ref()
+                        .and_then(|view| view.active_environment_name().map(str::to_string)),
+                });
+            }
+            Err(err) => {
+                self.status = format!("Http: spawn failed — {err}");
+            }
+        }
+    }
+
+    /// Lazy [`HttpEngine`] accessor. Constructed on first send so we
+    /// don't pay reqwest's TLS init cost during cold start — the
+    /// notebook / editor flows don't need it.
+    fn http_engine(
+        &mut self,
+    ) -> Result<std::sync::Arc<dyn cockpit_http::HttpEngine + Send + Sync>, cockpit_http::HttpError>
+    {
+        if let Some(engine) = &self.http_engine {
+            return Ok(engine.clone());
+        }
+        let engine = cockpit_http::ReqwestEngine::new()?;
+        let engine: std::sync::Arc<dyn cockpit_http::HttpEngine + Send + Sync> =
+            std::sync::Arc::new(engine);
+        self.http_engine = Some(engine.clone());
+        Ok(engine)
+    }
+
+    /// Channel poll for the in-flight send. Called from [`tick`] each
+    /// frame so the UI thread never blocks waiting on reqwest.
+    fn poll_http_inflight(&mut self) {
+        let Some(pending) = self.http_in_flight.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.status = "Http: worker disconnected without a response.".to_string();
+                self.http_in_flight = None;
+                return;
+            }
+        };
+        // Drain everything we captured at send-time *before* we let the
+        // view see the result — that way the post-script runs against
+        // the response the engine returned, not whatever the user might
+        // select while we're mid-tick.
+        let pending = self.http_in_flight.take().expect("guarded above");
+        let HttpInFlight {
+            summary,
+            post_script,
+            post_script_env,
+            ..
+        } = pending;
+        if let Some(view) = self.http.as_mut() {
+            view.apply_result(result.clone());
+        }
+        let mut post_script_status: Option<String> = None;
+        if let Ok(response) = &result
+            && let Some(source) = post_script.as_deref()
+        {
+            post_script_status = self.run_post_script(source, response, post_script_env.as_deref());
+        }
+        self.status = match (&summary, &result) {
+            (summary, Ok(response)) => {
+                let base = format!(
+                    "Http: {} {} → {} in {} ms",
+                    summary.method.block_name().to_uppercase(),
+                    summary.url,
+                    response.status,
+                    response.elapsed.as_millis()
+                );
+                let with_post = match post_script_status {
+                    Some(extra) => format!("{base} ({extra})"),
+                    None => base,
+                };
+                self.append_batch_progress(with_post)
+            }
+            (summary, Err(err)) => {
+                let base = format!(
+                    "Http: {} {} failed — {err}",
+                    summary.method.block_name().to_uppercase(),
+                    summary.url
+                );
+                self.append_batch_progress(base)
+            }
+        };
+        // v0.11 M11.5: advance the batch (if any) once the current
+        // response has been recorded. Engine errors don't abort the
+        // batch — the response panel keeps the engine status, the
+        // batch keeps going so the user sees every result.
+        if !self.http_batch.is_empty() {
+            self.dispatch_next_http_batch();
+        } else {
+            self.http_batch_total = 0;
+        }
+    }
+
+    /// Suffix `(i/N)` onto `status` when an active `Send All In
+    /// Folder` batch is running, so the user can track progress
+    /// without staring at the palette.
+    fn append_batch_progress(&self, status: String) -> String {
+        if self.http_batch_total == 0 {
+            return status;
+        }
+        let completed = self.http_batch_total - self.http_batch.len();
+        format!(
+            "{status}  [{completed}/{total}]",
+            completed = completed,
+            total = self.http_batch_total
+        )
+    }
+
+    /// Run a captured `script:lua-post-response` against `response`,
+    /// mutating the env named `env_name` (if any) on the view in place.
+    /// Returns a short status suffix on failure / success so the caller
+    /// can append it to the round-trip message. v0.11 M11.6.2.
+    fn run_post_script(
+        &mut self,
+        source: &str,
+        response: &cockpit_http::Response,
+        env_name: Option<&str>,
+    ) -> Option<String> {
+        let mut env_vars = self
+            .http
+            .as_ref()
+            .and_then(|view| view.active_environment().map(|env| env.vars.clone()))
+            .unwrap_or_default();
+        let response_view = cockpit_lua::ScriptResponseView {
+            status: response.status,
+            headers: response.headers.clone(),
+            body: response.body.clone(),
+        };
+        if let Err(err) = cockpit_lua::run_post_response(source, &response_view, &mut env_vars) {
+            tracing::warn!(error = %err, "post-response script failed");
+            return Some(format!("post-script failed: {err}"));
+        }
+        if let (Some(name), Some(view)) = (env_name, self.http.as_mut())
+            && let Err(err) = view.replace_environment_vars(name, env_vars)
+        {
+            tracing::warn!(error = %err, "post-script env write-back failed");
+            return Some(format!("post-script env update failed: {err}"));
+        }
+        Some("post-script ran".to_string())
+    }
+
+    /// `Http: Switch Environment` (v0.11 M11.5.2). Opens the palette
+    /// pre-loaded with the collection's environments plus a "(none)"
+    /// entry; selection lands in [`Self::apply_http_environment`].
+    fn http_switch_environment(&mut self) {
+        let Some(view) = self.http.as_ref() else {
+            self.status = "Http: open a .bru file to switch environments.".to_string();
+            return;
+        };
+        if view.collection().environments.is_empty() {
+            self.status = "Http: no environments — add files under environments/".to_string();
+            return;
+        }
+        let mut entries = vec![PaletteEntry::new(
+            HTTP_ENVIRONMENT_NONE_ID,
+            "Http: No environment",
+        )];
+        for env in &view.collection().environments {
+            let label = format!("Http: env {}", env.name);
+            entries.push(PaletteEntry::new(env.name.as_str(), label));
+        }
+        self.palette_mode = PaletteMode::HttpEnvironments;
+        self.palette = Some(Palette::new(entries));
+        self.status =
+            "Switch environment — type to filter, Enter to switch, Esc to close.".to_string();
+    }
+
+    /// `Http: Cancel In-flight Request` (v0.11 M11.5.2). Trips the
+    /// cancel handle on the active worker; the engine's caller loop
+    /// observes the flag on its next 50 ms poll and returns
+    /// [`cockpit_http::HttpError::Cancelled`], which lands as
+    /// [`cockpit_ui::http::SendStatus::Cancelled`] on the view.
+    fn http_cancel_inflight(&mut self) {
+        let drained_batch = !self.http_batch.is_empty();
+        self.http_batch.clear();
+        self.http_batch_total = 0;
+        match self.http_in_flight.as_ref() {
+            Some(pending) => {
+                pending.cancel.cancel();
+                let summary = format!(
+                    "Http: cancel requested for {} {} …",
+                    pending.summary.method.block_name().to_uppercase(),
+                    pending.summary.url
+                );
+                self.status = if drained_batch {
+                    format!("{summary} (folder batch aborted)")
+                } else {
+                    summary
+                };
+            }
+            None => {
+                self.status = if drained_batch {
+                    "Http: folder batch aborted; nothing in flight.".to_string()
+                } else {
+                    "Http: nothing in flight to cancel.".to_string()
+                };
+            }
+        }
+    }
+
+    /// Apply the user's environment pick from the
+    /// [`PaletteMode::HttpEnvironments`] sub-palette.
+    fn apply_http_environment(&mut self, name: &str) {
+        let Some(view) = self.http.as_mut() else {
+            self.status = "Http: no .bru file open.".to_string();
+            return;
+        };
+        let pick = if name == HTTP_ENVIRONMENT_NONE_ID {
+            None
+        } else {
+            Some(name)
+        };
+        match view.switch_environment(pick) {
+            Ok(()) => {
+                self.status = match view.active_environment_name() {
+                    Some(env) => format!("Http: active environment → {env}"),
+                    None => "Http: no active environment.".to_string(),
+                };
+            }
+            Err(err) => self.status = format!("Http: {err}"),
+        }
+    }
+
+    /// `Http: Save Response To File` (v0.11 M11.5). Picks the
+    /// destination from the request's `meta.name` (or the index when
+    /// absent), routes the body bytes through [`Self::fs`] so the
+    /// fake filesystem in tests sees the write, and prompts on
+    /// conflict via a [`ConfirmPrompt`] rather than overwriting
+    /// silently.
+    fn http_save_response(&mut self) {
+        let Some(view) = self.http.as_ref() else {
+            self.status = "Http: open a .bru file before saving a response.".to_string();
+            return;
+        };
+        let Some(run) = view.selected_run() else {
+            self.status = "Http: no request selected.".to_string();
+            return;
+        };
+        let Some(response) = run.response.as_ref() else {
+            self.status = "Http: no response on the selected request yet.".to_string();
+            return;
+        };
+        let request = view.selected_request().expect("run implies request");
+        let stem = request
+            .meta
+            .name
+            .as_deref()
+            .map(sanitize_file_stem)
+            .unwrap_or_else(|| format!("response-{}", view.selected_index().unwrap_or(0)));
+        let ext = response_extension(&response.headers);
+        let dir = view.collection().root.join("responses");
+        let path = dir.join(format!("{stem}.{ext}"));
+        let body = response.body.clone();
+        if let Err(err) = self.fs.create_dir_all(&dir) {
+            self.status = format!("Http: cannot create responses dir — {err}");
+            return;
+        }
+        if self.fs.is_file(&path) {
+            // Confirm before clobbering.
+            self.confirm_intent = Some(PromptIntent::OverwriteHttpResponse {
+                path: path.clone(),
+                body,
+            });
+            self.confirm = Some(ConfirmPrompt::new(
+                "Overwrite response file?",
+                format!(
+                    "`{}` already exists. Y to overwrite, N to cancel.",
+                    path.display()
+                ),
+            ));
+            self.status = format!("Http: confirm overwrite of {}", path.display());
+            return;
+        }
+        self.write_http_response_file(&path, &body);
+    }
+
+    fn write_http_response_file(&mut self, path: &Path, body: &[u8]) {
+        match self.fs.write(path, body) {
+            Ok(()) => self.status = format!("Http: wrote response → {}", path.display()),
+            Err(err) => self.status = format!("Http: write failed ({}): {err}", path.display()),
+        }
+    }
+
+    /// `Http: Send All In Folder` (v0.11 M11.5). Fires every request
+    /// in the same on-disk folder as the open `.bru` file
+    /// sequentially through the engine. Reuses the single-request
+    /// pipeline (env interpolation, pre-script when granted) per
+    /// request and applies each result to the view as we go. Runs on
+    /// a dedicated worker thread to keep the UI responsive; cancel
+    /// trips the whole batch by aborting whatever's mid-flight.
+    fn http_send_all_in_folder(&mut self) {
+        if self.http_in_flight.is_some() {
+            self.status = "Http: a send is already in flight (Esc/cancel first).".to_string();
+            return;
+        }
+        let Some(view) = self.http.as_ref() else {
+            self.status = "Http: open a .bru file before sending a folder.".to_string();
+            return;
+        };
+        let Some(active_path) = self.document.as_ref().map(|doc| doc.path.clone()) else {
+            self.status = "Http: no document open — can't determine folder.".to_string();
+            return;
+        };
+        let Some(folder) = active_path.parent().map(Path::to_path_buf) else {
+            self.status = "Http: open document has no parent folder.".to_string();
+            return;
+        };
+        // Pick requests whose source `.bru` lives in the same folder as
+        // the currently open file. We compare by `meta.name` matched
+        // against on-disk file stems — same heuristic as
+        // `recognise_http_request`. If the file walk turns up empty
+        // (e.g. the open file is in the project root and no other
+        // .bru files share it), surface a status instead of silently
+        // doing nothing.
+        let names_in_folder: HashSet<String> = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    (path.extension().and_then(|s| s.to_str()) == Some("bru"))
+                        .then(|| {
+                            path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .map(str::to_string)
+                        })
+                        .flatten()
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Http: scan folder failed — {err}");
+                return;
+            }
+        };
+        let mut to_run: Vec<usize> = Vec::new();
+        for (index, request) in view.collection().requests.iter().enumerate() {
+            if let Some(name) = request.meta.name.as_deref()
+                && names_in_folder
+                    .iter()
+                    .any(|stem| stem.eq_ignore_ascii_case(name))
+            {
+                to_run.push(index);
+            }
+        }
+        if to_run.is_empty() {
+            self.status = format!(
+                "Http: no requests in {} matched the current folder.",
+                folder.display()
+            );
+            return;
+        }
+        self.http_batch_total = to_run.len();
+        self.http_batch = to_run.into_iter().collect();
+        tracing::info!(
+            count = self.http_batch_total,
+            folder = %folder.display(),
+            "http: send-all-in-folder kicking off",
+        );
+        // Kick off the first request; subsequent ones fire from
+        // `poll_http_inflight` as each completes.
+        self.dispatch_next_http_batch();
+    }
+
+    /// Pull the next index off `http_batch`, select it on the view, and
+    /// dispatch through `http_send_request`. No-op when the queue is
+    /// empty; clears `http_batch_total` so the status doesn't keep
+    /// reporting a phantom batch.
+    fn dispatch_next_http_batch(&mut self) {
+        let Some(next) = self.http_batch.pop_front() else {
+            self.http_batch_total = 0;
+            return;
+        };
+        if let Some(view) = self.http.as_mut() {
+            view.select(next);
+        }
+        self.http_send_request();
     }
 
     /// Re-detect the analytics project (if any) and run every
@@ -5246,6 +5976,111 @@ fn chord_to_terminal_bytes(chord: &KeyChord) -> Option<Vec<u8>> {
 ///
 /// Returns `None` for plain text files so opening a regular `.sql`
 /// file without markers keeps the normal editor experience.
+/// Recognise a `.bru` file open as a Bruno collection editor pane
+/// (v0.11 M11.4). Loads the surrounding collection from `project_root`
+/// so the view picks up the full request list + environments — Bruno
+/// requests don't make sense in isolation. Returns `None` for
+/// non-`.bru` files and silently falls back when no collection is
+/// detected (the user opened a stray `.bru` outside a project).
+/// Map a Bruno request name to a filesystem-safe file stem for
+/// `Http: Save Response To File` (v0.11 M11.5). Replaces every char
+/// outside `[A-Za-z0-9._-]` with `_`, collapsing runs so we don't
+/// produce `__` clusters. Empty input falls back to `response`.
+fn sanitize_file_stem(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_was_replacement = false;
+    for ch in name.chars() {
+        let safe = ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_';
+        if safe {
+            out.push(ch);
+            last_was_replacement = false;
+        } else if !last_was_replacement {
+            out.push('_');
+            last_was_replacement = true;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "response".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Pick a file extension for the saved response based on its
+/// `Content-Type` header. Falls back to `bin` for unknown types so
+/// users still get *something* on disk; the response body is bytes,
+/// not text.
+fn response_extension(headers: &[(String, String)]) -> &'static str {
+    let Some(content_type) = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+    else {
+        return "bin";
+    };
+    let primary = content_type.split(';').next().map(str::trim).unwrap_or("");
+    match primary.to_ascii_lowercase().as_str() {
+        "application/json" => "json",
+        "application/xml" | "text/xml" => "xml",
+        "text/html" => "html",
+        "text/plain" => "txt",
+        "text/css" => "css",
+        "application/javascript" | "text/javascript" => "js",
+        "application/yaml" | "text/yaml" => "yaml",
+        _ => "bin",
+    }
+}
+
+fn recognise_http_request(path: &Path, project_root: &Path) -> Option<HttpView> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    if ext.as_deref() != Some("bru") {
+        return None;
+    }
+    let collection = match load_http_collection(project_root) {
+        Ok(Some(collection)) => collection,
+        Ok(None) => HttpCollection {
+            root: project_root.to_path_buf(),
+            requests: Vec::new(),
+            environments: Vec::new(),
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to load Bruno collection");
+            return None;
+        }
+    };
+    let mut view = HttpView::new(collection);
+    // If the opened file matches a request in the collection, select it.
+    if let Some(index) = view
+        .collection()
+        .requests
+        .iter()
+        .position(|req| matches_path(req, path))
+    {
+        view.select(index);
+    }
+    Some(view)
+}
+
+/// Best-effort match: Bruno keeps the source file path on disk but the
+/// parsed [`Request`] doesn't carry it. We compare by `meta.name` —
+/// good enough for selection bias; the user can still navigate with
+/// `Http: Send Request` on whatever the collection currently considers
+/// active.
+fn matches_path(req: &cockpit_http::Request, path: &Path) -> bool {
+    let Some(name) = req.meta.name.as_deref() else {
+        return false;
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    name.eq_ignore_ascii_case(stem)
+}
+
 fn recognise_notebook(path: &Path, content: &str) -> Option<Notebook> {
     let ext = path
         .extension()
@@ -5628,6 +6463,27 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(NOTEBOOK_NEXT_CELL, "Notebook: Next Cell"),
         PaletteEntry::new(NOTEBOOK_PREVIOUS_CELL, "Notebook: Previous Cell"),
         PaletteEntry::new(NOTEBOOK_INSERT_CELL_BELOW, "Notebook: Insert Cell Below"),
+        PaletteEntry::new(http_command_ids::SEND_REQUEST, "Http: Send Request"),
+        PaletteEntry::new(
+            http_command_ids::SEND_ALL_IN_FOLDER,
+            "Http: Send All In Folder",
+        ),
+        PaletteEntry::new(http_command_ids::CANCEL, "Http: Cancel In-flight Request"),
+        PaletteEntry::new(
+            http_command_ids::SWITCH_ENVIRONMENT,
+            "Http: Switch Environment",
+        ),
+        PaletteEntry::new(http_command_ids::COPY_AS_CURL, "Http: Copy As cURL"),
+        PaletteEntry::new(
+            http_command_ids::SAVE_RESPONSE,
+            "Http: Save Response To File",
+        ),
+        PaletteEntry::new(http_command_ids::TAB_BODY, "Http: Show Body Tab"),
+        PaletteEntry::new(http_command_ids::TAB_HEADERS, "Http: Show Headers Tab"),
+        PaletteEntry::new(http_command_ids::TAB_TIMING, "Http: Show Timing Tab"),
+        PaletteEntry::new(http_command_ids::TAB_RAW, "Http: Show Raw Tab"),
+        PaletteEntry::new(http_command_ids::NEXT_TAB, "Http: Next Response Tab"),
+        PaletteEntry::new(http_command_ids::PREV_TAB, "Http: Previous Response Tab"),
         PaletteEntry::new(MODELS_BUILD_ALL, "Models: Build All"),
         PaletteEntry::new(MODELS_SHOW_DAG, "Models: Show DAG"),
         PaletteEntry::new(QUARTO_RENDER, "Quarto: Render"),
@@ -6144,6 +7000,9 @@ impl CockpitApp for AppShell {
                 // v0.9 M9.5: hot-reload pulse — pick up any extension
                 // files the user just saved.
                 model.poll_lua_watcher();
+                // v0.11 M11.5.2: pick up any HTTP send that completed
+                // since the last frame.
+                model.poll_http_inflight();
             }
             _ => {}
         }
@@ -9085,6 +9944,609 @@ format_on_save = true
         assert!(
             model.browser.rows().iter().any(|row| row.name == "lib.rs"),
             "src should be expanded after the click"
+        );
+    }
+
+    #[test]
+    fn recognise_http_request_returns_none_for_non_bru_files() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let path = project.path().join("notes.txt");
+        std::fs::write(&path, "hi").unwrap();
+        assert!(recognise_http_request(&path, project.path()).is_none());
+    }
+
+    #[test]
+    fn recognise_http_request_loads_collection_and_selects_matching_request() {
+        let project = tempfile::tempdir().expect("tempdir");
+        std::fs::write(project.path().join("bruno.json"), "{}").unwrap();
+        std::fs::write(
+            project.path().join("get-users.bru"),
+            "meta {\n  name: get-users\n}\n\nget {\n  url: https://api.test/users\n  body: none\n  auth: none\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("get-roles.bru"),
+            "meta {\n  name: get-roles\n}\n\nget {\n  url: https://api.test/roles\n  body: none\n  auth: none\n}\n",
+        )
+        .unwrap();
+        let path = project.path().join("get-roles.bru");
+        let view = recognise_http_request(&path, project.path()).expect("view");
+        assert_eq!(view.collection().requests.len(), 2);
+        let selected = view.selected_request().expect("selection");
+        assert_eq!(selected.meta.name.as_deref(), Some("get-roles"));
+    }
+
+    #[test]
+    fn recognise_http_request_falls_back_to_empty_collection_when_marker_missing() {
+        let project = tempfile::tempdir().expect("tempdir");
+        // No bruno.json or cockpit-http/ — the user opened a stray .bru.
+        let path = project.path().join("standalone.bru");
+        std::fs::write(
+            &path,
+            "get {\n  url: https://x\n  body: none\n  auth: none\n}\n",
+        )
+        .unwrap();
+        let view = recognise_http_request(&path, project.path()).expect("view");
+        assert!(view.collection().requests.is_empty());
+        assert!(view.selected_request().is_none());
+    }
+
+    /// Build a fixture HttpView with one request and inject it on `model`,
+    /// alongside a FakeHttpEngine the test can script.
+    fn install_fake_http(model: &mut AppModel) -> std::sync::Arc<cockpit_http::FakeHttpEngine> {
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.meta.name = Some("get-users".into());
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req
+            }],
+            environments: vec![cockpit_http::Environment {
+                name: "dev".into(),
+                vars: Default::default(),
+            }],
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+        let engine = std::sync::Arc::new(cockpit_http::FakeHttpEngine::new());
+        model.http_engine = Some(engine.clone());
+        engine
+    }
+
+    fn pump_until<F: FnMut(&mut AppModel) -> bool>(model: &mut AppModel, mut done: F) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            model.poll_http_inflight();
+            if done(model) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("pump_until: deadline expired (status = {})", model.status);
+    }
+
+    #[test]
+    fn http_send_request_drives_engine_and_lands_response_on_view() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: b"{\"ok\":true}".to_vec(),
+            elapsed: std::time::Duration::from_millis(7),
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let run = model.http.as_ref().unwrap().selected_run().unwrap();
+        assert_eq!(run.status, cockpit_ui::http::SendStatus::Ok);
+        assert_eq!(run.response.as_ref().unwrap().status, 200);
+        assert!(
+            model
+                .status
+                .starts_with("Http: GET https://api.test/users → 200"),
+            "status = {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn http_send_request_records_engine_failure_with_method_and_url() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_error(cockpit_http::HttpError::Network("EHOSTUNREACH".into()));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let run = model.http.as_ref().unwrap().selected_run().unwrap();
+        assert_eq!(run.status, cockpit_ui::http::SendStatus::Failed);
+        assert!(
+            model.status.contains("EHOSTUNREACH"),
+            "status = {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn http_send_request_rejects_a_second_send_while_one_is_in_flight() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        // Second send before the worker resolves — engine might race,
+        // but the in_flight slot is set synchronously by http_send_request
+        // before the worker can finish, so as long as we don't pump_until
+        // first the second call sees Some(_) and bails.
+        model.run_command(http_command_ids::SEND_REQUEST);
+        assert!(
+            model.status.contains("already in flight"),
+            "status = {}",
+            model.status
+        );
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+    }
+
+    #[test]
+    fn http_switch_environment_opens_palette_with_env_entries_plus_none() {
+        let mut model = model();
+        install_fake_http(&mut model);
+
+        model.run_command(http_command_ids::SWITCH_ENVIRONMENT);
+        assert_eq!(model.palette_mode, PaletteMode::HttpEnvironments);
+        let palette = model.palette.as_ref().expect("palette");
+        let ids: Vec<&str> = palette.entries().iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&HTTP_ENVIRONMENT_NONE_ID));
+        assert!(ids.contains(&"dev"));
+    }
+
+    #[test]
+    fn apply_http_environment_switches_active_env() {
+        let mut model = model();
+        install_fake_http(&mut model);
+
+        model.apply_http_environment("dev");
+        assert_eq!(
+            model.http.as_ref().unwrap().active_environment_name(),
+            Some("dev")
+        );
+        model.apply_http_environment(HTTP_ENVIRONMENT_NONE_ID);
+        assert_eq!(model.http.as_ref().unwrap().active_environment_name(), None);
+    }
+
+    #[test]
+    fn http_cancel_inflight_with_nothing_pending_is_a_noop_with_status() {
+        let mut model = model();
+        model.run_command(http_command_ids::CANCEL);
+        assert!(
+            model.status.contains("nothing in flight"),
+            "{}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn http_send_request_runs_pre_script_when_granted() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        model.http_scripts_granted = true;
+        // Replace the installed collection with one carrying a pre_script.
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.meta.name = Some("get-users".into());
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.headers = vec![cockpit_http::KeyValue::new("X-Token", "{{token}}")];
+                req.pre_script = Some("cockpit.http.set_var('token', 'abc')".into());
+                req
+            }],
+            environments: vec![cockpit_http::Environment {
+                name: "dev".into(),
+                vars: Default::default(),
+            }],
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let sent = engine.requests();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k == "X-Token" && v == "abc"),
+            "pre-script env mutation did not flow into headers: {:?}",
+            sent[0].headers
+        );
+    }
+
+    #[test]
+    fn http_send_request_skips_pre_script_when_capability_not_granted() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        // http_scripts_granted stays false (default).
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.pre_script = Some("cockpit.http.set_var('token', 'abc')".into());
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let run = model.http.as_ref().unwrap().selected_run().unwrap();
+        assert_eq!(run.status, cockpit_ui::http::SendStatus::Ok);
+        let sent = engine.requests();
+        // Script was skipped — nothing set `token`, so no header should
+        // carry it. The send still went through with the unmutated env.
+        assert!(
+            !sent[0]
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("X-Token")),
+            "headers should not contain X-Token: {:?}",
+            sent[0].headers
+        );
+    }
+
+    #[test]
+    fn sanitize_file_stem_strips_unsafe_chars_and_collapses_runs() {
+        assert_eq!(sanitize_file_stem("Get / Users"), "Get_Users");
+        assert_eq!(sanitize_file_stem("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_file_stem(""), "response");
+        assert_eq!(sanitize_file_stem("///"), "response");
+        assert_eq!(sanitize_file_stem("List-Users_2"), "List-Users_2");
+    }
+
+    #[test]
+    fn response_extension_picks_from_content_type() {
+        let json = vec![("content-type".to_string(), "application/json".to_string())];
+        assert_eq!(response_extension(&json), "json");
+        let html = vec![(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        assert_eq!(response_extension(&html), "html");
+        let unknown = vec![(
+            "Content-Type".to_string(),
+            "application/octet-stream".to_string(),
+        )];
+        assert_eq!(response_extension(&unknown), "bin");
+        assert_eq!(response_extension(&[]), "bin");
+    }
+
+    #[test]
+    fn http_save_response_writes_body_to_responses_dir() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: br#"{"id":1}"#.to_vec(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        // Use a temp dir as the collection root so the file write
+        // lands somewhere observable.
+        let tmp = tempfile::tempdir().unwrap();
+        let collection = cockpit_http::Collection {
+            root: tmp.path().to_path_buf(),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.meta.name = Some("Get Users".into());
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        // Drive a send so we have a response on the view.
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        model.run_command(http_command_ids::SAVE_RESPONSE);
+        let path = tmp.path().join("responses").join("Get_Users.json");
+        let written = std::fs::read(&path).expect("response file written");
+        assert_eq!(written, br#"{"id":1}"#);
+        assert!(
+            model.status.contains("wrote response"),
+            "status = {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn http_save_response_prompts_before_overwriting_existing_file() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: vec![("content-type".into(), "text/plain".into())],
+            body: b"new".to_vec(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/x".into(),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("responses")).unwrap();
+        std::fs::write(tmp.path().join("responses").join("Hi.txt"), b"old").unwrap();
+        let collection = cockpit_http::Collection {
+            root: tmp.path().to_path_buf(),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.meta.name = Some("Hi".into());
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/x".into();
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        model.run_command(http_command_ids::SAVE_RESPONSE);
+        assert!(
+            model.status.contains("confirm overwrite"),
+            "status = {}",
+            model.status
+        );
+        // Old contents preserved until the user accepts.
+        let contents = std::fs::read(tmp.path().join("responses").join("Hi.txt")).unwrap();
+        assert_eq!(contents, b"old");
+    }
+
+    #[test]
+    fn http_scripts_grants_unlock_pre_script_for_listed_collection() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/x".into(),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let collection = cockpit_http::Collection {
+            root: tmp.path().to_path_buf(),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/x".into();
+                req.headers = vec![cockpit_http::KeyValue::new("X-Token", "{{token}}")];
+                req.pre_script = Some("cockpit.http.set_var('token', 'fromgrant')".into());
+                req
+            }],
+            environments: vec![cockpit_http::Environment {
+                name: "dev".into(),
+                vars: Default::default(),
+            }],
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+        // Grant via the per-collection store rather than the test
+        // override.
+        model.http_scripts_grants =
+            cockpit_lua::HttpScriptsGrants::from_roots([tmp.path().to_path_buf()]);
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        let sent = engine.requests();
+        assert!(
+            sent[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k == "X-Token" && v == "fromgrant"),
+            "headers = {:?}",
+            sent[0].headers
+        );
+    }
+
+    #[test]
+    fn http_send_request_runs_post_script_and_writes_env_back() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 201,
+            headers: vec![("X-New-Token".into(), "fresh".into())],
+            body: b"{\"id\":42}".to_vec(),
+            elapsed: std::time::Duration::from_millis(3),
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        model.http_scripts_granted = true;
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Post;
+                req.url = "https://api.test/users".into();
+                req.post_script = Some(
+                    "local r = cockpit.http.response(); \
+                     cockpit.http.set_var('last_status', tostring(r.status)); \
+                     cockpit.http.set_var('last_token', r.headers[1].value)"
+                        .into(),
+                );
+                req
+            }],
+            environments: vec![cockpit_http::Environment {
+                name: "dev".into(),
+                vars: Default::default(),
+            }],
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        // Status reports the post-script ran.
+        assert!(
+            model.status.contains("post-script ran"),
+            "status = {}",
+            model.status
+        );
+        // Env mutation landed back on the active environment so the
+        // next send picks up the new value.
+        let env = model
+            .http
+            .as_ref()
+            .unwrap()
+            .active_environment()
+            .expect("env");
+        assert_eq!(env.vars.get("last_status").map(String::as_str), Some("201"));
+        assert_eq!(
+            env.vars.get("last_token").map(String::as_str),
+            Some("fresh")
+        );
+    }
+
+    #[test]
+    fn http_send_request_post_script_failure_surfaces_in_status() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        model.http_scripts_granted = true;
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.post_script = Some("error('explode')".into());
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        assert!(
+            model.status.contains("post-script failed"),
+            "status = {}",
+            model.status
+        );
+        // The Ok response still lands on the view; only the script failed.
+        let run = model.http.as_ref().unwrap().selected_run().unwrap();
+        assert_eq!(run.status, cockpit_ui::http::SendStatus::Ok);
+    }
+
+    #[test]
+    fn http_send_request_skips_post_script_when_capability_not_granted() {
+        let mut model = model();
+        let engine = install_fake_http(&mut model);
+        engine.push_response(cockpit_http::Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            elapsed: std::time::Duration::ZERO,
+            redirects: Vec::new(),
+            final_url: "https://api.test/users".into(),
+        });
+        // http_scripts_granted stays false.
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.post_script = Some("error('would explode but skipped')".into());
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+        pump_until(&mut model, |m| m.http_in_flight.is_none());
+
+        assert!(
+            !model.status.contains("post-script"),
+            "post-script should not have run: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn http_send_request_surfaces_pre_script_failure_without_dispatching() {
+        let mut model = model();
+        let _engine = install_fake_http(&mut model);
+        model.http_scripts_granted = true;
+        let collection = cockpit_http::Collection {
+            root: std::path::PathBuf::from("/tmp/test"),
+            requests: vec![{
+                let mut req = cockpit_http::Request::empty();
+                req.method = cockpit_http::HttpMethod::Get;
+                req.url = "https://api.test/users".into();
+                req.pre_script = Some("error('boom from script')".into());
+                req
+            }],
+            environments: Vec::new(),
+        };
+        model.http = Some(cockpit_ui::http::HttpView::new(collection));
+
+        model.run_command(http_command_ids::SEND_REQUEST);
+
+        assert!(
+            model.status.contains("pre-request script failed"),
+            "status = {}",
+            model.status
+        );
+        assert!(
+            model.http_in_flight.is_none(),
+            "engine should not have been called"
         );
     }
 }

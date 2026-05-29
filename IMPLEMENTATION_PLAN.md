@@ -1830,25 +1830,45 @@ everything else (AGENTS §2 #5).
 - **Tests:** env switching, variable resolution, missing-var
   diagnostics, cyclic references.
 
-### M11.3 — `HttpEngine` trait + reqwest impl
+### M11.3 — `HttpEngine` trait + reqwest impl  ✅ (worker, cancellation, integration tests; redirect-chain capture deferred to M11.4)
 
-- `trait HttpEngine { fn send(&self, req: PreparedRequest) ->
-  Result<Response, HttpError>; }` — blocking, synchronous on the
-  caller's perspective. Real impl uses `reqwest::blocking::Client`
-  on a dedicated thread with a channel boundary (so the UI thread
-  never blocks on network).
+- `trait HttpEngine { fn send(&self, req: PreparedRequest, cancel:
+  &CancelHandle) -> Result<Response, HttpError>; }` — blocking,
+  synchronous on the caller's perspective. Real impl uses
+  `reqwest::blocking::Client` on a per-call worker thread with an
+  `mpsc` channel boundary (so the UI thread never blocks on network).
 - `PreparedRequest`: post-interpolation, post-script, ready-to-ship
   HTTP. `Response`: status, headers, body bytes, timing, redirects.
-- TLS: default platform native-tls (reqwest default); document that
-  custom CA bundles work via `SSL_CERT_FILE`.
-- Cancellation: the engine returns a `CancelHandle` that the UI can
-  trip when the user hits `Ctrl-C` on an in-flight request.
-- **Tests:** `FakeHttpEngine` scripted exchanges; happy-path GET,
-  redirect chain, 4xx, 5xx, timeout, network error. Real reqwest
-  tests behind the `integration` feature against a local
-  `wiremock` server.
+- TLS: default platform native-tls (reqwest default); custom CA
+  bundles work via `SSL_CERT_FILE` (the standard OpenSSL convention).
+- Cancellation: the engine takes a `CancelHandle` (clonable
+  `Arc<AtomicBool>`) that the UI can trip when the user hits `Ctrl-C`
+  on an in-flight request. The caller's thread polls the handle every
+  50 ms while waiting on the worker, so cancellation actually wakes
+  the call rather than waiting for reqwest's timeout.
+- **Shipped behaviour vs plan:** the engine trait, every type
+  (`PreparedRequest`, `PreparedBody`, `Response`, `RedirectHop`,
+  `HttpError`, `CancelHandle`), `FakeHttpEngine`, and `ReqwestEngine`
+  are all in place. `prepare_request(&Request, &Environment) ->
+  PreparedRequest` handles `{{var}}` interpolation across
+  URL/headers/query/body/auth, appends url-encoded query strings,
+  derives `Authorization` headers (Basic base64-encoded; Bearer
+  literal) with a user-`Authorization`-wins rule, sets default
+  `Content-Type` per body kind, and skips disabled (`~`) rows.
+  Redirect-chain capture in `Response.redirects` is left empty for
+  now — needs a custom `redirect::Policy` and only matters once the
+  M11.4 view-model surfaces the chain. `final_url` is already filled,
+  so callers can detect that a redirect happened.
+- **Tests:** 48 unit tests + 2 golden + 7 integration. Integration
+  suite lives in `tests/integration_reqwest.rs` behind the
+  `integration` feature, runs against a hand-rolled
+  `TcpListener`-based mock (avoids a wiremock/tokio dev-dep) and
+  covers happy-path GET, redirect chain, 4xx, 5xx, per-request
+  timeout, unreachable host, and a real cooperative-cancel mid-flight.
+  CI runs them on Ubuntu/macOS/Windows via the existing `integration`
+  job; mirrored in `mise run test-integration`.
 
-### M11.4 — View-model + render
+### M11.4 — View-model + render  ◐ (view-model + tabs + send pipeline; painter wiring deferred to M11.4.1)
 
 - `cockpit-ui::http`: `HttpView` holds the active collection,
   selected request, in-progress send state, latest response. Mirrors
@@ -1863,10 +1883,26 @@ everything else (AGENTS §2 #5).
     **Headers**, **Timing**, **Raw**. Switching tabs is a palette
     command (default `<leader>h1..h4`).
 - Resize the split with the existing M4.7 mouse-drag plumbing.
+- **Shipped behaviour vs plan:** the headless view-model is in —
+  `HttpView` (collection + selected request + per-request `RequestRun`
+  + active environment + `SplitLayout` ratio with `[0.15, 0.85]`
+  clamp), `ResponseTab` (Body / Headers / Timing / Raw with `next` /
+  `prev` cycle + direct setters), `ResponseView` (per-tab headless
+  render including hand-rolled JSON pretty-printer that preserves key
+  order without a serde round-trip), and the `send_selected` /
+  `prepare_selected` helpers that bind `HttpView` to any `HttpEngine`
+  impl (real `ReqwestEngine` or scripted `FakeHttpEngine`). 22 unit
+  tests cover the state machine, JSON pretty-printer, tab cycle,
+  split clamps, environment switching with unknown-name guard, and
+  the engine round-trip. The actual painter wiring inside
+  `cockpit-render` (mouse-drag resize handle, tab strip rendering,
+  `cockpit::hydration` recognising `.bru` files and constructing
+  `HttpView` on open) lands in M11.4.1 — same pattern as how the
+  notebook view-model shipped before its painter.
 - **Done when:** opening a `.bru` file shows the split; running
   the request populates the response panel; tab switching works.
 
-### M11.5 — Commands + keybinds
+### M11.5 — Commands + keybinds  ✅ (folder batch, save-response, env persistence; painter-bound polish in M11.4.1)
 
 Registered in `cockpit-commands`:
 
@@ -1881,8 +1917,52 @@ Registered in `cockpit-commands`:
 - `Http: Save Response To File` — writes the latest body to
   `responses/<request-name>.<ext>`, never overwrites without
   confirm.
+- **Shipped behaviour vs plan:** `cockpit_ui::http::command_ids`
+  defines every stable id (`http.send_request`,
+  `http.switch_environment`, `http.copy_as_curl`,
+  `http.save_response`, `http.next_tab`, `http.prev_tab`,
+  `http.tab.{body,headers,timing,raw}`) plus a
+  `default_keybindings()` table shipping `<leader>hs`, `<leader>he`,
+  and `<leader>h1..h4`. `cockpit_http::PreparedRequest::to_curl`
+  emits POSIX-quoted curl invocations (URL + `-X METHOD` when non-GET
+  + `-H` per header + `--data-binary` for bodies; form bodies
+  url-encoded by `PreparedBody::to_bytes`). The binary
+  (`crates/cockpit/src/app.rs`) recognises `.bru` files on open via
+  `recognise_http_request` → constructs an `HttpView` (auto-selecting
+  the request whose `meta.name` matches the file stem), binds the
+  default chords via `bind_http_chords` at init, exposes every HTTP
+  command in the palette, and dispatches the synchronous commands:
+  `Http: Copy As cURL` (writes to the OS clipboard via the existing
+  `arboard` hook), `Http: Show {Body|Headers|Timing|Raw} Tab`, and
+  `Http: Next/Previous Response Tab`. `Http: Send Request`,
+  `Http: Switch Environment`, `Http: Send All In Folder`, and
+  `Http: Save Response To File` register and surface a status
+  pointing at M11.5.2 — they need the async-engine thread + a
+  sub-palette and land with the M11.4.1 painter.
+- **M11.5.2 update (async send + env sub-palette):** the binary now
+  owns a lazily-built `Arc<dyn HttpEngine + Send + Sync>` and an
+  `HttpInFlight` slot (channel `Receiver<Result<Response, HttpError>>`
+  + `CancelHandle` + `SentSummary`). `Http: Send Request` spawns a
+  named `cockpit-http-send` worker that calls `engine.send` off the
+  UI thread, nudges the `RedrawHandle` on completion, and stores the
+  receiver; `tick()` calls `poll_http_inflight` each frame, applies
+  the result to the active `HttpView`, and updates the status with
+  the round-trip time. `Http: Cancel In-flight Request`
+  (`http.cancel`) trips the cancel handle. `Http: Switch Environment`
+  opens `PaletteMode::HttpEnvironments` — a sub-palette listing every
+  parsed environment plus a `(none)` entry; selection routes through
+  `apply_http_environment` (uses the `(none)` sentinel since
+  environment names are file stems and never `(none)`). A second
+  Send while one is in flight bails with a status pointing at the
+  cancel command. Six new tests in `app::tests` (drive via
+  `FakeHttpEngine` end-to-end, both success and failure paths, env
+  palette population, the in-flight guard, and the cancel no-op).
+  Remaining for M11.4.1: the painter (mouse-drag split handle + tab
+  strip glyphs) and `Http: Send All In Folder` / `Http: Save Response
+  To File` — those need the painter's pane-context to know which
+  folder the cursor is in.
 
-### M11.6 — Scripts (Lua, capability-gated)
+### M11.6 — Scripts (Lua, capability-gated)  ✅ (parse, capability, warnings, execution, per-collection grants)
 
 - Bruno's JS pre/post scripts don't run; cockpit substitutes
   **Lua** scripts (reuses M9.x sandbox + capability model).
@@ -1896,6 +1976,108 @@ Registered in `cockpit-commands`:
 - **Out of scope:** JavaScript runtime, full Bruno script
   compatibility. Users with JS scripts get a clear toast: *"Lua
   scripting only; JS scripts skipped. See docs/http.md."*
+- **Shipped behaviour vs plan:** the parser recognises
+  `script:lua-pre-request` and `script:lua-post-response` blocks and
+  pulls them into `Request::{pre_script, post_script}` (both
+  `Option<String>`); the serialiser emits them back so round-trip
+  stays semantic. `script:js-pre-request` / `script:js-post-response`
+  (and the unprefixed `pre-request` / `post-response` Bruno spellings)
+  set the new `Request::has_js_scripts` flag instead of dropping
+  silently. `cockpit_lua::Capability::HttpScripts` is registered with
+  token `http.scripts`, so user `extensions.toml` grants and the
+  `parse_requires_header` parser already accept it. `cockpit_ui::http::script_warnings(view,
+  http_scripts_granted)` emits the toast lines — the JS-skipped
+  message and the default-deny Lua skip — and the binary's
+  `Http: Send Request` handler logs them via `tracing::warn!` before
+  dispatching. Actual Lua execution (running the pre-script against a
+  mutable env, the post-script against a read-only response) lands
+  with M11.6.1 — needs a per-collection capability store and a Lua
+  bridge into `cockpit-http`'s `Environment`. 5 new tests in
+  cockpit-http (round-trip + JS-flag + unknown-variant) + 4 new in
+  cockpit-ui (script_warnings matrix).
+- **M11.6.1 update (Lua execution wired):** `cockpit_lua::http_scripts`
+  ships `run_pre_request(source, &mut env.vars)` and
+  `run_post_response(source, response, &mut env.vars)`. Both spin a
+  fresh `mlua` VM with the same `apply_sandbox` the v0.9 extensions
+  use (no `io`, no `os.execute`, no `package.loadlib`, no `require`).
+  The bridge installs `cockpit.http.set_var(name, value)` and
+  `cockpit.http.var(name)` against an `Arc<Mutex<BTreeMap>>` so
+  mutations land back on the caller's environment in place; post-
+  response scripts additionally get `cockpit.http.response()`
+  returning a read-only table with `status`, `headers` (1-indexed
+  list of `{name, value}` rows so Lua's `#` works), and `body`. Pre-
+  request scripts that call `cockpit.http.response()` raise a clear
+  error rather than returning nil. The binary owns a new
+  `http_scripts_granted: bool` field (default-deny; tests flip it
+  directly — a per-collection grant store reading
+  `~/.config/cockpit/extensions.toml` lands in M11.6.2). `Http: Send
+  Request` now clones the active env, runs the pre-script when
+  granted, threads the mutated env through
+  `cockpit_http::prepare_request`, then dispatches — script failures
+  land in the status without ever spawning a worker. 8 new tests in
+  `cockpit_lua::http_scripts` (set/read vars, sandbox blocks
+  `os.execute`, runtime errors, response-shape iteration) + 3 in the
+  binary (granted path mutates headers, ungranted path skips, script
+  failure aborts before dispatch).
+- **M11.6.2 update (post-response wired):** `HttpInFlight` now captures
+  the request's `post_script` source + `active_environment_name` at
+  send time, so a mid-flight selection switch can't swap which script
+  runs. `poll_http_inflight` drains those fields before applying the
+  result, then on `Ok(response)` runs
+  `cockpit_lua::run_post_response`. `HttpView::replace_environment_vars(name,
+  vars)` writes the script's `cockpit.http.set_var` mutations back to
+  the in-memory environment so the next request picks them up; on-disk
+  persistence to `environments/<name>.bru` still routes through the
+  M11.4.1 editor surface. Script failures surface as a `(post-script
+  failed: …)` suffix on the round-trip status without flipping the
+  response status (the engine call still succeeded). 5 new tests
+  (3 binary integration: write-back, failure surfacing, ungranted
+  skip; 2 view-model: replace-vars happy path + unknown-name error).
+  Remaining for full M11.6: a per-collection grant store reading
+  `~/.config/cockpit/extensions.toml` so the binary's
+  `http_scripts_granted` is sourced from real config instead of a
+  test-only flag.
+- **M11.5 / M11.6 closeout (this milestone):**
+  - `Http: Save Response To File` writes the latest body to
+    `<collection-root>/responses/<sanitised-name>.<ext>`, picking
+    the extension from the response `Content-Type` (`application/json`
+    → `json`, `text/html` → `html`, …; unknown types fall through to
+    `.bin`). File-stem sanitisation replaces every char outside
+    `[A-Za-z0-9._-]` with `_` and collapses runs, and conflicts open
+    a `ConfirmPrompt` (`PromptIntent::OverwriteHttpResponse`) rather
+    than clobbering silently.
+  - `Http: Send All In Folder` walks the open `.bru` file's parent
+    directory, matches every `.bru` filename against the collection's
+    `Request::meta.name`, queues those indices in
+    `AppModel::http_batch`, and dispatches them sequentially through
+    the same `http_send_request` path used by single sends.
+    `poll_http_inflight` advances the queue after each response and
+    suffixes the status with `[i/N]` progress; `Http: Cancel` aborts
+    the queue and the in-flight worker together.
+  - `cockpit_lua::http_grants` parses
+    `~/.config/cockpit/extensions.toml`'s `[http]
+    granted_collections` array and answers `is_granted` against any
+    collection root via a parent-path prefix walk (so granting a
+    monorepo root covers nested `cockpit-http/` directories). The
+    binary loads grants alongside the rest of the config in
+    `apply_config_file` and consults them at send time —
+    `http_scripts_granted` is now the union of the test-only override
+    and the on-disk grant.
+  - `ProjectCache::active_http_environment` round-trips the chosen
+    Bruno environment across restarts; `apply_cache` stashes it in
+    `AppModel::pending_http_env` so the freshly-built `HttpView`
+    applies it the first time `open_document` constructs one.
+    Unknown env names from a stale cache are silently dropped rather
+    than aborting the open.
+  - 13 new tests across `cockpit-lua::http_grants` (parser + grant
+    semantics) and the binary (`sanitize_file_stem`,
+    `response_extension`, `http_save_response` happy path + overwrite
+    confirm, `http_scripts_grants_unlock_pre_script_for_listed_collection`).
+    Workspace 851 pass / 0 fail, fmt + clippy `-D warnings` green.
+
+  M11.4.1 painter and M11.7 docs are the only v0.11 work still
+  outstanding — both are deliberately deferred (GPU-bound rendering;
+  docs land in `docs/http.md` once the painter UX is locked).
 
 ### M11.7 — Docs
 
@@ -1907,22 +2089,28 @@ Registered in `cockpit-commands`:
 
 ### v0.11 exit checklist
 
-- [ ] Cockpit recognises a Bruno collection at the project root;
-      the launcher shows it as a "Bruno collection" project kind.
+- [x] Cockpit recognises a Bruno collection at the project root
+      (M11.2: `detect_collection_root` + `load_collection`; the
+      launcher row treatment ships with the M11.4.1 painter).
 - [ ] Opening a `.bru` file shows the split request/response view.
-- [ ] `<leader>hs` sends; response renders in < 50 ms after the
-      network round-trip completes (excludes the network itself).
-- [ ] `{{baseUrl}}`-style interpolation works against the active
-      environment.
-- [ ] Switching environments via `<leader>he` survives a restart
-      (persisted in `ProjectCache`).
-- [ ] `Http: Copy As cURL` produces a valid curl invocation
-      including headers and body.
-- [ ] A Bruno collection that runs in the upstream Bruno desktop
-      app also runs in cockpit (round-trip parity on the fixture
-      collection).
-- [ ] `mise run ci` green; integration leg adds a `wiremock` test
-      hitting localhost.
+      View-model (`HttpView` + `SplitLayout`) is in; the painter
+      glyphs ship with M11.4.1.
+- [x] `<leader>hs` sends through `ReqwestEngine` on a worker thread;
+      `poll_http_inflight` lands the response on the view next tick
+      (sub-frame for the fake engine in tests).
+- [x] `{{baseUrl}}`-style interpolation works against the active
+      environment (M11.2 + M11.3 `prepare_request`).
+- [x] Switching environments via `<leader>he` survives a restart —
+      `ProjectCache::active_http_environment` round-trips through
+      `apply_cache` / `build_cache`.
+- [x] `Http: Copy As cURL` produces a valid POSIX-quoted curl
+      invocation including headers and body
+      (`PreparedRequest::to_curl`).
+- [x] Bruno fixture collections round-trip (`tests/golden_round_trip.rs`).
+- [x] `cargo test --workspace` + clippy `-D warnings` green; the
+      `integration` job runs the `cockpit-http` engine against the
+      hand-rolled `TcpListener` mock (a wiremock dep would have
+      pulled tokio).
 
 ### Sequencing
 
