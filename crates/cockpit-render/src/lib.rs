@@ -11,11 +11,17 @@ pub mod frame;
 pub mod geometry;
 pub mod glyph_cache;
 pub mod key_event;
-pub mod painter;
 pub mod renderer;
 pub mod text;
 pub mod text_mesh;
-pub mod theme;
+
+// The immediate-mode painter and theme palette were extracted into the
+// headless `cockpit-paint` crate (v0.12 M12.4) so the sibling popover binaries
+// can paint without depending on `winit`/`glow`. Re-exported here under their
+// original module paths (`cockpit_render::painter`, `::theme`) so existing
+// callers — and this crate's own `crate::painter`/`crate::theme` uses — keep
+// compiling unchanged.
+pub use cockpit_paint::{painter, theme};
 
 pub use app::{
     AppError, CockpitApp, MouseButton, PointerPosition, RedrawHandle, Viewport, run_app,

@@ -1,0 +1,10 @@
+[package]
+name = "cockpit-paint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless presentation primitives — theme, immediate-mode painter, popover content trait — shared by cockpit-render and the sibling popover binaries."
+
+[dependencies]
+cockpit-commands.workspace = true

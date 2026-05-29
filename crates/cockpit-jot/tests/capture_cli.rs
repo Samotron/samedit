@@ -41,7 +41,11 @@ fn capture_writes_entry_to_disk() {
     let config = dir.path().join("org.toml");
 
     let out = run(&config, &["capture", "t", "buy", "milk"]);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("Captured to"));
 
     let inbox = std::fs::read_to_string(dir.path().join("inbox.org")).unwrap();
@@ -56,8 +60,14 @@ fn capture_unknown_key_fails_and_lists_templates() {
     let out = run(&config, &["capture", "zzz", "nope"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no capture template with key 'zzz'"), "stderr: {stderr}");
-    assert!(stderr.contains("t (Todo)"), "stderr should list available templates: {stderr}");
+    assert!(
+        stderr.contains("no capture template with key 'zzz'"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("t (Todo)"),
+        "stderr should list available templates: {stderr}"
+    );
 
     // The unknown key must not have touched the file.
     let inbox = std::fs::read_to_string(dir.path().join("inbox.org")).unwrap();
@@ -79,9 +89,20 @@ fn capture_annotation_flows_into_template() {
 
     let out = run(
         &dir.path().join("org.toml"),
-        &["capture", "n", "--annotate", "src/lib.rs:42", "look", "here"],
+        &[
+            "capture",
+            "n",
+            "--annotate",
+            "src/lib.rs:42",
+            "look",
+            "here",
+        ],
     );
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let notes = std::fs::read_to_string(dir.path().join("notes.org")).unwrap();
     assert_eq!(notes, "* Inbox\n** look here from src/lib.rs:42\n");
@@ -92,7 +113,5 @@ fn capture_missing_key_reports_usage() {
     let dir = fixture();
     let out = run(&dir.path().join("org.toml"), &["capture"]);
     assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("capture needs a template key"),
-    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("capture needs a template key"),);
 }

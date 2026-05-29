@@ -27,6 +27,8 @@ cockpit-org.workspace = true
 cockpit-ui.workspace = true
 cockpit-tray.workspace = true
 cockpit-hotkey.workspace = true
+cockpit-paint.workspace = true
+cockpit-commands.workspace = true
 anyhow = "1.0.102"
 
 [dev-dependencies]

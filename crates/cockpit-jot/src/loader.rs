@@ -29,8 +29,7 @@ pub fn load_config(path: impl AsRef<Path>) -> io::Result<OrgConfig> {
 /// The default config path, `$HOME/.config/cockpit/org.toml`. `None` when
 /// `HOME` is unset.
 pub fn default_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".config/cockpit/org.toml"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/cockpit/org.toml"))
 }
 
 /// Resolve the org root directory. An explicit `cli` override wins; otherwise
@@ -194,10 +193,7 @@ mod tests {
         // `~/` resolves under it; the no-HOME branch is covered by the
         // pass-through test above on machines without one.
         if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(
-                expand_tilde("~/org"),
-                PathBuf::from(home).join("org"),
-            );
+            assert_eq!(expand_tilde("~/org"), PathBuf::from(home).join("org"),);
         }
     }
 }

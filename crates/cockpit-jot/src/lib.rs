@@ -14,6 +14,8 @@
 
 pub mod app;
 pub mod loader;
+pub mod popover;
 
 pub use app::{HotkeyAction, JotController, JotIntent, Surface};
 pub use loader::load_root;
+pub use popover::JotPopover;
