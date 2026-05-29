@@ -56,11 +56,11 @@ pub use agenda::{
 };
 pub use capture::{
     CaptureContext, CaptureOutcome, CaptureTarget, CaptureTemplate, Expansion, NowStamp, OrgConfig,
-    apply_capture, expand, expand_with, run_capture,
+    apply_capture, expand, expand_with, paste_subtree, refile, run_capture,
 };
 pub use edit::{
-    byte_offset_of_line, cycle_todo, insert_at_line, replace_line_content, replace_line_range,
-    set_deadline, set_scheduled, set_todo,
+    byte_offset_of_line, cut_subtree, cycle_todo, insert_at_line, replace_line_content,
+    replace_line_range, set_deadline, set_scheduled, set_todo,
 };
 pub use keywords::Keywords;
 pub use model::{Heading, OrgFile};

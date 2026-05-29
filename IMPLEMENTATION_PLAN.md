@@ -2642,10 +2642,16 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   parity is structural: both paths call the same
   `cockpit-org` edit primitives (the `org` service's `Complete`
   returns the identical source a direct `cycle_todo`/`complete`
-  produces). Remaining display-bound work: the `Language::Org`
-  highlight arm, the floating agenda pane, the IPC client wiring,
-  `Org: Refile` (cross-file subtree move), and registering these
-  commands in the cockpit binary.
+  produces). `Org: Refile` also ships headlessly:
+  `cockpit-org::{cut_subtree, paste_subtree, refile}` move a
+  heading's whole subtree (same-file or cross-file), demoting levels
+  to nest under the target and keeping every other line
+  byte-identical. `Language::Org` is recognised by the editor
+  (`cockpit-editor::highlight`, `.org` extension; no LSP entry) —
+  highlight spans await `tree-sitter-org`, the same staged approach
+  as `Ggsql`. Remaining display-bound work: the floating agenda
+  pane, the IPC client wiring, and registering these commands +
+  handlers in the cockpit binary's event loop.
 
 ### M12.8 — Sync (effectively free)
 

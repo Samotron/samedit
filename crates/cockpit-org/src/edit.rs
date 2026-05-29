@@ -118,6 +118,20 @@ pub fn cycle_todo(source: &str, heading: &Heading, keywords: &Keywords) -> Strin
     set_todo(source, heading, keywords, next.as_deref())
 }
 
+/// Cut a heading and its whole subtree out of `source`, returning
+/// `(remaining_source, subtree_text)`. The cut text is byte-exact (it keeps the
+/// original line terminators) so it can be pasted elsewhere unchanged; the
+/// remaining source stays byte-identical outside the removed range. Used by
+/// refile (M12.7).
+pub fn cut_subtree(source: &str, heading: &Heading) -> (String, String) {
+    let range = heading.subtree_line_range();
+    let start = byte_offset_of_line(source, range.start);
+    let end = byte_offset_of_line(source, range.end);
+    let subtree = source[start..end].to_string();
+    let remaining = format!("{}{}", &source[..start], &source[end..]);
+    (remaining, subtree)
+}
+
 /// `true` if `line` is a planning line (`SCHEDULED:` / `DEADLINE:` / `CLOSED:`,
 /// possibly indented).
 pub(crate) fn is_planning_line(line: &str) -> bool {

@@ -283,6 +283,34 @@ pub fn apply_capture(
     CaptureOutcome { source, cursor }
 }
 
+/// Paste a previously-cut subtree (see [`crate::edit::cut_subtree`]) into
+/// `target_source` at `target`, demoting its heading levels to nest correctly.
+/// `target.datetree` is not supported for refile (use `under`/end); a datetree
+/// target is treated as an EOF append. Returns the new target source.
+pub fn paste_subtree(target_source: &str, target: &CaptureTarget, subtree: &str) -> String {
+    let plain = CaptureTarget {
+        file: target.file.clone(),
+        under: target.under.clone(),
+        datetree: false,
+    };
+    let entry = Expansion {
+        text: subtree.to_string(),
+        cursor: None,
+    };
+    // `now` is only consulted for datetree targets, which we force off here.
+    let now = NowStamp::new(OrgDate::new(1970, 1, 1), OrgTime::new(0, 0), "Thu");
+    apply_capture(target_source, &plain, &entry, &now).source
+}
+
+/// Refile the `heading` subtree within a single file: cut it and re-file it
+/// under `target`. Returns the new file source. For a cross-file move, call
+/// [`crate::edit::cut_subtree`] on the source file and [`paste_subtree`] on the
+/// destination file separately.
+pub fn refile(source: &str, heading: &crate::model::Heading, target: &CaptureTarget) -> String {
+    let (remaining, subtree) = crate::edit::cut_subtree(source, heading);
+    paste_subtree(&remaining, target, &subtree)
+}
+
 fn ensure_trailing_newline(s: &str) -> String {
     if s.ends_with('\n') {
         s.to_string()
@@ -575,5 +603,40 @@ mod tests {
             out.source,
             "* 2026\n** 2026-05\n*** 2026-05-29 Fri\n**** earlier\n**** later\n"
         );
+    }
+
+    #[test]
+    fn refile_moves_subtree_under_another_heading_same_file() {
+        let src = "* Inbox\n** TODO move me\n   body\n* Projects\n";
+        let file = crate::parse::parse_file("t.org", src);
+        // "move me" is a child of Inbox (level 2) with a body line.
+        let moveme = file.headings[0].children[0].clone();
+        let target = CaptureTarget {
+            file: "t.org".into(),
+            under: Some("Projects".into()),
+            datetree: false,
+        };
+        let out = refile(src, &moveme, &target);
+        // Cut from Inbox; pasted under Projects, demoted to level 2; body kept.
+        assert_eq!(out, "* Inbox\n* Projects\n** TODO move me\n   body\n");
+    }
+
+    #[test]
+    fn refile_across_files_cuts_and_pastes() {
+        let from = "* Inbox\n** TODO ship\n* Keep\n";
+        let to = "* Tasks\n";
+        let file = crate::parse::parse_file("from.org", from);
+        let ship = file.headings[0].children[0].clone();
+
+        let (remaining, subtree) = crate::edit::cut_subtree(from, &ship);
+        assert_eq!(remaining, "* Inbox\n* Keep\n");
+
+        let target = CaptureTarget {
+            file: "to.org".into(),
+            under: Some("Tasks".into()),
+            datetree: false,
+        };
+        let pasted = paste_subtree(to, &target, &subtree);
+        assert_eq!(pasted, "* Tasks\n** TODO ship\n");
     }
 }

@@ -54,6 +54,9 @@ impl ServerConfig {
             // notebook cells fall back to sqls when they need schema
             // intelligence, since ggsql wraps DuckDB anyway.
             Language::Ggsql => None,
+            // Org has no LSP (v0.12) — structural ops come from `cockpit-org`,
+            // not a language server.
+            Language::Org => None,
         }
     }
 
@@ -67,6 +70,7 @@ impl ServerConfig {
             Language::Ggsql => "ggsql",
             Language::TypeScript => "typescript",
             Language::Go => "go",
+            Language::Org => "org",
         }
     }
 }
