@@ -200,6 +200,14 @@ impl JotController {
         }
     }
 
+    /// Insert `text` at the capture editor's cursor (the `%?` slot after a
+    /// pick). No-op unless an editing capture is open.
+    pub fn capture_insert_str(&mut self, text: &str) {
+        if let Surface::Capture(view) = &mut self.surface {
+            view.insert_str(text);
+        }
+    }
+
     /// Commit the capture being edited: expand → file under the template's
     /// target → persist. Returns the write + dismiss intents, or empty if the
     /// surface isn't an editing capture.
@@ -388,9 +396,7 @@ mod tests {
         assert!(c.capture_pick("t"));
 
         // Type a title into the %? slot.
-        if let Surface::Capture(v) = &mut c.surface {
-            v.insert_str("buy milk");
-        }
+        c.capture_insert_str("buy milk");
 
         let intents = c.capture_commit();
         // The entry is filed under "Tasks" in inbox.org (demoted to level 2).
@@ -456,5 +462,22 @@ mod tests {
         let mut c = controller();
         assert!(c.capture_commit().is_empty());
         assert!(!c.capture_pick("t")); // not in capture surface
+    }
+
+    #[test]
+    fn capture_insert_str_is_noop_off_capture_surface() {
+        let mut c = controller();
+        // No capture open: inserting is a silent no-op, not a panic.
+        c.capture_insert_str("ignored");
+        assert_eq!(c.surface().name(), "hidden");
+    }
+
+    #[test]
+    fn capture_pick_unknown_key_stays_in_picker() {
+        let mut c = controller();
+        c.on_hotkey(HotkeyAction::Capture);
+        assert!(!c.capture_pick("zzz"));
+        // Still on the capture surface, just nothing picked.
+        assert_eq!(c.surface().name(), "capture");
     }
 }

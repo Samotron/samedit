@@ -2546,11 +2546,14 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   `loader::{load_root,now_stamp}` is the disk/clock glue (the latter
   derives the calendar date from `SystemTime` via
   `cockpit-org::date`, no `chrono`). Until the `ui-smoke` event loop
-  lands, `main.rs` is a headless CLI (`cockpit-jot [--root D]
-  [--config org.toml] [agenda|overview]`) over the same controller —
-  it loads the root and prints the agenda, proving the wiring without
-  a window. The real `tray-icon` + `global-hotkey` + winit popover
-  loop is the display-bound follow-up.
+  lands, `main.rs` is a headless CLI over the same controller:
+  `agenda` / `overview` print the view, and `capture <key>
+  [title...]` runs a configured template to completion and writes the
+  entry (the same `WriteFile` intent the popover carries out) — usable
+  from scripts / editor keybindings today. A `tests/capture_cli.rs`
+  integration test drives the real binary end-to-end. The real
+  `tray-icon` + `global-hotkey` + winit popover loop is the
+  display-bound follow-up.
 - **Impl note (`org.toml` loading):** `OrgConfig::from_toml_str`
   parses the documented `[org]` + `[[org.capture]]` grammar
   (foreign sections tolerated, missing `[org]` → defaults) as a

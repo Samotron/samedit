@@ -198,8 +198,17 @@ primitives.
 > release. The tray icon, global-hotkey registration, and the floating
 > popover window are wired up on platforms with a desktop session; on a
 > headless build the same controller is reachable via the `cockpit-jot`
-> CLI (`cockpit-jot [--root DIR] [--config org.toml] [agenda|overview]`),
-> which reads `~/.config/cockpit/org.toml` by default.
+> CLI, which reads `~/.config/cockpit/org.toml` by default:
+>
+> ```
+> cockpit-jot [--root DIR] [--config org.toml] agenda
+> cockpit-jot [--root DIR] [--config org.toml] overview
+> cockpit-jot [--root DIR] [--config org.toml] capture <key> [title...]
+> ```
+>
+> `capture` runs a configured template to completion and writes the
+> entry to disk — handy from scripts or an editor keybinding even before
+> the popover exists.
 
 ---
 
