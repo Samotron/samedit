@@ -1,0 +1,33 @@
+[package]
+name = "cockpit-jot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The cockpit-jot sibling tray app: Org capture/agenda reachable even when the cockpit is closed (v0.12 M12.6)."
+
+[features]
+default = []
+# The real winit popover + tray-icon + global-hotkey event loop lands behind
+# this flag once it can be smoke-tested on a windowing CI leg. The headless
+# JotController (event -> intent orchestration) is backend-free and tested in
+# the fast leg.
+ui-smoke = []
+
+[lib]
+name = "cockpit_jot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cockpit-jot"
+path = "src/main.rs"
+
+[dependencies]
+cockpit-org.workspace = true
+cockpit-ui.workspace = true
+cockpit-tray.workspace = true
+cockpit-hotkey.workspace = true
+anyhow = "1.0.102"
+
+[dev-dependencies]
+tempfile = "3.27.0"

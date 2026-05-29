@@ -2536,6 +2536,21 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   the messages through the real `cockpit-ipc` CBOR codec. The jot
   binary's event loop / winit popover that hosts this is the
   remaining (display-bound) work.
+- **Impl note (controller):** the `cockpit-jot` crate is split into a
+  tested, backend-free `JotController` and a thin glue `main.rs`. The
+  controller owns the live `OrgRoot`, the capture/agenda/overview
+  view-models, and the tray menu, and maps **events** (hotkey, tray,
+  popover keys — `NowStamp` injected) to **intents** (`ShowPopover` /
+  `DismissPopover` / `WriteFile` / `OpenInCockpit` / `Quit`); capture
+  commit files via `apply_capture` and syncs the live root.
+  `loader::{load_root,now_stamp}` is the disk/clock glue (the latter
+  derives the calendar date from `SystemTime` via
+  `cockpit-org::date`, no `chrono`). Until the `ui-smoke` event loop
+  lands, `main.rs` is a headless CLI (`cockpit-jot [--root D]
+  [agenda|overview]`) over the same controller — it loads the root
+  and prints the agenda, proving the wiring without a window. The
+  real `tray-icon` + `global-hotkey` + winit popover loop is the
+  display-bound follow-up.
 - **Default hotkeys** (configurable in `~/.config/cockpit/org.toml`):
   - `Ctrl+O` — **capture** (opens the capture-template picker;
     pressing the template key triggers immediate quick-entry).

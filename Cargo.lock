@@ -745,6 +745,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-jot"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "cockpit-hotkey",
+ "cockpit-org",
+ "cockpit-tray",
+ "cockpit-ui",
+ "tempfile",
+]
+
+[[package]]
 name = "cockpit-lsp"
 version = "0.0.1"
 dependencies = [
