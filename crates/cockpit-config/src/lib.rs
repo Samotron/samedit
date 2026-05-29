@@ -5,8 +5,13 @@
 //! M7.8. Pure data + parsing; no I/O side effects beyond reading files.
 
 pub mod cockpit_layout;
+pub mod launcher;
 
 pub use cockpit_layout::{CockpitLayout, CockpitLayoutNode, CockpitSplitDirection};
+pub use launcher::{
+    HotkeyConfig, LauncherConfig, LauncherMiseConfig, LauncherPosition, LauncherSection,
+    LauncherUi, MiseProjects, ProvidersConfig, launcher_config_path,
+};
 
 use std::{collections::BTreeMap, fs, io, path::Path};
 

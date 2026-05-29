@@ -759,6 +759,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-launcher"
+version = "0.0.1"
+dependencies = [
+ "cockpit-commands",
+ "cockpit-ipc",
+ "cockpit-project",
+ "nucleo-matcher",
+ "serde",
+]
+
+[[package]]
 name = "cockpit-lsp"
 version = "0.0.1"
 dependencies = [
@@ -836,6 +847,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "cockpit-quick"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "cockpit-commands",
+ "cockpit-config",
+ "cockpit-launcher",
+ "cockpit-project",
+ "tempfile",
 ]
 
 [[package]]

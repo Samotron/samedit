@@ -2860,6 +2860,25 @@ New crates:
   provider quota to avoid one provider drowning the list.
 - **Tests:** ranking with synthetic providers; quota enforcement;
   empty-query "favourites" listing; query escaping.
+- **Impl note (M13.1):** shipped as the headless `cockpit-launcher`
+  crate. `ActionProvider` gained two defaulted methods beyond the
+  plan sketch — `quota()` (the per-provider cap, default 5) and
+  `fuzzy_filtered()`. The latter resolves the "providers return
+  scored candidates" tension cleanly: list providers (mise) return
+  every candidate and let the launcher fuzzy-score titles, while
+  *verbatim* providers (calculator, URL) emit one already-relevant
+  action that the launcher keeps at a high base score so it floats
+  to the top, Raycast-style. `Launcher::search` is the two-stage
+  merge: score → per-provider quota → cross-provider sort by score,
+  then title, then id (fully deterministic, no dependence on
+  provider iteration order), capped to `max_rows` (default 8).
+  Ranking reuses `nucleo-matcher` exactly as `cockpit_ui::file_finder`
+  does. `ActionRun::OpenUrl` carries a `String` (validated at
+  provider time) rather than a `url::Url`, avoiding a new dep; the
+  enum is otherwise as specified, with `Lua(LuaActionHandle)` modelled
+  now so the binary (M13.5) only has to wire the runtime. The
+  crate stays backend-free — the only seam it touches is
+  `cockpit-project::env` for `ProcessSpec` and the test `FakeFileSystem`.
 
 ### M13.2 — Provider: mise tasks
 
@@ -2875,6 +2894,19 @@ New crates:
   crate, reused from M9.5).
 - **Out of scope:** running tasks against the cockpit's *open*
   project specifically — that's the in-cockpit palette's job.
+- **Impl note (M13.2):** `MiseTasksProvider::from_projects(fs, roots)`
+  parses each root's `mise.toml` through `cockpit_project::
+  detect_mise_project_with` over an injected `FileSystem` — no real
+  disk, fully testable. The mise-availability probe is stubbed with a
+  never-spawning `ProcessRunner` (discovery only reads the config, it
+  never runs `mise --version`). Tasks are emitted as
+  `Action { title: "<project>: <task>", run: Process(mise run <task>,
+  cwd = project root) }`; the project label prefers `[metadata.cockpit]
+  name`, else the directory name. A stale/missing root is skipped, not
+  fatal. Entries are sorted (project, task) so the empty-query listing
+  is stable. The disk-watch re-scan (`notify`) and the
+  `Launcher: Add Mise Project` cockpit command are binary-side wiring,
+  deferred with M13.5/M13.7.
 
 ### M13.3 — Provider: Lua extensions
 
@@ -2899,6 +2931,18 @@ New crates:
   surfaces.
 - **Tests:** scripted Lua action registration; sandbox enforcement
   identical to v0.9.
+- **Impl note (M13.3, launcher side):** the provider ships as
+  `cockpit_launcher::lua::LuaActionsProvider` over plain `LuaAction
+  { extension, id, title }` descriptors — so `cockpit-launcher` does
+  **not** depend on `cockpit-lua`; the `cockpit-quick` binary bridges
+  the two. Each action emits `ActionRun::Lua(LuaActionHandle{extension,
+  id})`; the binary routes Enter back to the owning VM via the existing
+  `LuaRuntime::dispatch_command` path (same sandbox + capability gate,
+  so a pure-Lua action needs nothing and a network/fs one still hits
+  M9.4). The `cockpit.launcher.action {…}` registrar in `cockpit-lua`'s
+  sandbox (harvesting into `Registrations`) and the shared
+  `extensions/*.lua` hot-reload are the binary-side follow-up, behind
+  the same `ui-smoke`-gated event loop as the rest of M13.5.
 
 ### M13.4 — Provider: built-ins
 
@@ -2921,6 +2965,19 @@ New crates:
   second entry point to capture, complementing `Ctrl+O`.
 - `Org Agenda` — opens the agenda popover via the `org` IPC
   service (or launches the tray app if it isn't running).
+- **Impl note (M13.4, headless subset):** the two self-contained
+  built-ins ship now in `cockpit_launcher::builtins`. `Calculator` is
+  a verbatim provider: `=<expr>` runs a dependency-free recursive-descent
+  evaluator (`calc.rs` — `+ - * /`, parentheses, unary minus, correct
+  precedence so `=2+2*3` → `8`; div-by-zero / malformed → no row) and
+  emits one action whose Enter dispatches `clipboard.copy` with the
+  result (so even the calculator rides the `CommandId` spine). `Open URL`
+  recognises an `http(s)://` query with a real host (conservative,
+  regex-free) and emits an `OpenUrl` action. The IPC-backed built-ins —
+  `Open Project`, `Switch Theme`, `Org Capture: <Template>`,
+  `Org Agenda` — need a live IPC client, so they land with the
+  `cockpit-quick` binary (M13.5) alongside the `cockpit` IPC service
+  variants (M13.7).
 
 ### M13.5 — `cockpit-quick`: sibling binary
 
@@ -2937,6 +2994,27 @@ New crates:
   cheap to summon.
 - **Tests:** popover view-model goldens; provider integration
   smoke per OS.
+- **Impl note (M13.5):** shipped split like `cockpit-jot` — a tested,
+  backend-free `QuickController` (event → intent) plus a thin
+  `main.rs`. The controller owns the live `Launcher` and the
+  query/results/selection, mapping `QuickEvent`
+  (`SetQuery`/`MoveUp`/`MoveDown`/`Submit`/`Dismiss`) onto `QuickIntent`
+  (`CopyToClipboard`/`OpenUrl`/`OpenPath`/`DispatchCommand`/`RunLua`/
+  `RunProcess`/`Dismiss`). Every `ActionRun` lowers to exactly one
+  intent — the calculator's `clipboard.copy` command becomes a local
+  `CopyToClipboard`, every other `Command` becomes a `DispatchCommand`
+  the binary sends over the `cockpit`/`org` IPC service. `loader.rs` is
+  the config glue: `build_launcher(config, inputs, home, fs)` assembles
+  the enabled providers from `launcher.toml` (expanding a leading `~`
+  in project paths) over an injected `FileSystem`, taking the
+  IPC-sourced runtime data (recent projects, themes, org templates, Lua
+  actions) as plain `ProviderInputs`. Until the `ui-smoke` event loop
+  lands, `main.rs` is a headless CLI over the same controller —
+  `search` / `run` / `providers` — usable from scripts today. The real
+  `tray-icon` + `global-hotkey` + winit popover (text input on top,
+  results list, `Tab` secondary actions, cold-start budget) is the
+  display-bound follow-up behind the `ui-smoke` feature, same staging
+  as `cockpit-jot`'s shell.
 
 ### M13.6 — Settings + config
 
