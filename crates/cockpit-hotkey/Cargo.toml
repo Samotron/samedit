@@ -1,0 +1,18 @@
+[package]
+name = "cockpit-hotkey"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Global-hotkey chord parsing, conflict detection, and a headless hotkey bus for Coding Cockpit's tray apps (v0.12 M12.3)."
+
+[features]
+default = []
+# The real `global-hotkey` backend (registers chords with the OS) lands behind
+# this flag once it can be smoke-tested on a windowing CI leg. The chord
+# grammar, conflict detection, and `FakeHotkeyBus` below are backend-free and
+# tested in the fast leg.
+ui-smoke = []
+
+[dependencies]
+thiserror = "2.0.17"

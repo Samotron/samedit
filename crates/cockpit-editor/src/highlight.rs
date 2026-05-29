@@ -50,6 +50,10 @@ pub enum Language {
     Ggsql,
     TypeScript,
     Go,
+    /// Org-mode. Recognised so `.org` files route through the org structural
+    /// ops (`cockpit-org`); highlight spans await the `tree-sitter-org`
+    /// grammar (same staged approach as [`Language::Ggsql`]).
+    Org,
 }
 
 impl Language {
@@ -62,6 +66,7 @@ impl Language {
             "ggsql" => Some(Language::Ggsql),
             "ts" | "tsx" => Some(Language::TypeScript),
             "go" => Some(Language::Go),
+            "org" => Some(Language::Org),
             _ => None,
         }
     }
@@ -132,7 +137,11 @@ fn with_config<R>(language: Language, f: impl FnOnce(&HighlightConfiguration) ->
             let mut slot = cell.borrow_mut();
             f(slot.get_or_insert_with(build_go_config))
         }),
-        Language::Python | Language::Sql | Language::Ggsql | Language::TypeScript => {
+        Language::Python
+        | Language::Sql
+        | Language::Ggsql
+        | Language::TypeScript
+        | Language::Org => {
             unreachable!("unsupported languages return before requesting a highlight config")
         }
     }
@@ -268,7 +277,17 @@ mod tests {
             Language::from_path(Path::new("foo_test.GO")),
             Some(Language::Go)
         );
+        assert_eq!(
+            Language::from_path(Path::new("inbox.org")),
+            Some(Language::Org)
+        );
         assert_eq!(Language::from_path(Path::new("README")), None);
+    }
+
+    #[test]
+    fn org_highlights_to_no_spans_until_grammar_lands() {
+        // Recognised, but (like ggsql) yields no spans until tree-sitter-org.
+        assert!(compute(Language::Org, "* TODO heading\n").is_empty());
     }
 
     #[test]

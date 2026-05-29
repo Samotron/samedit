@@ -1,0 +1,24 @@
+#+TITLE: Agenda fixture — every scheduling permutation
+
+* TODO Scheduled today                         :work:
+  SCHEDULED: <2026-05-29 Fri>
+* TODO Deadline today                          :work:
+  DEADLINE: <2026-05-29 Fri>
+* TODO Overdue deadline                        :work:
+  DEADLINE: <2026-05-20 Wed>
+* TODO Overdue scheduled                       :home:
+  SCHEDULED: <2026-05-25 Mon>
+* DONE Done in the past                        :work:
+  SCHEDULED: <2026-05-01 Fri>
+* TODO Later this week                         :home:
+  SCHEDULED: <2026-05-31 Sun>
+* TODO Next week edge                          :work:
+  DEADLINE: <2026-06-04 Thu>
+* TODO Far future                              :work:
+  SCHEDULED: <2026-07-15 Wed>
+* TODO Timed meeting                           :work:
+  SCHEDULED: <2026-05-29 Fri 09:30>
+* TODO Weekly repeat                           :home:
+  SCHEDULED: <2026-05-29 Fri +1w>
+* TODO No date but a keyword                   :work:
+* Plain heading without a keyword

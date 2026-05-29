@@ -2275,6 +2275,21 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   reach. Document explicitly that this is *not* a remote protocol.
 - **Tests:** scripted client/server pair in a tempdir; message
   ordering, reconnect, malformed-frame handling, per-OS smoke.
+- **Impl notes (M12.1):** shipped as `cockpit-ipc`. Frame =
+  4-byte BE length + 1-byte encoding tag + body; the tag (`0`=CBOR,
+  `1`=JSON) lets one socket accept either, so a `socat`/JSON poke and
+  the production CBOR stream interoperate (tested). CBOR via
+  `ciborium`, JSON via `serde_json`. The transport is **generic over
+  the payload** (`Envelope<T> { service: ServiceId, payload: T }`),
+  so each service defines its own message enum. Unix-socket transport
+  (`IpcListener`/`Connection`) is `#[cfg(unix)]` and fully tested
+  (round-trip, ordering, reconnect, stale-socket cleanup); the wire
+  types + codec are platform-independent. `MAX_FRAME` (16 MiB) guards
+  against a hostile length prefix. **Windows named-pipe transport is
+  a documented follow-up** (`WINDOWS_PIPE_NAME` constant exists; the
+  sandbox is Linux-only, so the pipe impl ships when it can be
+  smoke-tested). The `ipc-smoke` CI leg / per-OS smoke is pending the
+  Windows impl.
 
 ### M12.2 — `cockpit-tray`: system tray icon
 
@@ -2285,6 +2300,15 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   fake (`FakeTray`) for tests.
 - **Tests:** unit on the headless fake; smoke on real `tray-icon`
   behind the `ui-smoke` feature (gated to non-headless CI legs).
+- **Impl notes (M12.2):** shipped as `cockpit-tray` — the
+  backend-free half. A flat [`Menu`] of `Action`/`Separator` items
+  (no submenus), a [`Tray`] seam (`set_menu`/`set_tooltip`), and a
+  `TrayEvent` stream (`LeftClick` / `MenuItem(id)`). `FakeTray`
+  records the menu/tooltip and simulates clicks; activating a
+  missing or disabled item is a no-op. The real `tray-icon` backend
+  is deferred behind the `ui-smoke` feature (needs a tray host to
+  smoke-test); it isn't a dependency yet, so the default build pulls
+  no GUI crates.
 
 ### M12.3 — `cockpit-hotkey`: global hotkey registration
 
@@ -2296,6 +2320,15 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
 - **Tests:** headless fake hotkey bus; integration tests behind
   `ui-smoke` register a low-collision chord
   (`Ctrl+Alt+F12`-class) and assert the callback fires.
+- **Impl notes (M12.3):** shipped as `cockpit-hotkey` — the
+  backend-free half. `Hotkey::parse` normalises chords
+  (case-insensitive; `cmd`/`win`/`meta`→super; chars upper-cased;
+  `F1`..=`F24`; named keys) so conflict comparison is by value, with
+  typed `HotkeyError`s (`EmptyChord`/`MissingKey`/`UnknownToken`/
+  `UnknownKey`/`Conflict`). The `HotkeyBus` seam + `FakeHotkeyBus`
+  model external ownership (conflict fires, never silent) and
+  simulated presses. The real `global-hotkey` backend is deferred
+  behind `ui-smoke` (needs a windowing leg); not a dependency yet.
 
 ### M12.4 — `cockpit-popover`: frameless floating window
 
@@ -2318,9 +2351,27 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
 
 ### M12.5 — `cockpit-org`: parser, store, view-model
 
-- New crate. Wraps `orgize` (`0.10`+) for parsing. Domain types
+- New crate. Wraps `orgize` for parsing. Domain types
   are thin layers over orgize's AST so we don't fight the upstream
   model:
+  - **Version deviation (M12.5 impl):** pinned to **`orgize 0.9`**
+    (stable), not `0.10`. The only published `0.10` is an
+    `alpha` rewrite with an unstable, undocumented API; the stable
+    `0.9` parses the v0.12 headline grammar (title / keyword /
+    priority / tags) cleanly. Round-trip is unaffected — we never
+    use orgize's serialiser (see the line-range rule below).
+  - **Timestamp deviation (M12.5 impl):** orgize `0.9`'s timestamp
+    parser silently *drops* any stamp carrying a repeater/delay
+    cookie (`<2026-06-01 Mon +1w>` fails to parse, losing the whole
+    `SCHEDULED`). Since the agenda (M12.5b) needs repeaters, the
+    `SCHEDULED:/DEADLINE:/CLOSED:` planning grammar is parsed by a
+    small in-crate parser (`timestamp.rs`) instead. orgize still
+    owns the inline headline grammar.
+  - **Position deviation (M12.5 impl):** orgize `0.9` exposes no
+    source ranges, so `line_range`s are computed by scanning
+    headline lines (`^\*+(space|eol)`) and zipping them, in
+    document order, against orgize's pre-order headlines (1:1 for
+    the v0.12 subset, which has no code/example blocks).
   - `OrgFile { path, content_hash, headings: Vec<Heading> }`.
   - `Heading { level, title, todo_state, tags, scheduled,
     deadline, body, children, line_range }`.
@@ -2395,8 +2446,20 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   ```
 - Substitution tokens (mirrors Emacs `org-capture-templates`):
   - `%?` — cursor position after expansion.
-  - `%U` / `%u` — inactive / active timestamp of now.
-  - `%t` / `%T` — active date / date-time.
+  - `%U` / `%u` — inactive date-time / inactive date.
+  - `%t` / `%T` — active date / active date-time.
+  - **Impl note (M12.5a):** implemented with Emacs semantics — the
+    `u`/`U` pair is *inactive* (`[...]`), the `t`/`T` pair is
+    *active* (`<...>`), and the upper-case member of each pair
+    carries the time. (The earlier prose paired these as
+    "inactive/active timestamp of now", which mislabels the axis;
+    "mirrors Emacs" wins.) `%(...)` resolves via an injected
+    evaluator — the `cockpit-lua` wiring (capability
+    `org.capture.lua`) lands with the jot binary in M12.6; absent an
+    evaluator the token expands to empty. Expansion lives in
+    `cockpit-org::capture`; "now" is an injected `NowStamp`, not the
+    `Clock` trait, keeping the crate hermetic (the binary converts
+    `clock.system_now()` to a calendar value).
   - `%a` — annotation: the editor's `path:line` if a buffer is
     active, otherwise empty. (Cockpit's contribution beyond
     Emacs's `%a`: when capture fires from a launcher action that
@@ -2439,6 +2502,19 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
 - **Tests:** agenda content for a fixture root containing every
   scheduling permutation; today-view against a frozen clock;
   repeater bump on DONE.
+- **Impl notes (M12.5b):** shipped as pure functions in
+  `cockpit-org::agenda` (`today`, `next_7_days`, `todo_list`,
+  `complete`) over the in-memory `OrgRoot`; "today" is an injected
+  `OrgDate`, not a global clock. Calendar arithmetic
+  (`days_from_civil`/`civil_from_days`, weekday lookup, day/week/
+  month/year shifts) lives in `cockpit-org::date` — **no `chrono`
+  dependency**. Repeater bump on DONE handles `+`/`++`/`.+` with
+  `today` as the reference, keeps the keyword in its first open
+  state (Emacs repeat semantics), and rewrites only the timestamp on
+  the planning line. Today view surfaces overdue *scheduled* items
+  too (open + past), not just deadlines. Perf gate is the
+  `agenda_perf` test in `tests/bench.rs`, opt-in behind the crate's
+  `bench` feature (mirrors `cockpit-lua`'s bench gate).
 
 ### M12.6 — Sibling binary `cockpit-jot`
 
@@ -2447,6 +2523,34 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   hosting the Org view-models (M12.5/.5a/.5b), IPC server (M12.1)
   exposing the `org` service so the main cockpit can drive the
   same `OrgRoot`.
+- **Impl note (org service contract):** the `org` service
+  request/response protocol ships ahead of the binary in
+  `cockpit-org::service` — `OrgRequest` (`Reload` / `Today` /
+  `TodoList` / `Complete`) and `OrgResponse` (`Reloaded` / `Agenda`
+  / `Updated` / `Error`), plain `serde` types that ride as the
+  payload of `cockpit_ipc::Envelope`. The pure `handle(&mut OrgRoot,
+  req)` applies a request to the live root and (for `Complete`)
+  returns the new file source for the caller to persist — so the
+  jot-IPC and cockpit-direct-write paths share the same edit
+  primitives and stay byte-identical. An integration test round-trips
+  the messages through the real `cockpit-ipc` CBOR codec. The jot
+  binary's event loop / winit popover that hosts this is the
+  remaining (display-bound) work.
+- **Impl note (controller):** the `cockpit-jot` crate is split into a
+  tested, backend-free `JotController` and a thin glue `main.rs`. The
+  controller owns the live `OrgRoot`, the capture/agenda/overview
+  view-models, and the tray menu, and maps **events** (hotkey, tray,
+  popover keys — `NowStamp` injected) to **intents** (`ShowPopover` /
+  `DismissPopover` / `WriteFile` / `OpenInCockpit` / `Quit`); capture
+  commit files via `apply_capture` and syncs the live root.
+  `loader::{load_root,now_stamp}` is the disk/clock glue (the latter
+  derives the calendar date from `SystemTime` via
+  `cockpit-org::date`, no `chrono`). Until the `ui-smoke` event loop
+  lands, `main.rs` is a headless CLI (`cockpit-jot [--root D]
+  [agenda|overview]`) over the same controller — it loads the root
+  and prints the agenda, proving the wiring without a window. The
+  real `tray-icon` + `global-hotkey` + winit popover loop is the
+  display-bound follow-up.
 - **Default hotkeys** (configurable in `~/.config/cockpit/org.toml`):
   - `Ctrl+O` — **capture** (opens the capture-template picker;
     pressing the template key triggers immediate quick-entry).
@@ -2523,6 +2627,31 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
 - **Tests:** in-cockpit pane scripted edits; IPC + direct-write
   parity on the same fixture; round-trip preservation under
   TOGGLE-TODO + SCHEDULE on a fixture authored in Emacs.
+- **Impl notes (M12.7 headless half):** the buffer ops behind
+  `Org: Toggle TODO State` / `Org: Schedule` / `Org: Deadline` ship
+  as `cockpit-org::{cycle_todo, set_scheduled, set_deadline}` —
+  line-range edits that touch only the headline or planning line
+  (insert a new un-indented planning line when absent, update the
+  stamp in place when present, append the keyword when the planning
+  line exists without it), all byte-identical elsewhere with tests.
+  `Timestamp::{active_date,active_datetime}` build the value the
+  date prompt will supply. The palette command ids + default leader
+  bindings live in `cockpit_ui::org::commands`
+  (`org.capture`/`agenda`/`jump_to_inbox`/`toggle_todo`/`schedule`/
+  `deadline`/`refile`; `<leader>o{c,a,i,t}`). The IPC-vs-direct
+  parity is structural: both paths call the same
+  `cockpit-org` edit primitives (the `org` service's `Complete`
+  returns the identical source a direct `cycle_todo`/`complete`
+  produces). `Org: Refile` also ships headlessly:
+  `cockpit-org::{cut_subtree, paste_subtree, refile}` move a
+  heading's whole subtree (same-file or cross-file), demoting levels
+  to nest under the target and keeping every other line
+  byte-identical. `Language::Org` is recognised by the editor
+  (`cockpit-editor::highlight`, `.org` extension; no LSP entry) —
+  highlight spans await `tree-sitter-org`, the same staged approach
+  as `Ggsql`. Remaining display-bound work: the floating agenda
+  pane, the IPC client wiring, and registering these commands +
+  handlers in the cockpit binary's event loop.
 
 ### M12.8 — Sync (effectively free)
 
@@ -2598,7 +2727,7 @@ once M12.5 is in. M12.6 + M12.7 close the loop.
 |-----------------------------------------------|---------------------------------------------------------|
 | `tray-icon` quirks per OS                     | Stick to the API surface Tauri uses; CI smoke per OS catches regressions. Tray menu kept minimal — 6 items, no nested submenus. |
 | `global-hotkey` chord conflicts               | Detect at register; surface clearly; suggest alternatives in the toast. Never grab a chord behind the user's back. `Ctrl+O` collision with browser/editor "Open file" is documented loudly; users can remap. |
-| `orgize` API drift                            | Pin to a specific minor version; integration tests run against a fixture corpus that triggers every supported feature. Major-version bumps are a milestone-level change. |
+| `orgize` API drift                            | Pinned to stable `0.9` (not the `0.10` alpha); fixture corpus triggers every supported feature. orgize owns only the inline headline grammar — timestamps and positions are parsed in-crate, so an orgize bump can't silently change scheduling/round-trip behaviour. Major-version bumps are a milestone-level change. |
 | Round-trip byte-identical edits drift         | Line-range replacement on the original source buffer (never AST re-emit) + golden fixture corpus authored in Emacs. Property test: parse → mutate-no-op → serialise == input on a generator of fuzzy `.org` strings. |
 | Two writers to the same `.org` file          | The editor's "file changed on disk" toast catches the race; cockpit reloads before overwriting. Plain-text + git-friendly format means worst case is a 3-way merge, not data loss. |
 | Process supervision (jot crashes)             | Tray app is intentionally simple; if it crashes the user notices because the tray icon vanishes. No respawner in v0.12 — out of scope, adds surface for very rare failure. |

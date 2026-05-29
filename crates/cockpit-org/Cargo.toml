@@ -1,0 +1,27 @@
+[package]
+name = "cockpit-org"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Org-mode subset parser, domain model, and line-range edit primitives for the Coding Cockpit jot surface (v0.12)."
+
+[features]
+default = []
+# Opt-in timing gates (agenda perf, M12.5b). Off by default so fast tests stay
+# fast and contributors don't pay flaky wall-clock assertions.
+bench = []
+
+[dependencies]
+# Parse-only: orgize handles the fiddly title/tag/keyword/planning grammar.
+# We deliberately disable default features (`ser` -> serde/indexmap) since we
+# only consume the parsed AST; round-trip is done via our own line-range edits,
+# never orgize's serialiser.
+orgize = { version = "0.9.0", default-features = false }
+serde = { version = "1.0.228", features = ["derive"] }
+
+[dev-dependencies]
+# Proves the OrgRequest/OrgResponse contract rides over the real IPC codec.
+cockpit-ipc.workspace = true
+insta = "1.43.2"
+toml = "0.9.8"

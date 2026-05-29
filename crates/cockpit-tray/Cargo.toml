@@ -1,0 +1,16 @@
+[package]
+name = "cockpit-tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "System-tray menu model, event routing, and a headless fake tray for Coding Cockpit's tray apps (v0.12 M12.2)."
+
+[features]
+default = []
+# The real `tray-icon` backend lands behind this flag once it can be smoke
+# tested on a windowing CI leg. The menu model, event routing, and `FakeTray`
+# are backend-free and tested in the fast leg.
+ui-smoke = []
+
+[dependencies]

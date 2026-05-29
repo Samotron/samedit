@@ -1,0 +1,27 @@
+#+TITLE: Sample org file
+#+FILETAGS: :project:
+
+* Inbox
+  Loose notes land here before they are refiled.
+
+* TODO [#A] Ship v0.12 jot surface          :work:urgent:
+  SCHEDULED: <2026-06-01 Mon>
+  The capture popover and the agenda both hang off this.
+  - parser
+  - capture
+  - agenda
+
+** TODO Wire the global hotkey                :work:
+   DEADLINE: <2026-05-30 Sat 17:00>
+
+** DONE Pick the org parser                   :work:
+   CLOSED: [2026-05-29 Fri 11:24]
+   Settled on orgize 0.9 (stable).
+
+* TODO Weekly review                          :review:
+  SCHEDULED: <2026-05-31 Sun +1w>
+
+* Notes
+  Inactive timestamp here: [2026-05-28 Thu] for the record.
+* Meeting block                               :work:
+  <2026-06-02 Tue 09:00>--<2026-06-02 Tue 10:00>
