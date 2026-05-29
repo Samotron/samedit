@@ -67,6 +67,27 @@ pub struct Timestamp {
 }
 
 impl Timestamp {
+    /// An active, date-only timestamp (`<YYYY-MM-DD Day>`).
+    pub fn active_date(date: OrgDate) -> Self {
+        Timestamp {
+            date,
+            time: None,
+            end_date: None,
+            end_time: None,
+            repeater: None,
+            delay: None,
+            is_active: true,
+        }
+    }
+
+    /// An active timestamp with a time (`<YYYY-MM-DD Day HH:MM>`).
+    pub fn active_datetime(date: OrgDate, time: OrgTime) -> Self {
+        Timestamp {
+            time: Some(time),
+            ..Timestamp::active_date(date)
+        }
+    }
+
     /// `true` if this timestamp carries a repeater cookie.
     pub fn is_repeating(&self) -> bool {
         self.repeater.is_some()

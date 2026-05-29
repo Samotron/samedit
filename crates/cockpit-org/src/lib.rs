@@ -60,7 +60,7 @@ pub use capture::{
 };
 pub use edit::{
     byte_offset_of_line, cycle_todo, insert_at_line, replace_line_content, replace_line_range,
-    set_todo,
+    set_deadline, set_scheduled, set_todo,
 };
 pub use keywords::Keywords;
 pub use model::{Heading, OrgFile};

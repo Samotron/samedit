@@ -381,7 +381,7 @@ pub fn complete(source: &str, heading: &Heading, keywords: &Keywords, today: Org
         AgendaKind::Deadline => "DEADLINE:",
         AgendaKind::Todo => unreachable!("planning stamps are dated"),
     };
-    let new_line = replace_stamp_after(plan_line, keyword, &bumped.format());
+    let new_line = crate::edit::replace_stamp_after(plan_line, keyword, &bumped.format());
     let mut out = replace_line_content(source, plan_idx, &new_line);
 
     // Reset the keyword to the first open state so the task recurs.
@@ -390,29 +390,6 @@ pub fn complete(source: &str, heading: &Heading, keywords: &Keywords, today: Org
         out = set_todo(&out, heading, keywords, reset);
     }
     out
-}
-
-/// Replace the first `<...>` / `[...]` timestamp following `keyword` in `line`
-/// with `new_stamp`, leaving everything else byte-identical.
-fn replace_stamp_after(line: &str, keyword: &str, new_stamp: &str) -> String {
-    let Some(kw_pos) = line.find(keyword) else {
-        return line.to_string();
-    };
-    let after = &line[kw_pos + keyword.len()..];
-    let Some(rel_open) = after.find(['<', '[']) else {
-        return line.to_string();
-    };
-    let open_byte = kw_pos + keyword.len() + rel_open;
-    let close_char = if line.as_bytes()[open_byte] == b'<' {
-        '>'
-    } else {
-        ']'
-    };
-    let Some(rel_close) = line[open_byte..].find(close_char) else {
-        return line.to_string();
-    };
-    let close_byte = open_byte + rel_close + 1; // inclusive of the closing bracket
-    format!("{}{}{}", &line[..open_byte], new_stamp, &line[close_byte..])
 }
 
 #[cfg(test)]

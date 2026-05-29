@@ -12,6 +12,7 @@ use std::path::Path;
 
 use orgize::{Org, ParseConfig};
 
+use crate::edit::is_planning_line;
 use crate::keywords::Keywords;
 use crate::model::{Heading, OrgFile};
 use crate::timestamp::{Timestamp, parse_timestamp};
@@ -171,11 +172,6 @@ fn section_body(source: &str, start: usize, end: usize) -> String {
     }
     let body_lines = &lines[idx..end.min(lines.len())];
     body_lines.join("\n").trim_end().to_string()
-}
-
-fn is_planning_line(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("SCHEDULED:") || t.starts_with("DEADLINE:") || t.starts_with("CLOSED:")
 }
 
 /// Turn a flat, document-ordered heading list into a nested tree using levels.

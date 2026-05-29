@@ -2627,6 +2627,25 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
 - **Tests:** in-cockpit pane scripted edits; IPC + direct-write
   parity on the same fixture; round-trip preservation under
   TOGGLE-TODO + SCHEDULE on a fixture authored in Emacs.
+- **Impl notes (M12.7 headless half):** the buffer ops behind
+  `Org: Toggle TODO State` / `Org: Schedule` / `Org: Deadline` ship
+  as `cockpit-org::{cycle_todo, set_scheduled, set_deadline}` —
+  line-range edits that touch only the headline or planning line
+  (insert a new un-indented planning line when absent, update the
+  stamp in place when present, append the keyword when the planning
+  line exists without it), all byte-identical elsewhere with tests.
+  `Timestamp::{active_date,active_datetime}` build the value the
+  date prompt will supply. The palette command ids + default leader
+  bindings live in `cockpit_ui::org::commands`
+  (`org.capture`/`agenda`/`jump_to_inbox`/`toggle_todo`/`schedule`/
+  `deadline`/`refile`; `<leader>o{c,a,i,t}`). The IPC-vs-direct
+  parity is structural: both paths call the same
+  `cockpit-org` edit primitives (the `org` service's `Complete`
+  returns the identical source a direct `cycle_todo`/`complete`
+  produces). Remaining display-bound work: the `Language::Org`
+  highlight arm, the floating agenda pane, the IPC client wiring,
+  `Org: Refile` (cross-file subtree move), and registering these
+  commands in the cockpit binary.
 
 ### M12.8 — Sync (effectively free)
 

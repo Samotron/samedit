@@ -528,6 +528,48 @@ impl CaptureView {
     }
 }
 
+// ---- palette commands (M12.7) -----------------------------------------------
+
+/// Org palette command ids and their default leader keybindings.
+///
+/// The main cockpit registers these with the command registry and binds the
+/// leader chords (M8.2 leader path). Schedule / Deadline / Refile are
+/// palette-only (no default chord). The actual handlers live in the binary and
+/// call into [`cockpit_org`] (`run_capture`, `cycle_todo`, `set_scheduled`,
+/// `set_deadline`, agenda view-models).
+pub mod commands {
+    /// `(command_id, leader_chord)` for the org commands that have a default
+    /// binding (plan M12.7).
+    pub const CAPTURE: &str = "org.capture";
+    pub const AGENDA: &str = "org.agenda";
+    pub const JUMP_TO_INBOX: &str = "org.jump_to_inbox";
+    pub const TOGGLE_TODO: &str = "org.toggle_todo";
+    pub const SCHEDULE: &str = "org.schedule";
+    pub const DEADLINE: &str = "org.deadline";
+    pub const REFILE: &str = "org.refile";
+
+    /// Every org command id, for palette registration.
+    pub const ALL: &[&str] = &[
+        CAPTURE,
+        AGENDA,
+        JUMP_TO_INBOX,
+        TOGGLE_TODO,
+        SCHEDULE,
+        DEADLINE,
+        REFILE,
+    ];
+
+    /// Default leader keybindings as `(chord, command_id)` pairs (plan M12.7).
+    pub fn leader_keybindings() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("<leader>oc", CAPTURE),
+            ("<leader>oa", AGENDA),
+            ("<leader>oi", JUMP_TO_INBOX),
+            ("<leader>ot", TOGGLE_TODO),
+        ]
+    }
+}
+
 // ---- helpers -----------------------------------------------------------------
 
 fn file_name(path: &Path) -> String {
@@ -718,6 +760,22 @@ mod tests {
         view.move_left();
         view.insert_char('z');
         assert_eq!(view.buffer(), "* TODO zx :inbox:");
+    }
+
+    #[test]
+    fn org_commands_have_unique_ids_and_leader_bindings() {
+        // Ids are unique.
+        let mut ids = commands::ALL.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), commands::ALL.len());
+
+        // Every leader binding points at a known command id, all under `o`.
+        for (chord, id) in commands::leader_keybindings() {
+            assert!(chord.starts_with("<leader>o"), "unexpected chord {chord}");
+            assert!(commands::ALL.contains(id), "unknown id {id}");
+        }
+        assert_eq!(commands::leader_keybindings().len(), 4);
     }
 
     #[test]
