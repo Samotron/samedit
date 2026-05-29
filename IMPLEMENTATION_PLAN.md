@@ -2413,8 +2413,20 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   ```
 - Substitution tokens (mirrors Emacs `org-capture-templates`):
   - `%?` — cursor position after expansion.
-  - `%U` / `%u` — inactive / active timestamp of now.
-  - `%t` / `%T` — active date / date-time.
+  - `%U` / `%u` — inactive date-time / inactive date.
+  - `%t` / `%T` — active date / active date-time.
+  - **Impl note (M12.5a):** implemented with Emacs semantics — the
+    `u`/`U` pair is *inactive* (`[...]`), the `t`/`T` pair is
+    *active* (`<...>`), and the upper-case member of each pair
+    carries the time. (The earlier prose paired these as
+    "inactive/active timestamp of now", which mislabels the axis;
+    "mirrors Emacs" wins.) `%(...)` resolves via an injected
+    evaluator — the `cockpit-lua` wiring (capability
+    `org.capture.lua`) lands with the jot binary in M12.6; absent an
+    evaluator the token expands to empty. Expansion lives in
+    `cockpit-org::capture`; "now" is an injected `NowStamp`, not the
+    `Clock` trait, keeping the crate hermetic (the binary converts
+    `clock.system_now()` to a calendar value).
   - `%a` — annotation: the editor's `path:line` if a buffer is
     active, otherwise empty. (Cockpit's contribution beyond
     Emacs's `%a`: when capture fires from a launcher action that
@@ -2457,6 +2469,19 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
 - **Tests:** agenda content for a fixture root containing every
   scheduling permutation; today-view against a frozen clock;
   repeater bump on DONE.
+- **Impl notes (M12.5b):** shipped as pure functions in
+  `cockpit-org::agenda` (`today`, `next_7_days`, `todo_list`,
+  `complete`) over the in-memory `OrgRoot`; "today" is an injected
+  `OrgDate`, not a global clock. Calendar arithmetic
+  (`days_from_civil`/`civil_from_days`, weekday lookup, day/week/
+  month/year shifts) lives in `cockpit-org::date` — **no `chrono`
+  dependency**. Repeater bump on DONE handles `+`/`++`/`.+` with
+  `today` as the reference, keeps the keyword in its first open
+  state (Emacs repeat semantics), and rewrites only the timestamp on
+  the planning line. Today view surfaces overdue *scheduled* items
+  too (open + past), not just deadlines. Perf gate is the
+  `agenda_perf` test in `tests/bench.rs`, opt-in behind the crate's
+  `bench` feature (mirrors `cockpit-lua`'s bench gate).
 
 ### M12.6 — Sibling binary `cockpit-jot`
 

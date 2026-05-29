@@ -67,6 +67,42 @@ impl Timestamp {
     pub fn is_repeating(&self) -> bool {
         self.repeater.is_some()
     }
+
+    /// `true` if this is a range timestamp (`<a>--<b>` or a same-day time
+    /// range).
+    pub fn is_range(&self) -> bool {
+        self.end_date.is_some()
+    }
+
+    /// Render a single (non-range) timestamp back to Org syntax, recomputing the
+    /// weekday from the (possibly shifted) date:
+    /// `<YYYY-MM-DD Day[ HH:MM][ repeater][ delay]>`. Range timestamps are
+    /// formatted by start only — the bump path never serialises a range.
+    pub fn format(&self) -> String {
+        let (open, close) = if self.is_active {
+            ('<', '>')
+        } else {
+            ('[', ']')
+        };
+        let OrgDate { year, month, day } = self.date;
+        let mut s = format!(
+            "{open}{year:04}-{month:02}-{day:02} {dn}",
+            dn = crate::date::weekday_abbr(self.date)
+        );
+        if let Some(t) = self.time {
+            s.push_str(&format!(" {:02}:{:02}", t.hour, t.minute));
+        }
+        if let Some(r) = &self.repeater {
+            s.push(' ');
+            s.push_str(r);
+        }
+        if let Some(de) = &self.delay {
+            s.push(' ');
+            s.push_str(de);
+        }
+        s.push(close);
+        s
+    }
 }
 
 /// Parse a single Org timestamp from the start of `s`. Returns `None` if `s`

@@ -39,7 +39,9 @@
 //! recorded in `IMPLEMENTATION_PLAN.md`. Round-trip is unaffected because we
 //! never use orgize's serialiser — only its parser.
 
+pub mod agenda;
 pub mod capture;
+pub mod date;
 pub mod edit;
 pub mod keywords;
 pub mod model;
@@ -47,6 +49,10 @@ pub mod parse;
 pub mod store;
 pub mod timestamp;
 
+pub use agenda::{
+    AgendaDay, AgendaFileGroup, AgendaItem, AgendaKind, Filter, complete, next_7_days, today,
+    todo_list,
+};
 pub use capture::{
     CaptureContext, CaptureOutcome, CaptureTarget, CaptureTemplate, Expansion, NowStamp, OrgConfig,
     apply_capture, expand, expand_with, run_capture,
