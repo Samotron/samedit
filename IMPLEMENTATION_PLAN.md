@@ -2348,6 +2348,24 @@ Out of scope (explicit non-goals; revisit via v0.12.x as users ask):
   The jot app and the launcher each provide an impl.
 - **Tests:** unit on `PopoverContent` impls (headless); smoke on
   the real window behind `ui-smoke`.
+- **Impl notes (M12.4 headless half):** the painter + theme extraction
+  shipped as the new headless `cockpit-paint` crate — `theme` (`Color`,
+  `SyntaxTheme`, `Theme`) and `painter` (`Painter`, `Rect`, `TextRun`,
+  `DrawCommand`, `RectBatch`) moved verbatim out of `cockpit-render`,
+  which now re-exports them under their original module paths
+  (`cockpit_render::{painter, theme}`) so every existing caller compiles
+  unchanged. `cockpit-paint` depends only on `cockpit-commands` (for the
+  `KeyChord` the popover trait consumes) — no `winit`/`glow` — so the
+  sibling popover binaries paint with the same primitives and share the
+  on-disk glyph atlas. The `PopoverContent` trait (`theme` / `tick` /
+  `paint` / `on_key` / `on_text` / `wants_exit`) + `PopoverViewport`
+  live in `cockpit_paint::popover`; `on_key` returns whether the content
+  consumed the chord, and the pure `esc_should_dismiss(consumed, chord)`
+  helper encodes the "unconsumed bare `Escape` dismisses" shell policy
+  (focus-loss dismissal stays the shell's concern). A reference
+  `PopoverContent` impl in the unit tests exercises every method.
+  Remaining display-bound work: the `winit`+`glow` popover shell that
+  hosts a `PopoverContent`, and the concrete jot/launcher content impls.
 
 ### M12.5 — `cockpit-org`: parser, store, view-model
 

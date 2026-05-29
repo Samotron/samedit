@@ -817,6 +817,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-paint"
+version = "0.0.1"
+dependencies = [
+ "cockpit-commands",
+]
+
+[[package]]
 name = "cockpit-project"
 version = "0.0.1"
 dependencies = [
@@ -834,6 +841,7 @@ name = "cockpit-render"
 version = "0.0.1"
 dependencies = [
  "cockpit-commands",
+ "cockpit-paint",
  "cosmic-text",
  "directories",
  "etagere",
