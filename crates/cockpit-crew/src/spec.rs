@@ -96,10 +96,12 @@ pub struct CrewPlan {
 
 impl CrewPlan {
     /// Stamp out a [`CrewRun`] for `run_id`. Each agent gets a unique branch
-    /// `<prefix>/r<run>/<index>-<name>` and a worktree
-    /// `<worktree_root>/r<run>-<index>-<name>`, with its command resolved
+    /// `<prefix>/r<run>/<index>-<slug>` and a worktree
+    /// `<worktree_root>/r<run>-<index>-<slug>`, with its command resolved
     /// against those values. The index keeps names unique even when two
-    /// agents share a `name`.
+    /// agents share a `name`; the slug ([`slugify`]) keeps an arbitrary
+    /// config-supplied name a valid git ref and path component. The agent's
+    /// raw `name` is still carried verbatim for display.
     pub fn materialise(&self, run_id: RunId) -> CrewRun {
         let run = run_id.get();
         let base = self.task.base.as_git_ref();
@@ -108,7 +110,7 @@ impl CrewPlan {
             .iter()
             .enumerate()
             .map(|(index, spec)| {
-                let slug = format!("{index}-{}", spec.name);
+                let slug = format!("{index}-{}", slugify(&spec.name));
                 let branch = format!("{}/r{run}/{slug}", self.branch_prefix);
                 let worktree = self.worktree_root.join(format!("r{run}-{slug}"));
                 let command = spec.resolve(&Placeholders {
@@ -127,6 +129,35 @@ impl CrewPlan {
             })
             .collect();
         CrewRun::new(run_id, self.task.clone(), agents)
+    }
+}
+
+/// Sanitise an agent name into a slug that is safe as both a git ref
+/// component and a filesystem path component.
+///
+/// Keeps ASCII alphanumerics, `_`, and `-`; every other character (spaces,
+/// `/`, `:`, `~`, `^`, `.`, control chars, …) becomes a single `-`, with
+/// runs collapsed and the ends trimmed. An empty or all-punctuation name
+/// falls back to `agent`, so the surrounding `<index>-<slug>` component is
+/// always a non-empty, valid git ref. Plain names like `claude` pass
+/// through untouched.
+fn slugify(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut pending_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            slug.push(ch);
+            pending_dash = false;
+        } else if !pending_dash {
+            slug.push('-');
+            pending_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "agent".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -203,6 +234,47 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, ["exec", "add a feature"]);
+    }
+
+    #[test]
+    fn slugify_keeps_plain_names_and_sanitises_the_rest() {
+        assert_eq!(slugify("claude"), "claude");
+        assert_eq!(slugify("gpt-4o_mini"), "gpt-4o_mini");
+        // Spaces and ref-unsafe punctuation collapse to single dashes.
+        assert_eq!(slugify("My Agent"), "My-Agent");
+        assert_eq!(slugify("claude:v2"), "claude-v2");
+        assert_eq!(slugify("a/b~c^d"), "a-b-c-d");
+        // Dots never survive, so `..`, trailing `.`, and `.lock` can't form.
+        assert_eq!(slugify("v1.2..lock"), "v1-2-lock");
+        // Leading/trailing junk is trimmed; an empty result falls back.
+        assert_eq!(slugify("  spaced  "), "spaced");
+        assert_eq!(slugify("***"), "agent");
+        assert_eq!(slugify(""), "agent");
+    }
+
+    #[test]
+    fn materialise_sanitises_unsafe_names_into_branch_and_worktree() {
+        let plan = CrewPlan {
+            task: CrewTask::new("do it"),
+            agents: vec![AgentSpec::new(
+                "Claude: v2",
+                "claude",
+                vec!["-p".into(), "{prompt}".into()],
+            )],
+            worktree_root: PathBuf::from("/cache/crew"),
+            branch_prefix: "crew".into(),
+        };
+        let run = plan.materialise(RunId::new(3));
+        let agent = &run.agents()[0];
+
+        // The branch and worktree slug are git-ref / path safe...
+        assert_eq!(agent.branch(), "crew/r3/0-Claude-v2");
+        assert_eq!(
+            agent.worktree(),
+            &PathBuf::from("/cache/crew/r3-0-Claude-v2")
+        );
+        // ...while the raw name is preserved for display.
+        assert_eq!(agent.agent(), "Claude: v2");
     }
 
     #[test]
