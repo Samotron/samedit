@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 # Internal crates — referenced by members as `cockpit-foo.workspace = true`.
 cockpit-config = { path = "crates/cockpit-config" }
 cockpit-commands = { path = "crates/cockpit-commands" }
+cockpit-crew = { path = "crates/cockpit-crew" }
 cockpit-project = { path = "crates/cockpit-project" }
 cockpit-quick = { path = "crates/cockpit-quick" }
 cockpit-editor = { path = "crates/cockpit-editor" }

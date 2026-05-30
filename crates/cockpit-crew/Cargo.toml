@@ -1,0 +1,20 @@
+[package]
+name = "cockpit-crew"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless core for v0.14 agent crews: run several coding agents in parallel, each in an isolated git worktree, then review diffs and pick a winner (M14.1–M14.3)."
+
+[lib]
+name = "cockpit_crew"
+path = "src/lib.rs"
+
+[dependencies]
+cockpit-config.workspace = true
+cockpit-project.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+
+[dev-dependencies]
+cockpit-commands.workspace = true
