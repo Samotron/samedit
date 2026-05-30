@@ -1172,22 +1172,33 @@ running upstream CLIs the user already has. That is the whole point.
 - Side-right and bottom slotted layouts still type the command into
   the active pane today — dedicated docked panes are a follow-up.
 - ✅ Leader chord support: `keys.global.leader` (default `Space`) is
-  substituted into recipe keybinds, so the default `<leader>g`
-  Lazygit binding becomes the two-stroke chord `Space g` and fires
-  from the keymap without needing the palette.
-- ✅ Leader ("which-key") menu: pressing the leader outside the
-  terminal opens a Doom-/Spacemacs-style overlay (`cockpit_ui::LeaderMenu`,
-  painted bottom-anchored by `paint_leader_menu`) listing the keys
-  available for the next stroke. Pressing a key drills into a curated
-  group (`File…`, `Window…`, `Code…`, `Test…`, `Project…`, `HTTP…`,
-  `Theme…`, …) or dispatches a `CommandId` through the single command
-  spine; `Backspace` pops a level and `Esc` cancels. Every `<leader>…`
-  chord registered on the global keymap (tool-pane recipes such as
-  `<leader>g` lazygit, `<leader>aa`/`<leader>ac` agents, Lua binds) is
-  merged into the tree, so multi-stroke binds are now reachable and
-  discoverable — not just the two-stroke ones the old buffered path
-  could resolve. Tools that don't carry a real `<leader>` substitution
-  still work via their palette entry.
+  substituted into recipe keybinds. The compact Doom notation expands
+  to a full chord — `<leader>g` → `Space g`, `<leader>aa` → `Space a a`
+  — so multi-key sequences bind and fire correctly from the keymap.
+  HTTP command binds use the same `<leader>` notation (`<leader>hs`,
+  `<leader>he`, `<leader>h1..h4`) so they follow a rebound leader
+  instead of hardcoding `Space`.
+- ✅ Leader ("which-key") menu: pressing the leader opens a
+  Doom-/Spacemacs-style overlay (`cockpit_ui::LeaderMenu`, painted
+  bottom-anchored by `paint_leader_menu`) listing the keys available
+  for the next stroke. It is the single leader system — gated by
+  `AppModel::leader_opens_menu` so it fires in the file browser and in
+  the editor's Normal/Visual modes, never stealing a literal space
+  while typing (Insert/Replace/Command/Search) and always passing
+  through to a focused terminal. The tree uses the familiar Doom
+  prefixes — `f` File, `c` Code, `w` Window (pane focus on `h/j/l`
+  mirroring the global `Ctrl+h/j/l`), `t` Toggle, `r` Run, `q` Quit —
+  plus cockpit's own `h` HTTP, `n` Notebook, and (merged) `g` Git and
+  `a` AI. Each key is unique per level and no command is duplicated
+  across groups. Pressing a key drills into a group or dispatches a
+  `CommandId` through the single command spine; `Backspace` pops a
+  level and `Esc` cancels. Every `<leader>…` chord on the global
+  keymap (tool recipes `<leader>g` lazygit, `<leader>aa`/`<leader>ac`
+  agents, HTTP binds, Lua binds) is merged into the tree, so binds are
+  reachable and discoverable. The editor's old `Space`-prefixed
+  `<leader>c…` FSM was removed — those code bindings now live in the
+  menu's `Code…` group; native `gd` (definition) and `K` (hover) stay
+  as Vim normal-mode binds that don't collide with the leader.
 - Mux gains two primitives on top of M7.4's split tree:
   - **Floating pane** — overlay rectangle centred over the project,
     sized 80% × 80%, drawn above the regular layout. Single floating

@@ -836,15 +836,17 @@ pub fn script_warnings(view: &HttpView, http_scripts_granted: bool) -> Vec<Strin
 /// Default key chords for the M11.5 HTTP commands, as `(chord, command_id)`
 /// pairs ready to feed `InputRouter::bind_extra_chord`. Kept here so the
 /// binary doesn't hardcode chord strings — config layers (M11.5.x) can
-/// override by re-binding the same command id.
+/// override by re-binding the same command id. The `<leader>` prefix is
+/// substituted with the configured leader key by the binary, matching the
+/// tool-recipe convention so HTTP binds follow a rebound leader.
 pub fn default_keybindings() -> &'static [(&'static str, &'static str)] {
     &[
-        ("Space h s", command_ids::SEND_REQUEST),
-        ("Space h e", command_ids::SWITCH_ENVIRONMENT),
-        ("Space h 1", command_ids::TAB_BODY),
-        ("Space h 2", command_ids::TAB_HEADERS),
-        ("Space h 3", command_ids::TAB_TIMING),
-        ("Space h 4", command_ids::TAB_RAW),
+        ("<leader>hs", command_ids::SEND_REQUEST),
+        ("<leader>he", command_ids::SWITCH_ENVIRONMENT),
+        ("<leader>h1", command_ids::TAB_BODY),
+        ("<leader>h2", command_ids::TAB_HEADERS),
+        ("<leader>h3", command_ids::TAB_TIMING),
+        ("<leader>h4", command_ids::TAB_RAW),
     ]
 }
 

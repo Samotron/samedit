@@ -405,9 +405,6 @@ pub struct AppModel {
     /// Tracks a pending `g` in the editor pane so local `gd` can dispatch LSP
     /// definition while non-LSP Vim chords like `gg` still reach the Vim FSM.
     editor_pending_g: bool,
-    /// Tracks `<leader>c` in the editor pane so `<leader>ca` can dispatch the
-    /// quick-fix command without adding a parallel command path.
-    editor_pending_leader: u8,
     /// Tracks a pending `g` while in mux copy mode so `gg` can jump to the
     /// top of the scrollback (M7.6).
     mux_copy_pending_g: bool,
@@ -603,7 +600,6 @@ impl AppModel {
             http_batch_total: 0,
             analytics: None,
             editor_pending_g: false,
-            editor_pending_leader: 0,
             mux_copy_pending_g: false,
             mux_copy_yank: None,
             mux_pane_commands: HashMap::new(),
@@ -1038,10 +1034,13 @@ impl AppModel {
             return;
         }
         // v0.8 M8.2: leader-key support. Pressing the configured leader
-        // (default `Space`) outside the terminal opens the Doom-style leader
-        // menu, surfacing the keys available for the next stroke.
-        if focused != PaneId::Terminal
-            && self.leader_chord.is_some()
+        // (default `Space`) opens the Doom-style leader menu, surfacing the
+        // keys available for the next stroke. Gated by [`leader_opens_menu`]
+        // so the leader never steals a literal space while typing in the
+        // editor (Insert/Replace/Command/Search) or passes through to a focused
+        // terminal.
+        if self.leader_chord.is_some()
+            && self.leader_opens_menu(focused)
             && leader_stroke_match(&chord, self.leader_chord.as_deref()).is_some()
         {
             self.open_leader_menu();
@@ -2088,11 +2087,13 @@ impl AppModel {
     /// (palette dispatch still works) — same policy as tool-recipe
     /// chord binding.
     fn bind_http_chords(&mut self) {
+        let leader = self.leader_chord.clone();
         for (chord, command) in http_default_keybindings() {
-            if let Err(err) = self.router.bind_extra_chord(chord, *command) {
+            let resolved = substitute_leader(chord, leader.as_deref());
+            if let Err(err) = self.router.bind_extra_chord(&resolved, *command) {
                 tracing::debug!(
                     ?err,
-                    chord = %chord,
+                    chord = %resolved,
                     command = %command,
                     "http command keybind not bound (parser/conflict)",
                 );
@@ -2680,6 +2681,31 @@ impl AppModel {
         }
     }
 
+    /// Whether a leader press in the focused pane should open the menu.
+    ///
+    /// The terminal swallows the leader (it is a normal key for the child
+    /// process). In the editor the leader only acts as leader in the modes
+    /// where the key is not literal text — Normal and Visual — so a space typed
+    /// in Insert/Replace/Command/Search reaches the buffer instead of opening
+    /// the menu. With no document open the editor has nothing to type, so the
+    /// leader is free to open the menu.
+    fn leader_opens_menu(&self, focused: PaneId) -> bool {
+        match focused {
+            PaneId::Files => true,
+            PaneId::Terminal => false,
+            PaneId::Editor => self
+                .document
+                .as_ref()
+                .map(|doc| {
+                    matches!(
+                        doc.editor.mode(),
+                        Mode::Normal | Mode::Visual | Mode::VisualLine
+                    )
+                })
+                .unwrap_or(true),
+        }
+    }
+
     /// Open the Doom-style leader ("which-key") menu over the workspace.
     ///
     /// The tree mixes a curated set of grouped commands with any
@@ -3233,36 +3259,13 @@ impl AppModel {
             .as_ref()
             .is_some_and(|doc| doc.editor.mode() == Mode::Normal);
         if normal_mode {
+            // Native Vim/LSP normal-mode binds that don't collide with the
+            // leader: `K` shows hover, `gd` jumps to definition. The
+            // `<leader>c…` code bindings live in the global leader menu's
+            // `Code…` group, dispatched through the single command spine.
             if is_chord(chord, "K") {
                 self.editor_pending_g = false;
-                self.editor_pending_leader = 0;
                 self.run_command(LSP_SHOW_HOVER);
-                return;
-            }
-            if self.editor_pending_leader == 2 {
-                self.editor_pending_leader = 0;
-                if is_chord(chord, "a") {
-                    self.editor_pending_g = false;
-                    self.run_command(LSP_CODE_ACTION);
-                    return;
-                }
-                if is_chord(chord, "r") {
-                    self.editor_pending_g = false;
-                    self.run_command(LSP_RENAME);
-                    return;
-                }
-            }
-            if self.editor_pending_leader == 1 {
-                self.editor_pending_leader = 0;
-                if is_chord(chord, "c") {
-                    self.editor_pending_leader = 2;
-                    self.editor_pending_g = false;
-                    return;
-                }
-            }
-            if is_chord(chord, "Space") {
-                self.editor_pending_leader = 1;
-                self.editor_pending_g = false;
                 return;
             }
             let mut replayed_pending = false;
@@ -3281,7 +3284,6 @@ impl AppModel {
             }
         } else {
             self.editor_pending_g = false;
-            self.editor_pending_leader = 0;
         }
         let Some(key) = chord_to_vim_key(chord) else {
             return;
@@ -6177,9 +6179,15 @@ fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
 }
 
-/// Replace `<leader>` in `keybind` with the configured leader chord plus a
-/// space, so `<leader>g` becomes `Space g` when the leader is `Space`. Acts
-/// as a no-op when no leader is configured.
+/// Expand a `<leader>`-prefixed keybind into a full space-separated chord.
+///
+/// The leader prefix becomes the configured leader stroke and each following
+/// character becomes its own single-key stroke, so the compact Doom notation
+/// `<leader>aa` becomes the three-stroke chord `Space a a` (and `<leader>g`
+/// becomes `Space g`). Keybinds without a `<leader>` prefix, and any keybind
+/// when no leader is configured, are returned unchanged. Whitespace already in
+/// the trailing part is ignored so `<leader>h s` and `<leader>hs` are
+/// equivalent.
 fn substitute_leader(keybind: &str, leader: Option<&str>) -> String {
     let Some(leader) = leader else {
         return keybind.to_string();
@@ -6187,7 +6195,16 @@ fn substitute_leader(keybind: &str, leader: Option<&str>) -> String {
     if leader.is_empty() {
         return keybind.to_string();
     }
-    keybind.replace("<leader>", &format!("{leader} "))
+    let Some(rest) = keybind.strip_prefix("<leader>") else {
+        return keybind.to_string();
+    };
+    let mut strokes = vec![leader.to_string()];
+    strokes.extend(
+        rest.chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| c.to_string()),
+    );
+    strokes.join(" ")
 }
 
 /// Match a single-stroke `chord` against the configured leader chord string.
@@ -6998,7 +7015,11 @@ fn palette_entries() -> Vec<PaletteEntry> {
 }
 
 /// The curated, hand-grouped leader menu — a Doom/Spacemacs-style tree of the
-/// most-reached commands. Tool-pane recipes and Lua binds are merged on top by
+/// most-reached commands, using the familiar prefixes (`f` file, `c` code,
+/// `w` window, `t` toggle, `p` project, `g` git, `q` quit) plus cockpit's own
+/// (`r` run, `h` http, `n` notebook, `a` AI). Each key appears at most once per
+/// level and no command is duplicated across groups. Tool-pane recipes and Lua
+/// binds (`g` lazygit, `a` agents, `h` tabs) are merged on top by
 /// [`AppModel::merge_keymap_leader_chords`].
 fn curated_leader_items() -> Vec<LeaderItem> {
     vec![
@@ -7006,38 +7027,8 @@ fn curated_leader_items() -> Vec<LeaderItem> {
             "f",
             "File…",
             vec![
+                LeaderItem::command("f", "Find File", command_ids::FUZZY_OPEN),
                 LeaderItem::command("s", "Save", command_ids::SAVE),
-                LeaderItem::command("o", "Open File", command_ids::FUZZY_OPEN),
-                LeaderItem::command("r", "Format Document", EDITOR_FORMAT),
-            ],
-        ),
-        LeaderItem::group(
-            "b",
-            "Focus…",
-            vec![
-                LeaderItem::command("f", "Files", command_ids::FOCUS_FILES),
-                LeaderItem::command("e", "Editor", command_ids::FOCUS_EDITOR),
-                LeaderItem::command("t", "Terminal", command_ids::FOCUS_TERMINAL),
-            ],
-        ),
-        LeaderItem::group(
-            "v",
-            "View…",
-            vec![
-                LeaderItem::command("f", "Toggle Files Pane", command_ids::TOGGLE_FILES),
-                LeaderItem::command("t", "Toggle Terminal Pane", command_ids::TOGGLE_TERMINAL),
-            ],
-        ),
-        LeaderItem::group(
-            "w",
-            "Window…",
-            vec![
-                LeaderItem::command("v", "Split Vertical", mux_command_ids::SPLIT_VERTICAL),
-                LeaderItem::command("s", "Split Horizontal", mux_command_ids::SPLIT_HORIZONTAL),
-                LeaderItem::command("n", "New Window", mux_command_ids::NEW_WINDOW),
-                LeaderItem::command("d", "Kill Pane", mux_command_ids::KILL_PANE),
-                LeaderItem::command("z", "Zoom Pane", mux_command_ids::ZOOM_PANE),
-                LeaderItem::command("o", "Next Pane", mux_command_ids::NEXT_PANE),
             ],
         ),
         LeaderItem::group(
@@ -7045,28 +7036,48 @@ fn curated_leader_items() -> Vec<LeaderItem> {
             "Code…",
             vec![
                 LeaderItem::command("d", "Go to Definition", LSP_GOTO_DEFINITION),
-                LeaderItem::command("k", "Show Hover", LSP_SHOW_HOVER),
+                LeaderItem::command("k", "Show Documentation", LSP_SHOW_HOVER),
                 LeaderItem::command("r", "Rename Symbol", LSP_RENAME),
                 LeaderItem::command("a", "Code Action", LSP_CODE_ACTION),
-                LeaderItem::command("f", "Format Document", EDITOR_FORMAT),
+                LeaderItem::command("f", "Format Buffer", EDITOR_FORMAT),
+            ],
+        ),
+        LeaderItem::group(
+            "w",
+            "Window…",
+            vec![
+                // Pane focus mirrors the global Ctrl+h/j/l shortcuts.
+                LeaderItem::command("h", "Focus Files", command_ids::FOCUS_FILES),
+                LeaderItem::command("j", "Focus Editor", command_ids::FOCUS_EDITOR),
+                LeaderItem::command("l", "Focus Terminal", command_ids::FOCUS_TERMINAL),
+                LeaderItem::command("v", "Split Vertical", mux_command_ids::SPLIT_VERTICAL),
+                LeaderItem::command("s", "Split Horizontal", mux_command_ids::SPLIT_HORIZONTAL),
+                LeaderItem::command("n", "New Window", mux_command_ids::NEW_WINDOW),
+                LeaderItem::command("d", "Close Pane", mux_command_ids::KILL_PANE),
+                LeaderItem::command("z", "Zoom Pane", mux_command_ids::ZOOM_PANE),
+                LeaderItem::command("o", "Other Pane", mux_command_ids::NEXT_PANE),
             ],
         ),
         LeaderItem::group(
             "t",
-            "Test…",
+            "Toggle…",
             vec![
-                LeaderItem::command("a", "Run All", TEST_RUN_ALL),
-                LeaderItem::command("f", "Run Current File", TEST_RUN_CURRENT_FILE),
-                LeaderItem::command("n", "Run Nearest", TEST_RUN_NEAREST),
+                LeaderItem::command("f", "Files Pane", command_ids::TOGGLE_FILES),
+                LeaderItem::command("t", "Terminal Pane", command_ids::TOGGLE_TERMINAL),
+                LeaderItem::command("s", "Format on Save", EDITOR_TOGGLE_FORMAT_ON_SAVE),
             ],
         ),
         LeaderItem::group(
-            "p",
-            "Project…",
+            "r",
+            "Run…",
             vec![
-                LeaderItem::command("p", "Command Palette", command_ids::COMMAND_PALETTE),
-                LeaderItem::command("f", "Find File", command_ids::FUZZY_OPEN),
-                LeaderItem::command("t", "Run Mise Task", MISE_RUN_TASK),
+                LeaderItem::command("t", "Mise Task", MISE_RUN_TASK),
+                LeaderItem::command("a", "All Tests", TEST_RUN_ALL),
+                LeaderItem::command("f", "File Tests", TEST_RUN_CURRENT_FILE),
+                LeaderItem::command("n", "Nearest Test", TEST_RUN_NEAREST),
+                LeaderItem::command("g", "Go Generate", GO_GENERATE),
+                LeaderItem::command("b", "Build Models", MODELS_BUILD_ALL),
+                LeaderItem::command("q", "Quarto Render", QUARTO_RENDER),
             ],
         ),
         LeaderItem::group(
@@ -7085,6 +7096,17 @@ fn curated_leader_items() -> Vec<LeaderItem> {
                     http_command_ids::SWITCH_ENVIRONMENT,
                 ),
                 LeaderItem::command("c", "Copy As cURL", http_command_ids::COPY_AS_CURL),
+                LeaderItem::command("x", "Cancel In-flight", http_command_ids::CANCEL),
+            ],
+        ),
+        LeaderItem::group(
+            "n",
+            "Notebook…",
+            vec![
+                LeaderItem::command("r", "Run Cell", NOTEBOOK_RUN_ACTIVE_CELL),
+                LeaderItem::command("j", "Next Cell", NOTEBOOK_NEXT_CELL),
+                LeaderItem::command("k", "Previous Cell", NOTEBOOK_PREVIOUS_CELL),
+                LeaderItem::command("o", "Insert Cell Below", NOTEBOOK_INSERT_CELL_BELOW),
             ],
         ),
         LeaderItem::group(
@@ -7098,8 +7120,31 @@ fn curated_leader_items() -> Vec<LeaderItem> {
                 LeaderItem::command("o", "Mocha", THEME_SWITCH_MOCHA),
             ],
         ),
+        LeaderItem::group(
+            "d",
+            "Debug…",
+            vec![
+                LeaderItem::command("k", "Key Events", DEBUG_SHOW_KEY_EVENTS),
+                LeaderItem::command("l", "Command Log", DEBUG_SHOW_COMMAND_LOG),
+                LeaderItem::command("p", "Pane Tree", DEBUG_SHOW_PANE_TREE),
+                LeaderItem::command("s", "Project State", DEBUG_SHOW_PROJECT_STATE),
+                LeaderItem::command("r", "Reload Config", DEBUG_RELOAD_CONFIG),
+                LeaderItem::command("e", "Extensions", DEBUG_SHOW_EXTENSIONS),
+            ],
+        ),
         LeaderItem::command("q", "Quit", APP_QUIT),
     ]
+}
+
+/// Friendly label for an auto-created intermediate leader group, keyed by the
+/// prefix key. Falls back to a generic `+x…` marker so discovered binds always
+/// read sensibly even without a curated label.
+fn leader_group_label(key: &str) -> String {
+    match key {
+        "a" => "AI…".to_string(),
+        "g" => "Git…".to_string(),
+        _ => format!("+{key}…"),
+    }
 }
 
 /// Insert a `<leader>`-relative key path into `items`, creating intermediate
@@ -7134,7 +7179,7 @@ fn insert_leader_path(
     insert_leader_path(&mut children, rest, id, label);
     items.push(LeaderItem::group(
         first.clone(),
-        format!("+{first}…"),
+        leader_group_label(first),
         children,
     ));
 }
@@ -8365,6 +8410,79 @@ cockpit_layout = "missing.kdl"
     }
 
     #[test]
+    fn substitute_leader_expands_compact_multi_key_notation() {
+        let leader = Some("Space");
+        assert_eq!(substitute_leader("<leader>g", leader), "Space g");
+        assert_eq!(substitute_leader("<leader>aa", leader), "Space a a");
+        assert_eq!(substitute_leader("<leader>hs", leader), "Space h s");
+        // Whitespace in the trailing part is irrelevant.
+        assert_eq!(substitute_leader("<leader>h s", leader), "Space h s");
+        // No prefix, or no leader configured → unchanged.
+        assert_eq!(substitute_leader("Ctrl+Shift+g", leader), "Ctrl+Shift+g");
+        assert_eq!(substitute_leader("<leader>g", None), "<leader>g");
+        assert_eq!(substitute_leader("<leader>g", Some("")), "<leader>g");
+    }
+
+    #[test]
+    fn leader_menu_reaches_agents_through_a_merged_subgroup() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        // The default config ships claude-code on `<leader>aa`, which the
+        // rationalised substitution binds as `Space a a`. The merge folds it
+        // under an "AI…" subgroup, so `Space a a` is reachable through the menu.
+        model.dispatch(chord("Space"));
+        let menu = model.leader_menu.as_ref().expect("menu open");
+        let ai = menu
+            .items()
+            .iter()
+            .find(|item| item.key == "a")
+            .expect("AI group present");
+        assert_eq!(ai.label, "AI…");
+        assert!(ai.is_group());
+
+        model.dispatch(chord("a"));
+        model.dispatch(chord("a"));
+        assert!(model.leader_menu.is_none());
+        assert!(
+            model
+                .command_log
+                .iter()
+                .any(|cmd| cmd == "tool.claude-code"),
+            "log: {:?}",
+            model.command_log,
+        );
+    }
+
+    #[test]
+    fn leader_menu_send_http_request_through_merged_http_group() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        // HTTP binds now respect the leader: `<leader>hs` → `Space h s`.
+        model.dispatch(chord("Space"));
+        model.dispatch(chord("h"));
+        assert_eq!(
+            model.leader_menu.as_ref().expect("open").breadcrumb(),
+            &["h".to_string()]
+        );
+        model.dispatch(chord("s"));
+        assert!(model.leader_menu.is_none());
+        assert!(
+            model
+                .command_log
+                .iter()
+                .any(|cmd| cmd == http_command_ids::SEND_REQUEST),
+            "log: {:?}",
+            model.command_log,
+        );
+    }
+
+    #[test]
     fn tool_recipe_with_parseable_chord_binds_into_the_global_keymap() {
         let mut model = model();
         let mut config = cockpit_config::Config::default();
@@ -8378,9 +8496,8 @@ cockpit_layout = "missing.kdl"
                 ..Default::default()
             },
         );
-        // Placeholder `<leader>…` notation has no chord parser today and
-        // should be silently skipped without bringing the whole apply
-        // path down.
+        // Compact multi-key `<leader>` notation expands to a full chord:
+        // `<leader>aa` becomes the three-stroke `Space a a`.
         config.panes.tools.insert(
             "claude-code".to_string(),
             cockpit_config::ToolPaneRecipe {
@@ -8397,6 +8514,17 @@ cockpit_layout = "missing.kdl"
             RoutedInput::Command(id) => assert_eq!(id.as_str(), "tool.lazygit"),
             other => panic!("expected tool.lazygit, got {other:?}"),
         }
+
+        // The multi-key agent bind resolves as a real three-stroke chord.
+        let claude_chord = "Space a a".parse().unwrap();
+        assert_eq!(
+            model
+                .router
+                .global_keymap()
+                .resolve(&claude_chord)
+                .map(cockpit_commands::CommandId::as_str),
+            Some("tool.claude-code"),
+        );
     }
 
     #[test]
@@ -9152,13 +9280,18 @@ font  = "JetBrains Mono"
     }
 
     #[test]
-    fn editor_leader_ca_dispatches_code_action_command() {
+    fn leader_code_action_via_menu_from_normal_mode_editor() {
         let mut model = rust_model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
         model.open_path_reference("src/main.rs");
+        model.layout.focus(PaneId::Editor);
 
-        model.handle_editor_key(&chord("Space"));
-        model.handle_editor_key(&chord("c"));
-        model.handle_editor_key(&chord("a"));
+        // Normal mode by default — `Space c a` opens the menu, drills into
+        // Code…, and runs the code-action command through the command spine.
+        model.dispatch(chord("Space"));
+        model.dispatch(chord("c"));
+        model.dispatch(chord("a"));
 
         assert_eq!(
             model.command_log.back().map(String::as_str),
@@ -9167,19 +9300,46 @@ font  = "JetBrains Mono"
     }
 
     #[test]
-    fn editor_leader_cr_dispatches_rename_command() {
+    fn leader_rename_via_menu_from_normal_mode_editor() {
         let mut model = rust_model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
         model.open_path_reference("src/main.rs");
+        model.layout.focus(PaneId::Editor);
 
-        model.handle_editor_key(&chord("Space"));
-        model.handle_editor_key(&chord("c"));
-        model.handle_editor_key(&chord("r"));
+        model.dispatch(chord("Space"));
+        model.dispatch(chord("c"));
+        model.dispatch(chord("r"));
 
         assert_eq!(
             model.command_log.back().map(String::as_str),
             Some(LSP_RENAME)
         );
         assert!(model.rename_input.is_some());
+    }
+
+    #[test]
+    fn leader_does_not_steal_space_while_typing_in_the_editor() {
+        let mut model = rust_model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.open_path_reference("src/main.rs");
+        model.layout.focus(PaneId::Editor);
+
+        // Enter insert mode, then a space must reach the buffer, not the leader.
+        model.dispatch(chord("i"));
+        model.dispatch(chord("Space"));
+
+        assert!(
+            model.leader_menu.is_none(),
+            "Space in insert mode must type, not open the leader menu"
+        );
+        let mode = model
+            .document
+            .as_ref()
+            .map(|doc| doc.editor.mode())
+            .expect("document open");
+        assert_eq!(mode, Mode::Insert, "still typing in insert mode");
     }
 
     #[test]
