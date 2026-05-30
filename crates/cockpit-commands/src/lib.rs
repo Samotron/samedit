@@ -368,6 +368,13 @@ impl Keymap {
     pub fn resolve(&self, chord: &KeyChord) -> Option<&CommandId> {
         self.bindings.get(chord)
     }
+
+    /// Iterate every `(chord, command)` binding in chord order. Used by the
+    /// leader ("which-key") menu to discover the available `<leader>…`
+    /// chords for display.
+    pub fn bindings(&self) -> impl Iterator<Item = (&KeyChord, &CommandId)> {
+        self.bindings.iter()
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +464,29 @@ mod tests {
         assert_eq!(
             keymap.bind(chord.clone(), "project.open_file"),
             Err(CommandError::DuplicateKeybinding(chord))
+        );
+    }
+
+    #[test]
+    fn bindings_iterates_every_chord_in_order() {
+        let mut keymap = Keymap::new();
+        // A two-stroke leader chord plus a single-stroke chord.
+        let leader = "Space g".parse::<KeyChord>().unwrap();
+        let palette = KeyChord::single("p", Modifiers::CTRL_SHIFT);
+        keymap.bind(leader.clone(), "tool.lazygit").unwrap();
+        keymap.bind(palette.clone(), "palette.open").unwrap();
+
+        let collected: Vec<(&KeyChord, &CommandId)> = keymap.bindings().collect();
+        assert_eq!(collected.len(), 2);
+        assert!(
+            collected
+                .iter()
+                .any(|(chord, id)| **chord == leader && id.as_str() == "tool.lazygit")
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|(chord, id)| **chord == palette && id.as_str() == "palette.open")
         );
     }
 }

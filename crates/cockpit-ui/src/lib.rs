@@ -11,6 +11,7 @@ pub mod file_finder;
 pub mod http;
 pub mod hydration;
 pub mod launcher;
+pub mod leader_menu;
 pub mod org;
 pub mod palette;
 pub mod prompt;
@@ -27,6 +28,7 @@ pub use http::{
 };
 pub use hydration::{CompletedPhase, HydrationPhase, HydrationProgress};
 pub use launcher::{Launcher, LauncherAction, LauncherIntent, LauncherSelection, RecentProject};
+pub use leader_menu::{LeaderItem, LeaderKind, LeaderMenu, LeaderOutcome};
 pub use org::{
     AgendaMode, AgendaRow, AgendaRowKind, AgendaView, CaptureCommit, CapturePhase,
     CaptureTemplateRow, CaptureView, OrgListRow, OrgListView,

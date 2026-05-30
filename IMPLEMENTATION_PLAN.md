@@ -1174,11 +1174,20 @@ running upstream CLIs the user already has. That is the whole point.
 - ✅ Leader chord support: `keys.global.leader` (default `Space`) is
   substituted into recipe keybinds, so the default `<leader>g`
   Lazygit binding becomes the two-stroke chord `Space g` and fires
-  from the keymap without needing the palette. The dispatch path
-  buffers the leader stroke when it lands as a single chord and
-  combines it with the next chord to look up multi-stroke matches.
-  Tools that don't carry a real `<leader>` substitution still work
-  via their palette entry.
+  from the keymap without needing the palette.
+- ✅ Leader ("which-key") menu: pressing the leader outside the
+  terminal opens a Doom-/Spacemacs-style overlay (`cockpit_ui::LeaderMenu`,
+  painted bottom-anchored by `paint_leader_menu`) listing the keys
+  available for the next stroke. Pressing a key drills into a curated
+  group (`File…`, `Window…`, `Code…`, `Test…`, `Project…`, `HTTP…`,
+  `Theme…`, …) or dispatches a `CommandId` through the single command
+  spine; `Backspace` pops a level and `Esc` cancels. Every `<leader>…`
+  chord registered on the global keymap (tool-pane recipes such as
+  `<leader>g` lazygit, `<leader>aa`/`<leader>ac` agents, Lua binds) is
+  merged into the tree, so multi-stroke binds are now reachable and
+  discoverable — not just the two-stroke ones the old buffered path
+  could resolve. Tools that don't carry a real `<leader>` substitution
+  still work via their palette entry.
 - Mux gains two primitives on top of M7.4's split tree:
   - **Floating pane** — overlay rectangle centred over the project,
     sized 80% × 80%, drawn above the regular layout. Single floating
