@@ -89,6 +89,7 @@ samedit/                            # Cargo workspace root
 │   │                               #  + env::{FileSystem,ProcessRunner,Clock}
 │   │                               #    seams (M4.10)
 │   ├── cockpit-mux/                # native multiplexer state (M7.2+)
+│   ├── cockpit-crew/               # parallel agents in git worktrees (v0.14)
 │   ├── cockpit-terminal/           # pty, termwiz engine, path detect
 │   ├── cockpit-http/               # Bruno-style .bru parser + model (v0.11)
 │   ├── cockpit-lsp/                # LSP transport — codec, JSON-RPC, client
@@ -125,6 +126,7 @@ should never gain a window/GPU dependency.
 | Filesystem / process / clock seams       | `cockpit-project::env`   |
 | PTY, terminal engine, path parse         | `cockpit-terminal`       |
 | Mux state (sessions/windows/panes)       | `cockpit-mux`            |
+| Parallel agent runs / worktrees (v0.14)  | `cockpit-crew`           |
 | LSP codec / JSON-RPC / client transport  | `cockpit-lsp`            |
 | A new command ID or keybinding           | `cockpit-commands`       |
 | Config schema, TOML/KDL parsing          | `cockpit-config`         |

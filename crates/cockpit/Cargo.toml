@@ -19,6 +19,7 @@ cockpit-project.workspace = true
 cockpit-testkit.workspace = true
 cockpit-commands.workspace = true
 cockpit-config.workspace = true
+cockpit-crew.workspace = true
 cockpit-editor.workspace = true
 cockpit-http.workspace = true
 cockpit-lsp.workspace = true

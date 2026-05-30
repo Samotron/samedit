@@ -654,6 +654,7 @@ dependencies = [
  "cockpit-analytics",
  "cockpit-commands",
  "cockpit-config",
+ "cockpit-crew",
  "cockpit-editor",
  "cockpit-http",
  "cockpit-lsp",
@@ -699,6 +700,17 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "toml_edit 0.23.10+spec-1.0.0",
+]
+
+[[package]]
+name = "cockpit-crew"
+version = "0.0.1"
+dependencies = [
+ "cockpit-commands",
+ "cockpit-config",
+ "cockpit-project",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -919,6 +931,7 @@ version = "0.0.1"
 dependencies = [
  "cockpit-commands",
  "cockpit-config",
+ "cockpit-crew",
  "cockpit-http",
  "cockpit-org",
  "cockpit-project",

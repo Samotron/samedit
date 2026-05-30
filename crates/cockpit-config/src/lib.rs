@@ -5,9 +5,11 @@
 //! M7.8. Pure data + parsing; no I/O side effects beyond reading files.
 
 pub mod cockpit_layout;
+pub mod crew;
 pub mod launcher;
 
 pub use cockpit_layout::{CockpitLayout, CockpitLayoutNode, CockpitSplitDirection};
+pub use crew::{CrewAgentConfig, CrewConfig};
 pub use launcher::{
     HotkeyConfig, LauncherConfig, LauncherMiseConfig, LauncherPosition, LauncherSection,
     LauncherUi, MiseProjects, ProvidersConfig, launcher_config_path,
@@ -29,6 +31,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub keys: KeysConfig,
     pub panes: PanesConfig,
+    pub crew: crew::CrewConfig,
 }
 
 impl Config {

@@ -13,6 +13,7 @@ ui-smoke = []
 [dependencies]
 cockpit-commands.workspace = true
 cockpit-config.workspace = true
+cockpit-crew.workspace = true
 cockpit-http.workspace = true
 cockpit-org.workspace = true
 cockpit-project.workspace = true

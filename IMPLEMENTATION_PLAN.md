@@ -3111,6 +3111,147 @@ order once M13.1 is in.
 
 ---
 
+## 8j. v0.14 — Agent crews (cmux-inspired)  (NEW — post-spec)
+
+Goal: run several coding agents in **parallel on the same task**, each in
+its own isolated **git worktree**, then review their diffs side-by-side and
+**pick a winner** to integrate — discarding the rest. Conceptually
+[cmux](https://github.com/manaflow-ai/cmux): fan one prompt out to N agents,
+compare, keep the best. Where cmux orchestrates containers, the cockpit
+reuses what it already owns — `git worktree` for isolation (no Docker
+dependency), the `ProcessRunner` seam for spawning, `cockpit-mux` panes for
+each agent's live terminal, and the command spine for dispatch. A crew is
+"just" another view-model over the existing project/terminal machinery.
+
+### Scope
+
+- **Fan-out:** one [`CrewTask`] (prompt + base revision) → N
+  [`AgentRun`]s, each on a fresh branch in its own worktree.
+- **Lifecycle:** a guarded per-agent state machine —
+  `Pending → Preparing → Running → Succeeded(diff) | Failed`, then the
+  review-time terminals `Picked` / `Discarded`.
+- **Review:** capture each worktree's `git diff --numstat` against the base
+  so the UI can show `+/−` per candidate; pick one (integrate its worktree,
+  prune the rest) or discard individually.
+- **Config:** a `[crew]` section names the available agents
+  (`claude`, `codex`, … as command templates with `{prompt}` /
+  `{worktree}` / `{branch}` / `{base}` placeholders) and the worktree root.
+
+**Out of scope (deliberate non-goals):** container/VM isolation (worktrees
+only — AGENTS §2 keeps core headless and dependency-light), an agent
+marketplace (AGENTS §2 #7), auto-merge/conflict resolution beyond handing
+the picked worktree to the existing git flow, and any cloud/remote agent
+runner. No new async runtime — agent PTYs ride the existing dedicated-thread
+model (AGENTS §2 #4).
+
+### Architecture
+
+```diagram
+╭──────────────╮   plan   ╭───────────────────╮  spawn  ╭──────────────╮
+│ cockpit-ui   │─────────▶│ cockpit-crew      │────────▶│ N worktrees  │
+│ crew view-   │  pick/   │ (headless core)   │  git    │ + agent PTYs │
+│ model (later)│  discard │  run state machine│ worktree│ (cockpit-mux)│
+╰──────────────╯◀─────────│  worktree git glue│◀────────╰──────────────╯
+        ▲      diffstat    │  plan ⇐ [crew] cfg│
+        │                  ╰───────────────────╯
+   cockpit-commands (crew.* ids — the single dispatch spine)
+```
+
+New crate:
+
+- `cockpit-crew` — headless core. Three modules: `run` (the [`CrewRun`]
+  aggregate + per-agent state machine), `worktree` (git command
+  construction + porcelain/numstat parsing, spawn injected through
+  `cockpit_project::env::ProcessRunner`, mirroring `cockpit_project::git`),
+  and `spec` ([`AgentSpec`]/[`CrewPlan`]: config → live run, with
+  placeholder expansion). Fully unit-tested with `FakeProcessRunner`.
+
+### M14.1 — `cockpit-crew`: run model + state machine  ✅
+
+- [`CrewRun`] owns the task, the ordered [`AgentRun`]s, and a `RunOutcome`
+  (`InProgress` / `Decided(id)` / `Cancelled`).
+- Guarded transitions return a typed [`CrewError`] (`IllegalTransition`,
+  `UnknownAgent`, `NotReviewable`, `AlreadyDecided`) — no silent no-ops, so
+  the command layer can surface *why* an action was refused.
+- `pick(id)` marks the winner `Picked` and discards the other live/reviewable
+  agents while leaving `Failed` ones as-is; the winner's [`DiffStat`] is
+  stashed so it survives the terminal transition (a reviewer still wants to
+  see which candidate they kept).
+- **Tests:** full lifecycle, illegal transitions, pick-discards-rest,
+  pick-preserves-failures, can't-pick-failed/running, can't-pick-twice,
+  cancel semantics, diff retained after pick.
+
+### M14.2 — worktree git glue + command ids  ✅
+
+- `worktree`: `add` / `remove --force` / `list --porcelain` / `diff
+  --numstat` spec builders + parsers; `WorktreeError` separates a spawn
+  failure from a non-zero git exit. `--force` on remove because an abandoned
+  agent worktree usually carries uncommitted changes we mean to drop.
+- `command_ids`: the `crew.*` dispatch ids (`run.new`, `run.cancel`,
+  `agent.pick`, `agent.discard`, `agent.retry`, `agent.open_diff`,
+  `agent.open_terminal`, focus/next/prev). Defined next to the model they
+  act on, mirroring `cockpit-mux`'s `command_ids` (AGENTS §2 #5).
+
+### M14.3 — `[crew]` config + plan bridge  ✅
+
+- `cockpit-config::crew::CrewConfig` — worktree root, branch prefix, default
+  parallelism, and `[[crew.agents]]` recipes; `#[serde(default,
+  deny_unknown_fields)]`, surfaced as `Config::crew`. Defaults ship `claude`
+  + `codex` (matching the `[panes.tools]` recipes).
+- `CrewPlan::materialise(run_id)` stamps out a `CrewRun`: unique
+  `<prefix>/r<run>/<index>-<name>` branches and worktree paths, command
+  resolved per agent. `AgentSpec::from_config` adapts a config entry.
+
+### M14.4 — crew view-model (`cockpit-ui`)  ✅
+
+- `CrewView` wraps a live `CrewRun` and adds a keyboard focus cursor + row
+  derivation (`CrewAgentRow` with an `AgentStatus` badge, diffstat, and
+  failure message). Intent emitters (`pick_focused`, `discard_focused`,
+  `retry_focused`, `open_diff_focused`, …) return `Option<CrewIntent>` so the
+  binary never dispatches a doomed action — pick only offers itself for a
+  succeeded agent, retry only for a failed/discarded one. Headless; asserts on
+  the row tree (spec §18.8).
+
+### M14.5 — orchestration + binary wiring  ✅
+
+- `cockpit_crew::orchestrate` (headless core): the synchronous git side the
+  binary calls at PTY lifecycle edges — `prepare_worktree`,
+  `finalize_success`, `discard`, `pick`, `cancel` — each keeping the run model
+  and the on-disk worktrees in step (a git failure on prepare rolls the agent
+  into `Failed`; pick prunes only the losers it just discarded). `FakeProcessRunner`
+  tested.
+- `cockpit::crew::CrewController` (binary): the run-id allocator, a `[crew]`
+  config snapshot (set from `apply_user_config`), and the active `CrewView`.
+  `start_run` materialises a plan and prepares the worktrees, handing back
+  `AgentSpawn`s for the app's terminal layer; `apply_intent` lowers a
+  `CrewIntent` onto the orchestrator and reports a `CrewOutcome`. Wired into
+  the command spine: `run_crew_command` routes the `crew.*` ids and the
+  palette lists every Crew command.
+- **Render leg still open:** the live agent PTYs (one `cockpit-mux` pane per
+  worktree), an interactive task-prompt entry for `crew.run.new`, the
+  side-by-side diff pane, and lowering `Picked` onto a real merge. The
+  controller already produces the `AgentSpawn`s / `CrewOutcome`s these need;
+  what remains is the winit-side plumbing, which can't be exercised headlessly.
+
+### M14.6 — single-agent retry  ✅
+
+- `CrewRun::retry` resets a `Failed`/`Discarded` agent to `Pending` with a
+  fresh branch/worktree/command; the controller re-resolves the command from
+  config (with a `-retryN` slug) and re-prepares the worktree, returning a
+  `CrewOutcome::Retried(spawn)` for the app to re-launch — no need to restart
+  the whole crew.
+
+### Risks
+
+| Risk                                          | Mitigation                                                                                          |
+|-----------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| N parallel agent PTYs inflate RAM / CPU       | `default_parallelism = 3`; worktrees are cheap (shared object store). Spawn is the binary's call, not the core's. |
+| Worktree litter after crashes                 | `remove --force` on discard; `list --porcelain` lets a future GC reconcile orphaned `crew/*` worktrees. |
+| Agent CLIs differ wildly                       | Command *templates* in config (placeholders), not a hard-coded agent list — `aider`, `codex`, etc. drop in via TOML. |
+| Core reaching for git/PTY directly            | All git goes through the `ProcessRunner` seam; PTY/spawn deferred to the binary (AGENTS §2 #2/#3).  |
+
+---
+
 ## 9. Testing strategy realised  (maps spec §18)
 
 | Spec §        | Realisation                                                       |

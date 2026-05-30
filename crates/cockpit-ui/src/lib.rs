@@ -5,6 +5,7 @@
 //! and fully unit-testable without a window (spec §18.8).
 
 pub mod completion;
+pub mod crew;
 pub mod file_browser;
 pub mod file_finder;
 pub mod http;
@@ -15,6 +16,7 @@ pub mod palette;
 pub mod prompt;
 
 pub use completion::{CompletionItem, CompletionPopup};
+pub use crew::{AgentStatus, CrewAgentRow, CrewIntent, CrewSummary, CrewView};
 pub use file_browser::{FileBrowser, FileBrowserAction, FileRow};
 pub use file_finder::{FuzzyFinder, FuzzyMatch};
 pub use http::{
