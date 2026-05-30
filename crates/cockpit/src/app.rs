@@ -63,8 +63,9 @@ use cockpit_ui::http::{
 };
 use cockpit_ui::{
     CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, CrewIntent, CrewView,
-    FileBrowser, FileBrowserAction, FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId,
-    Rect as UiRect, RoutedInput, WorkspaceLayout, command_ids,
+    FileBrowser, FileBrowserAction, FuzzyFinder, InputRouter, LeaderItem, LeaderMenu,
+    LeaderOutcome, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput, WorkspaceLayout,
+    command_ids,
 };
 
 /// Logical layout metrics. The painter scales these by the display factor.
@@ -404,9 +405,6 @@ pub struct AppModel {
     /// Tracks a pending `g` in the editor pane so local `gd` can dispatch LSP
     /// definition while non-LSP Vim chords like `gg` still reach the Vim FSM.
     editor_pending_g: bool,
-    /// Tracks `<leader>c` in the editor pane so `<leader>ca` can dispatch the
-    /// quick-fix command without adding a parallel command path.
-    editor_pending_leader: u8,
     /// Tracks a pending `g` while in mux copy mode so `gg` can jump to the
     /// top of the scrollback (M7.6).
     mux_copy_pending_g: bool,
@@ -452,10 +450,10 @@ pub struct AppModel {
     /// `<leader>` in recipe keybinds and to detect leader presses
     /// during dispatch (v0.8 M8.2).
     leader_chord: Option<String>,
-    /// Buffered leader stroke captured by the previous keypress; the
-    /// next stroke is combined with this one and looked up as a
-    /// multi-stroke chord.
-    pending_leader: Option<cockpit_commands::KeyStroke>,
+    /// The Doom-style leader ("which-key") menu, present while the user is
+    /// mid-leader-sequence. Opening it shows the keys available after the
+    /// leader; pressing keys drills into groups or runs commands (v0.8 M8.2).
+    leader_menu: Option<LeaderMenu>,
     /// Most recent computed layout — populated each `paint()` so mouse hit
     /// tests can ask which pane an event landed in (M4.7).
     last_layout: Option<ComputedLayout>,
@@ -602,7 +600,6 @@ impl AppModel {
             http_batch_total: 0,
             analytics: None,
             editor_pending_g: false,
-            editor_pending_leader: 0,
             mux_copy_pending_g: false,
             mux_copy_yank: None,
             mux_pane_commands: HashMap::new(),
@@ -615,7 +612,7 @@ impl AppModel {
             status_format: cockpit_config::TerminalStatusConfig::default().format,
             user_config_path: None,
             leader_chord: None,
-            pending_leader: None,
+            leader_menu: None,
             last_layout: None,
             last_view_width: 0.0,
             last_view_height: 0.0,
@@ -1023,6 +1020,12 @@ impl AppModel {
             self.handle_finder_key(&chord);
             return;
         }
+        // While the leader ("which-key") menu is open it is modal: every key
+        // either drills into a group, runs a command, or closes it.
+        if self.leader_menu.is_some() {
+            self.handle_leader_menu_key(&chord);
+            return;
+        }
         let focused = self.layout.focused();
         if focused == PaneId::Terminal && self.handle_mux_copy_mode_key(&chord) {
             return;
@@ -1030,30 +1033,17 @@ impl AppModel {
         if focused == PaneId::Terminal && self.handle_mux_prefix(&chord) {
             return;
         }
-        // v0.8 M8.2: leader-key support. If the previous chord was the
-        // configured leader, combine it with the current chord to form
-        // a multi-stroke key and route the result. Resolved matches
-        // dispatch like a regular global; unresolved combos fall back
-        // to the current chord so the user doesn't lose the keystroke.
-        if let Some(leader) = self.pending_leader.take()
-            && let [stroke] = chord.strokes()
+        // v0.8 M8.2: leader-key support. Pressing the configured leader
+        // (default `Space`) opens the Doom-style leader menu, surfacing the
+        // keys available for the next stroke. Gated by [`leader_opens_menu`]
+        // so the leader never steals a literal space while typing in the
+        // editor (Insert/Replace/Command/Search) or passes through to a focused
+        // terminal.
+        if self.leader_chord.is_some()
+            && self.leader_opens_menu(focused)
+            && leader_stroke_match(&chord, self.leader_chord.as_deref()).is_some()
         {
-            let combined = KeyChord::new(vec![leader, stroke.clone()]);
-            if let Some(command) = self.router.global_keymap().resolve(&combined) {
-                let id = command.clone();
-                self.status = "Leader chord dispatched.".to_string();
-                self.run_command(id.as_str());
-                return;
-            }
-            // No combo matched — drop the buffered leader silently and
-            // process the current chord normally.
-        }
-        if focused != PaneId::Terminal
-            && self.leader_chord.is_some()
-            && let Some(stroke) = leader_stroke_match(&chord, self.leader_chord.as_deref())
-        {
-            self.pending_leader = Some(stroke);
-            self.status = "Leader…".to_string();
+            self.open_leader_menu();
             return;
         }
         match self.router.route(focused, chord) {
@@ -2097,11 +2087,13 @@ impl AppModel {
     /// (palette dispatch still works) — same policy as tool-recipe
     /// chord binding.
     fn bind_http_chords(&mut self) {
+        let leader = self.leader_chord.clone();
         for (chord, command) in http_default_keybindings() {
-            if let Err(err) = self.router.bind_extra_chord(chord, *command) {
+            let resolved = substitute_leader(chord, leader.as_deref());
+            if let Err(err) = self.router.bind_extra_chord(&resolved, *command) {
                 tracing::debug!(
                     ?err,
-                    chord = %chord,
+                    chord = %resolved,
                     command = %command,
                     "http command keybind not bound (parser/conflict)",
                 );
@@ -2689,6 +2681,156 @@ impl AppModel {
         }
     }
 
+    /// Whether a leader press in the focused pane should open the menu.
+    ///
+    /// The terminal swallows the leader (it is a normal key for the child
+    /// process). In the editor the leader only acts as leader in the modes
+    /// where the key is not literal text — Normal and Visual — so a space typed
+    /// in Insert/Replace/Command/Search reaches the buffer instead of opening
+    /// the menu. With no document open the editor has nothing to type, so the
+    /// leader is free to open the menu.
+    fn leader_opens_menu(&self, focused: PaneId) -> bool {
+        match focused {
+            PaneId::Files => true,
+            PaneId::Terminal => false,
+            PaneId::Editor => self
+                .document
+                .as_ref()
+                .map(|doc| {
+                    matches!(
+                        doc.editor.mode(),
+                        Mode::Normal | Mode::Visual | Mode::VisualLine
+                    )
+                })
+                .unwrap_or(true),
+        }
+    }
+
+    /// Open the Doom-style leader ("which-key") menu over the workspace.
+    ///
+    /// The tree mixes a curated set of grouped commands with any
+    /// `<leader>…` chords registered on the global keymap (tool-pane
+    /// recipes such as lazygit, Lua extension binds), so everything reachable
+    /// from the leader is discoverable in one place.
+    fn open_leader_menu(&mut self) {
+        let items = self.leader_menu_items();
+        self.leader_menu = Some(LeaderMenu::new(items));
+        self.status = "Leader — press a key (Esc to cancel).".to_string();
+    }
+
+    /// Build the leader-menu tree: curated groups first, then any
+    /// `<leader>…` chords discovered on the global keymap merged in.
+    fn leader_menu_items(&self) -> Vec<LeaderItem> {
+        let mut items = curated_leader_items();
+        self.merge_keymap_leader_chords(&mut items);
+        items
+    }
+
+    /// Fold every `<leader>…` chord on the global keymap into `items`,
+    /// creating intermediate groups as needed. Curated rows win on conflict so
+    /// the hand-tuned labels are never clobbered.
+    fn merge_keymap_leader_chords(&self, items: &mut Vec<LeaderItem>) {
+        let Some(leader) = self.leader_chord.as_deref() else {
+            return;
+        };
+        let Ok(leader_chord) = leader.parse::<cockpit_commands::KeyChord>() else {
+            return;
+        };
+        let [leader_stroke] = leader_chord.strokes() else {
+            return;
+        };
+        let labels = self.command_label_lookup();
+        for (chord, command) in self.router.global_keymap().bindings() {
+            let strokes = chord.strokes();
+            // Only multi-stroke chords whose first stroke is the leader.
+            let Some((first, rest)) = strokes.split_first() else {
+                continue;
+            };
+            if first != leader_stroke || rest.is_empty() {
+                continue;
+            }
+            let keys: Vec<String> = rest.iter().map(|s| s.key().to_string()).collect();
+            let label = labels
+                .get(command.as_str())
+                .cloned()
+                .unwrap_or_else(|| command.as_str().to_string());
+            insert_leader_path(items, &keys, command.clone(), label);
+        }
+    }
+
+    /// Map command id → human label, sourced from the palette entries (which
+    /// already carry friendly titles for every built-in and tool recipe).
+    fn command_label_lookup(&self) -> std::collections::HashMap<String, String> {
+        let mut labels = std::collections::HashMap::new();
+        for entry in palette_entries() {
+            labels.insert(entry.id.to_string(), entry.title.clone());
+        }
+        for entry in self.tool_recipe_palette_entries() {
+            labels.insert(entry.id.to_string(), entry.title.clone());
+        }
+        labels
+    }
+
+    /// Drive the modal leader menu from one key chord.
+    fn handle_leader_menu_key(&mut self, chord: &KeyChord) {
+        if self.leader_menu.is_none() {
+            return;
+        }
+        if is_chord(chord, "Escape") {
+            self.leader_menu = None;
+            self.status = "Leader cancelled.".to_string();
+            return;
+        }
+        if is_chord(chord, "Backspace") {
+            let still_open = self
+                .leader_menu
+                .as_mut()
+                .map(LeaderMenu::back)
+                .unwrap_or(false);
+            if still_open {
+                self.update_leader_status();
+            } else {
+                self.leader_menu = None;
+                self.status = "Leader cancelled.".to_string();
+            }
+            return;
+        }
+        let Some(key) = leader_menu_key(chord) else {
+            // Modifier-only or otherwise unmappable press — ignore but keep
+            // the menu open so the user can try again.
+            return;
+        };
+        let outcome = self
+            .leader_menu
+            .as_mut()
+            .map(|menu| menu.press(&key))
+            .unwrap_or(LeaderOutcome::Unknown);
+        match outcome {
+            LeaderOutcome::Run(id) => {
+                self.leader_menu = None;
+                self.run_command(id.as_str());
+            }
+            LeaderOutcome::Descended => self.update_leader_status(),
+            LeaderOutcome::Unknown => {
+                self.leader_menu = None;
+                self.status = format!("No leader binding for `{key}`.");
+            }
+        }
+    }
+
+    /// Refresh the status line with the current leader breadcrumb.
+    fn update_leader_status(&mut self) {
+        let Some(menu) = self.leader_menu.as_ref() else {
+            return;
+        };
+        let crumbs = menu.breadcrumb().join(" ");
+        self.status = if crumbs.is_empty() {
+            "Leader — press a key (Esc to cancel).".to_string()
+        } else {
+            format!("Leader {crumbs} — press a key (Backspace to go back).")
+        };
+    }
+
     /// Open the fuzzy file finder, indexing the project on first use.
     fn open_finder(&mut self) {
         if self.file_index.is_none() {
@@ -3117,36 +3259,13 @@ impl AppModel {
             .as_ref()
             .is_some_and(|doc| doc.editor.mode() == Mode::Normal);
         if normal_mode {
+            // Native Vim/LSP normal-mode binds that don't collide with the
+            // leader: `K` shows hover, `gd` jumps to definition. The
+            // `<leader>c…` code bindings live in the global leader menu's
+            // `Code…` group, dispatched through the single command spine.
             if is_chord(chord, "K") {
                 self.editor_pending_g = false;
-                self.editor_pending_leader = 0;
                 self.run_command(LSP_SHOW_HOVER);
-                return;
-            }
-            if self.editor_pending_leader == 2 {
-                self.editor_pending_leader = 0;
-                if is_chord(chord, "a") {
-                    self.editor_pending_g = false;
-                    self.run_command(LSP_CODE_ACTION);
-                    return;
-                }
-                if is_chord(chord, "r") {
-                    self.editor_pending_g = false;
-                    self.run_command(LSP_RENAME);
-                    return;
-                }
-            }
-            if self.editor_pending_leader == 1 {
-                self.editor_pending_leader = 0;
-                if is_chord(chord, "c") {
-                    self.editor_pending_leader = 2;
-                    self.editor_pending_g = false;
-                    return;
-                }
-            }
-            if is_chord(chord, "Space") {
-                self.editor_pending_leader = 1;
-                self.editor_pending_g = false;
                 return;
             }
             let mut replayed_pending = false;
@@ -3165,7 +3284,6 @@ impl AppModel {
             }
         } else {
             self.editor_pending_g = false;
-            self.editor_pending_leader = 0;
         }
         let Some(key) = chord_to_vim_key(chord) else {
             return;
@@ -5060,6 +5178,9 @@ impl AppModel {
         if let Some(prompt) = &self.confirm {
             paint_confirm(&mut canvas, &self.theme, prompt, width, height);
         }
+        if let Some(menu) = &self.leader_menu {
+            paint_leader_menu(&mut canvas, &self.theme, menu, width, height);
+        }
     }
 
     fn paint_top_bar(&self, canvas: &mut Canvas<'_>, width: f32) {
@@ -6058,9 +6179,15 @@ fn is_chord(chord: &KeyChord, key: &str) -> bool {
     *chord == KeyChord::single(key, Modifiers::NONE)
 }
 
-/// Replace `<leader>` in `keybind` with the configured leader chord plus a
-/// space, so `<leader>g` becomes `Space g` when the leader is `Space`. Acts
-/// as a no-op when no leader is configured.
+/// Expand a `<leader>`-prefixed keybind into a full space-separated chord.
+///
+/// The leader prefix becomes the configured leader stroke and each following
+/// character becomes its own single-key stroke, so the compact Doom notation
+/// `<leader>aa` becomes the three-stroke chord `Space a a` (and `<leader>g`
+/// becomes `Space g`). Keybinds without a `<leader>` prefix, and any keybind
+/// when no leader is configured, are returned unchanged. Whitespace already in
+/// the trailing part is ignored so `<leader>h s` and `<leader>hs` are
+/// equivalent.
 fn substitute_leader(keybind: &str, leader: Option<&str>) -> String {
     let Some(leader) = leader else {
         return keybind.to_string();
@@ -6068,7 +6195,16 @@ fn substitute_leader(keybind: &str, leader: Option<&str>) -> String {
     if leader.is_empty() {
         return keybind.to_string();
     }
-    keybind.replace("<leader>", &format!("{leader} "))
+    let Some(rest) = keybind.strip_prefix("<leader>") else {
+        return keybind.to_string();
+    };
+    let mut strokes = vec![leader.to_string()];
+    strokes.extend(
+        rest.chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| c.to_string()),
+    );
+    strokes.join(" ")
 }
 
 /// Match a single-stroke `chord` against the configured leader chord string.
@@ -6878,6 +7014,194 @@ fn palette_entries() -> Vec<PaletteEntry> {
     ]
 }
 
+/// The curated, hand-grouped leader menu — a Doom/Spacemacs-style tree of the
+/// most-reached commands, using the familiar prefixes (`f` file, `c` code,
+/// `w` window, `t` toggle, `p` project, `g` git, `q` quit) plus cockpit's own
+/// (`r` run, `h` http, `n` notebook, `a` AI). Each key appears at most once per
+/// level and no command is duplicated across groups. Tool-pane recipes and Lua
+/// binds (`g` lazygit, `a` agents, `h` tabs) are merged on top by
+/// [`AppModel::merge_keymap_leader_chords`].
+fn curated_leader_items() -> Vec<LeaderItem> {
+    vec![
+        LeaderItem::group(
+            "f",
+            "File…",
+            vec![
+                LeaderItem::command("f", "Find File", command_ids::FUZZY_OPEN),
+                LeaderItem::command("s", "Save", command_ids::SAVE),
+            ],
+        ),
+        LeaderItem::group(
+            "c",
+            "Code…",
+            vec![
+                LeaderItem::command("d", "Go to Definition", LSP_GOTO_DEFINITION),
+                LeaderItem::command("k", "Show Documentation", LSP_SHOW_HOVER),
+                LeaderItem::command("r", "Rename Symbol", LSP_RENAME),
+                LeaderItem::command("a", "Code Action", LSP_CODE_ACTION),
+                LeaderItem::command("f", "Format Buffer", EDITOR_FORMAT),
+            ],
+        ),
+        LeaderItem::group(
+            "w",
+            "Window…",
+            vec![
+                // Pane focus mirrors the global Ctrl+h/j/l shortcuts.
+                LeaderItem::command("h", "Focus Files", command_ids::FOCUS_FILES),
+                LeaderItem::command("j", "Focus Editor", command_ids::FOCUS_EDITOR),
+                LeaderItem::command("l", "Focus Terminal", command_ids::FOCUS_TERMINAL),
+                LeaderItem::command("v", "Split Vertical", mux_command_ids::SPLIT_VERTICAL),
+                LeaderItem::command("s", "Split Horizontal", mux_command_ids::SPLIT_HORIZONTAL),
+                LeaderItem::command("n", "New Window", mux_command_ids::NEW_WINDOW),
+                LeaderItem::command("d", "Close Pane", mux_command_ids::KILL_PANE),
+                LeaderItem::command("z", "Zoom Pane", mux_command_ids::ZOOM_PANE),
+                LeaderItem::command("o", "Other Pane", mux_command_ids::NEXT_PANE),
+            ],
+        ),
+        LeaderItem::group(
+            "t",
+            "Toggle…",
+            vec![
+                LeaderItem::command("f", "Files Pane", command_ids::TOGGLE_FILES),
+                LeaderItem::command("t", "Terminal Pane", command_ids::TOGGLE_TERMINAL),
+                LeaderItem::command("s", "Format on Save", EDITOR_TOGGLE_FORMAT_ON_SAVE),
+            ],
+        ),
+        LeaderItem::group(
+            "r",
+            "Run…",
+            vec![
+                LeaderItem::command("t", "Mise Task", MISE_RUN_TASK),
+                LeaderItem::command("a", "All Tests", TEST_RUN_ALL),
+                LeaderItem::command("f", "File Tests", TEST_RUN_CURRENT_FILE),
+                LeaderItem::command("n", "Nearest Test", TEST_RUN_NEAREST),
+                LeaderItem::command("g", "Go Generate", GO_GENERATE),
+                LeaderItem::command("b", "Build Models", MODELS_BUILD_ALL),
+                LeaderItem::command("q", "Quarto Render", QUARTO_RENDER),
+            ],
+        ),
+        LeaderItem::group(
+            "h",
+            "HTTP…",
+            vec![
+                LeaderItem::command("s", "Send Request", http_command_ids::SEND_REQUEST),
+                LeaderItem::command(
+                    "a",
+                    "Send All In Folder",
+                    http_command_ids::SEND_ALL_IN_FOLDER,
+                ),
+                LeaderItem::command(
+                    "e",
+                    "Switch Environment",
+                    http_command_ids::SWITCH_ENVIRONMENT,
+                ),
+                LeaderItem::command("c", "Copy As cURL", http_command_ids::COPY_AS_CURL),
+                LeaderItem::command("x", "Cancel In-flight", http_command_ids::CANCEL),
+            ],
+        ),
+        LeaderItem::group(
+            "n",
+            "Notebook…",
+            vec![
+                LeaderItem::command("r", "Run Cell", NOTEBOOK_RUN_ACTIVE_CELL),
+                LeaderItem::command("j", "Next Cell", NOTEBOOK_NEXT_CELL),
+                LeaderItem::command("k", "Previous Cell", NOTEBOOK_PREVIOUS_CELL),
+                LeaderItem::command("o", "Insert Cell Below", NOTEBOOK_INSERT_CELL_BELOW),
+            ],
+        ),
+        LeaderItem::group(
+            "T",
+            "Theme…",
+            vec![
+                LeaderItem::command("d", "Dark", THEME_SWITCH_DARK),
+                LeaderItem::command("l", "Latte", THEME_SWITCH_LATTE),
+                LeaderItem::command("f", "Frappé", THEME_SWITCH_FRAPPE),
+                LeaderItem::command("m", "Macchiato", THEME_SWITCH_MACCHIATO),
+                LeaderItem::command("o", "Mocha", THEME_SWITCH_MOCHA),
+            ],
+        ),
+        LeaderItem::group(
+            "d",
+            "Debug…",
+            vec![
+                LeaderItem::command("k", "Key Events", DEBUG_SHOW_KEY_EVENTS),
+                LeaderItem::command("l", "Command Log", DEBUG_SHOW_COMMAND_LOG),
+                LeaderItem::command("p", "Pane Tree", DEBUG_SHOW_PANE_TREE),
+                LeaderItem::command("s", "Project State", DEBUG_SHOW_PROJECT_STATE),
+                LeaderItem::command("r", "Reload Config", DEBUG_RELOAD_CONFIG),
+                LeaderItem::command("e", "Extensions", DEBUG_SHOW_EXTENSIONS),
+            ],
+        ),
+        LeaderItem::command("q", "Quit", APP_QUIT),
+    ]
+}
+
+/// Friendly label for an auto-created intermediate leader group, keyed by the
+/// prefix key. Falls back to a generic `+x…` marker so discovered binds always
+/// read sensibly even without a curated label.
+fn leader_group_label(key: &str) -> String {
+    match key {
+        "a" => "AI…".to_string(),
+        "g" => "Git…".to_string(),
+        _ => format!("+{key}…"),
+    }
+}
+
+/// Insert a `<leader>`-relative key path into `items`, creating intermediate
+/// groups as needed. Existing rows are never overwritten, so curated entries
+/// win over discovered keymap binds on conflict.
+fn insert_leader_path(
+    items: &mut Vec<LeaderItem>,
+    keys: &[String],
+    id: cockpit_commands::CommandId,
+    label: String,
+) {
+    let Some((first, rest)) = keys.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        if items.iter().any(|item| item.key == *first) {
+            return; // curated row already owns this key.
+        }
+        items.push(LeaderItem::command(first.clone(), label, id));
+        return;
+    }
+    if let Some(existing) = items.iter_mut().find(|item| item.key == *first) {
+        // Only recurse when the existing row is itself a group; a command
+        // already bound to this key takes precedence and the deeper bind is
+        // dropped.
+        if let cockpit_ui::LeaderKind::Group(children) = &mut existing.kind {
+            insert_leader_path(children, rest, id, label);
+        }
+        return;
+    }
+    let mut children = Vec::new();
+    insert_leader_path(&mut children, rest, id, label);
+    items.push(LeaderItem::group(
+        first.clone(),
+        leader_group_label(first),
+        children,
+    ));
+}
+
+/// Resolve a key chord to the single-key label the leader menu matches on.
+/// Returns `None` for presses with no menu representation (modifier combos).
+fn leader_menu_key(chord: &KeyChord) -> Option<String> {
+    if let Some(c) = chord_to_char(chord) {
+        if c == ' ' {
+            return Some("Space".to_string());
+        }
+        return Some(c.to_string());
+    }
+    let [stroke] = chord.strokes() else {
+        return None;
+    };
+    if stroke.modifiers().is_none() {
+        return Some(stroke.key().to_string());
+    }
+    None
+}
+
 /// Paint the modal command-palette overlay on top of the workspace.
 fn paint_palette(
     canvas: &mut Canvas<'_>,
@@ -6945,6 +7269,78 @@ fn paint_palette(
             theme.muted_text
         };
         canvas.text(panel_x + PAD, row_y + 3.0, entry.title.clone(), color, FONT);
+    }
+}
+
+/// Paint the Doom-style leader ("which-key") menu as a panel anchored to the
+/// bottom of the workspace. Each cell shows the key to press and the group or
+/// command it triggers; group labels are tinted with the accent colour.
+fn paint_leader_menu(
+    canvas: &mut Canvas<'_>,
+    theme: &Theme,
+    menu: &LeaderMenu,
+    view_width: f32,
+    view_height: f32,
+) {
+    let items = menu.items();
+    let panel_w = (view_width - 2.0 * PAD).max(0.0);
+    let panel_x = PAD;
+
+    // Lay out cells in a responsive grid sized to the window width.
+    let cell_w = 240.0_f32.min(panel_w);
+    let cols = ((panel_w / cell_w).floor() as usize).max(1);
+    let rows = items.len().div_ceil(cols).max(1);
+
+    let header_h = ROW_H + 6.0;
+    let panel_h = header_h + rows as f32 * ROW_H + PAD;
+    let panel_y = (view_height - panel_h - PAD).max(TOP_BAR_H);
+
+    canvas.rect(panel_x, panel_y, panel_w, panel_h, theme.pane_background);
+    canvas.rect(panel_x, panel_y, panel_w, 2.0, theme.accent);
+
+    let crumbs = menu.breadcrumb().join(" ");
+    let header = if crumbs.is_empty() {
+        "Leader — press a key  ·  Esc cancel".to_string()
+    } else {
+        format!("Leader {crumbs} — press a key  ·  Backspace back  ·  Esc cancel")
+    };
+    canvas.text(panel_x + PAD, panel_y + 8.0, header, theme.muted_text, FONT);
+    canvas.rect(
+        panel_x,
+        panel_y + header_h - 1.0,
+        panel_w,
+        1.0,
+        theme.pane_border,
+    );
+
+    let grid_top = panel_y + header_h + PAD * 0.5;
+    for (index, item) in items.iter().enumerate() {
+        let col = index % cols;
+        let row = index / cols;
+        let cell_x = panel_x + PAD + col as f32 * cell_w;
+        let cell_y = grid_top + row as f32 * ROW_H;
+
+        // Key cap, then a separator, then the label.
+        canvas.text(
+            cell_x,
+            cell_y + 3.0,
+            format!("{} ", item.key),
+            theme.accent,
+            FONT,
+        );
+        let key_advance = (item.key.chars().count() as f32 + 1.0) * (FONT * 0.6) + 6.0;
+        let label_color = if item.is_group() {
+            theme.accent
+        } else {
+            theme.text
+        };
+        canvas.text(
+            cell_x + key_advance,
+            cell_y + 3.0,
+            item.label.clone(),
+            label_color,
+            FONT,
+        );
     }
 }
 
@@ -7888,21 +8284,199 @@ cockpit_layout = "missing.kdl"
     fn leader_chord_substitution_lets_default_lazygit_keybind_fire() {
         let mut model = model();
         // The default config ships lazygit on `<leader>g` with `leader =
-        // "Space"`, so a focused-non-terminal `Space g` keystream should
-        // dispatch the `tool.lazygit` command.
+        // "Space"`, so a focused-non-terminal `Space g` keystream should open
+        // the leader menu and then dispatch the `tool.lazygit` command.
         let config = cockpit_config::Config::default();
         model.apply_user_config(&config);
         model.layout.focus(PaneId::Editor);
 
-        // Space alone buffers as a pending leader.
+        // Space alone opens the leader menu.
         model.dispatch(chord("Space"));
-        assert!(model.pending_leader.is_some(), "expected leader buffered");
+        assert!(model.leader_menu.is_some(), "expected leader menu open");
 
-        // The leader still wasn't routed to any local handler.
+        // `g` is merged into the menu from the keymap and runs lazygit.
         model.dispatch(chord("g"));
-        assert!(model.pending_leader.is_none(), "leader should be consumed");
+        assert!(
+            model.leader_menu.is_none(),
+            "menu should close after running a command"
+        );
         assert!(
             model.command_log.iter().any(|cmd| cmd == "tool.lazygit"),
+            "log: {:?}",
+            model.command_log,
+        );
+    }
+
+    #[test]
+    fn leader_menu_drills_into_a_group_then_runs_a_command() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        // Leader opens the which-key menu.
+        model.dispatch(chord("Space"));
+        let menu = model.leader_menu.as_ref().expect("menu open");
+        assert!(menu.items().iter().any(|item| item.key == "w"));
+
+        // `w` drills into the Window group without closing the menu.
+        model.dispatch(chord("w"));
+        let menu = model.leader_menu.as_ref().expect("menu still open");
+        assert_eq!(menu.breadcrumb(), &["w".to_string()]);
+
+        // `v` runs the split-vertical command and closes the menu.
+        model.dispatch(chord("v"));
+        assert!(model.leader_menu.is_none(), "menu should close");
+        assert!(
+            model
+                .command_log
+                .iter()
+                .any(|cmd| cmd == mux_command_ids::SPLIT_VERTICAL),
+            "log: {:?}",
+            model.command_log,
+        );
+    }
+
+    #[test]
+    fn leader_menu_escape_cancels_without_running_anything() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        model.dispatch(chord("Space"));
+        assert!(model.leader_menu.is_some());
+        model.dispatch(chord("Escape"));
+        assert!(model.leader_menu.is_none(), "escape should close the menu");
+        assert!(
+            model.status.contains("cancelled"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn leader_menu_backspace_pops_one_level_before_closing() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        model.dispatch(chord("Space"));
+        model.dispatch(chord("w"));
+        assert_eq!(
+            model.leader_menu.as_ref().expect("open").breadcrumb(),
+            &["w".to_string()]
+        );
+
+        // First backspace returns to the root, second closes the menu.
+        model.dispatch(chord("Backspace"));
+        let menu = model.leader_menu.as_ref().expect("still open at root");
+        assert!(menu.at_root());
+        model.dispatch(chord("Backspace"));
+        assert!(model.leader_menu.is_none(), "menu should close at root");
+    }
+
+    #[test]
+    fn leader_menu_unknown_key_closes_with_status() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        model.dispatch(chord("Space"));
+        // `9` is not bound at the root level.
+        model.dispatch(chord("9"));
+        assert!(model.leader_menu.is_none());
+        assert!(
+            model.status.contains("No leader binding"),
+            "status: {}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn leader_does_not_open_menu_in_terminal_focus() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Terminal);
+
+        model.dispatch(chord("Space"));
+        assert!(
+            model.leader_menu.is_none(),
+            "leader is a passthrough in the terminal"
+        );
+    }
+
+    #[test]
+    fn substitute_leader_expands_compact_multi_key_notation() {
+        let leader = Some("Space");
+        assert_eq!(substitute_leader("<leader>g", leader), "Space g");
+        assert_eq!(substitute_leader("<leader>aa", leader), "Space a a");
+        assert_eq!(substitute_leader("<leader>hs", leader), "Space h s");
+        // Whitespace in the trailing part is irrelevant.
+        assert_eq!(substitute_leader("<leader>h s", leader), "Space h s");
+        // No prefix, or no leader configured → unchanged.
+        assert_eq!(substitute_leader("Ctrl+Shift+g", leader), "Ctrl+Shift+g");
+        assert_eq!(substitute_leader("<leader>g", None), "<leader>g");
+        assert_eq!(substitute_leader("<leader>g", Some("")), "<leader>g");
+    }
+
+    #[test]
+    fn leader_menu_reaches_agents_through_a_merged_subgroup() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        // The default config ships claude-code on `<leader>aa`, which the
+        // rationalised substitution binds as `Space a a`. The merge folds it
+        // under an "AI…" subgroup, so `Space a a` is reachable through the menu.
+        model.dispatch(chord("Space"));
+        let menu = model.leader_menu.as_ref().expect("menu open");
+        let ai = menu
+            .items()
+            .iter()
+            .find(|item| item.key == "a")
+            .expect("AI group present");
+        assert_eq!(ai.label, "AI…");
+        assert!(ai.is_group());
+
+        model.dispatch(chord("a"));
+        model.dispatch(chord("a"));
+        assert!(model.leader_menu.is_none());
+        assert!(
+            model
+                .command_log
+                .iter()
+                .any(|cmd| cmd == "tool.claude-code"),
+            "log: {:?}",
+            model.command_log,
+        );
+    }
+
+    #[test]
+    fn leader_menu_send_http_request_through_merged_http_group() {
+        let mut model = model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.layout.focus(PaneId::Editor);
+
+        // HTTP binds now respect the leader: `<leader>hs` → `Space h s`.
+        model.dispatch(chord("Space"));
+        model.dispatch(chord("h"));
+        assert_eq!(
+            model.leader_menu.as_ref().expect("open").breadcrumb(),
+            &["h".to_string()]
+        );
+        model.dispatch(chord("s"));
+        assert!(model.leader_menu.is_none());
+        assert!(
+            model
+                .command_log
+                .iter()
+                .any(|cmd| cmd == http_command_ids::SEND_REQUEST),
             "log: {:?}",
             model.command_log,
         );
@@ -7922,9 +8496,8 @@ cockpit_layout = "missing.kdl"
                 ..Default::default()
             },
         );
-        // Placeholder `<leader>…` notation has no chord parser today and
-        // should be silently skipped without bringing the whole apply
-        // path down.
+        // Compact multi-key `<leader>` notation expands to a full chord:
+        // `<leader>aa` becomes the three-stroke `Space a a`.
         config.panes.tools.insert(
             "claude-code".to_string(),
             cockpit_config::ToolPaneRecipe {
@@ -7941,6 +8514,17 @@ cockpit_layout = "missing.kdl"
             RoutedInput::Command(id) => assert_eq!(id.as_str(), "tool.lazygit"),
             other => panic!("expected tool.lazygit, got {other:?}"),
         }
+
+        // The multi-key agent bind resolves as a real three-stroke chord.
+        let claude_chord = "Space a a".parse().unwrap();
+        assert_eq!(
+            model
+                .router
+                .global_keymap()
+                .resolve(&claude_chord)
+                .map(cockpit_commands::CommandId::as_str),
+            Some("tool.claude-code"),
+        );
     }
 
     #[test]
@@ -8696,13 +9280,18 @@ font  = "JetBrains Mono"
     }
 
     #[test]
-    fn editor_leader_ca_dispatches_code_action_command() {
+    fn leader_code_action_via_menu_from_normal_mode_editor() {
         let mut model = rust_model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
         model.open_path_reference("src/main.rs");
+        model.layout.focus(PaneId::Editor);
 
-        model.handle_editor_key(&chord("Space"));
-        model.handle_editor_key(&chord("c"));
-        model.handle_editor_key(&chord("a"));
+        // Normal mode by default — `Space c a` opens the menu, drills into
+        // Code…, and runs the code-action command through the command spine.
+        model.dispatch(chord("Space"));
+        model.dispatch(chord("c"));
+        model.dispatch(chord("a"));
 
         assert_eq!(
             model.command_log.back().map(String::as_str),
@@ -8711,19 +9300,46 @@ font  = "JetBrains Mono"
     }
 
     #[test]
-    fn editor_leader_cr_dispatches_rename_command() {
+    fn leader_rename_via_menu_from_normal_mode_editor() {
         let mut model = rust_model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
         model.open_path_reference("src/main.rs");
+        model.layout.focus(PaneId::Editor);
 
-        model.handle_editor_key(&chord("Space"));
-        model.handle_editor_key(&chord("c"));
-        model.handle_editor_key(&chord("r"));
+        model.dispatch(chord("Space"));
+        model.dispatch(chord("c"));
+        model.dispatch(chord("r"));
 
         assert_eq!(
             model.command_log.back().map(String::as_str),
             Some(LSP_RENAME)
         );
         assert!(model.rename_input.is_some());
+    }
+
+    #[test]
+    fn leader_does_not_steal_space_while_typing_in_the_editor() {
+        let mut model = rust_model();
+        let config = cockpit_config::Config::default();
+        model.apply_user_config(&config);
+        model.open_path_reference("src/main.rs");
+        model.layout.focus(PaneId::Editor);
+
+        // Enter insert mode, then a space must reach the buffer, not the leader.
+        model.dispatch(chord("i"));
+        model.dispatch(chord("Space"));
+
+        assert!(
+            model.leader_menu.is_none(),
+            "Space in insert mode must type, not open the leader menu"
+        );
+        let mode = model
+            .document
+            .as_ref()
+            .map(|doc| doc.editor.mode())
+            .expect("document open");
+        assert_eq!(mode, Mode::Insert, "still typing in insert mode");
     }
 
     #[test]
