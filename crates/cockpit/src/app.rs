@@ -16,6 +16,7 @@ use cockpit_analytics::{
 };
 use cockpit_commands::{KeyChord, Modifiers};
 use cockpit_config::GlobalKeys;
+use cockpit_crew::command_ids as crew_command_ids;
 use cockpit_editor::vim::{Key as VimKey, Mode};
 use cockpit_editor::{
     Editor, EditorSignal, HighlightKind, HighlightSpan, Language, TestScope, fallback_test_command,
@@ -61,9 +62,9 @@ use cockpit_ui::http::{
     default_keybindings as http_default_keybindings,
 };
 use cockpit_ui::{
-    CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, FileBrowser, FileBrowserAction,
-    FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId, Rect as UiRect, RoutedInput,
-    WorkspaceLayout, command_ids,
+    CompletionItem, CompletionPopup, ComputedLayout, ConfirmPrompt, CrewIntent, CrewView,
+    FileBrowser, FileBrowserAction, FuzzyFinder, InputRouter, Palette, PaletteEntry, PaneId,
+    Rect as UiRect, RoutedInput, WorkspaceLayout, command_ids,
 };
 
 /// Logical layout metrics. The painter scales these by the display factor.
@@ -490,6 +491,10 @@ pub struct AppModel {
     /// by `Debug: Show Extensions` to flag bad state without crawling
     /// the whole runtime.
     lua_load_errors: Vec<String>,
+    /// Agent-crew controller (v0.14): owns the active parallel-agent run, its
+    /// worktrees, and the run-id allocator. Configured from `[crew]` in
+    /// [`AppModel::apply_user_config`].
+    crew: crate::crew::CrewController,
     exit: bool,
 }
 
@@ -621,6 +626,7 @@ impl AppModel {
             lua_wake_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             lua_palette_entries: Vec::new(),
             lua_load_errors: Vec::new(),
+            crew: crate::crew::CrewController::new(),
             exit: false,
             detection,
         };
@@ -684,6 +690,7 @@ impl AppModel {
     /// owning subsystems get wired up.
     pub fn apply_user_config(&mut self, config: &cockpit_config::Config) {
         self.format_on_save = config.editor.format_on_save;
+        self.crew.configure(&config.crew);
 
         let mut prefs = self.layout.preferences().clone();
         prefs.left_width = config.ui.left_width.into();
@@ -1395,6 +1402,9 @@ impl AppModel {
         if self.run_mux_command(id) {
             return;
         }
+        if self.run_crew_command(id) {
+            return;
+        }
         match id {
             command_ids::FOCUS_FILES => self.layout.focus(PaneId::Files),
             command_ids::FOCUS_EDITOR => self.layout.focus(PaneId::Editor),
@@ -1556,6 +1566,121 @@ impl AppModel {
             }
         }
         true
+    }
+
+    /// Route a `crew.*` command to the agent-crew controller (v0.14 M14.5).
+    /// Returns `true` when the id was a crew command (handled), `false` to
+    /// fall through to the main dispatch — mirroring [`Self::run_mux_command`].
+    fn run_crew_command(&mut self, id: &str) -> bool {
+        use cockpit_crew::command_ids as crew_ids;
+        match id {
+            crew_ids::RUN_NEW => self.crew_run_new(),
+            crew_ids::RUN_CANCEL => self.crew_cancel(),
+            crew_ids::AGENT_FOCUS_NEXT => self.crew_focus(1),
+            crew_ids::AGENT_FOCUS_PREVIOUS => self.crew_focus(-1),
+            crew_ids::AGENT_PICK => self.crew_apply_focused(CrewView::pick_focused),
+            crew_ids::AGENT_DISCARD => self.crew_apply_focused(CrewView::discard_focused),
+            crew_ids::AGENT_RETRY => self.crew_apply_focused(CrewView::retry_focused),
+            crew_ids::AGENT_OPEN_DIFF => self.crew_apply_focused(CrewView::open_diff_focused),
+            crew_ids::AGENT_OPEN_TERMINAL => {
+                self.crew_apply_focused(CrewView::open_terminal_focused)
+            }
+            crew_ids::RUN_NEXT | crew_ids::RUN_PREVIOUS => {
+                self.status = "Crew: only one run at a time in v0.14.".to_string();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Start a crew run. Seeds the task from the open document, materialises
+    /// the plan, and prepares each agent's worktree (git side). Launching the
+    /// per-worktree agent PTYs is the M14.5 render leg; until then the agents
+    /// are marked running so the review flow (pick/discard/retry) is usable.
+    fn crew_run_new(&mut self) {
+        let prompt = match self.document.as_ref() {
+            Some(doc) => format!("Work on {}", doc.path.display()),
+            None => "Improve the project.".to_string(),
+        };
+        let root = self.detection.root_path.clone();
+        match self.crew.start_run(prompt, &root, self.process.as_ref()) {
+            Ok(start) => {
+                let count = start.agents.len();
+                for spawn in start.agents {
+                    // Placeholder for the live PTY spawn: flip the agent to
+                    // running so its worktree is reviewable.
+                    self.crew.mark_running(spawn.id);
+                }
+                self.status = format!(
+                    "Crew: started run {} with {count} worktree(s) — agent PTYs pending (M14.5).",
+                    start.run_id.get()
+                );
+            }
+            Err(crate::crew::CrewStartError::NoAgents) => {
+                self.status = "Crew: no agents configured under `[crew]`.".to_string();
+            }
+        }
+    }
+
+    fn crew_cancel(&mut self) {
+        match self.crew.active().map(CrewView::cancel) {
+            Some(intent) => self.crew_apply(intent),
+            None => self.status = "Crew: no active run.".to_string(),
+        }
+    }
+
+    fn crew_focus(&mut self, delta: i32) {
+        if self.crew.has_active_run() {
+            self.crew.focus(delta);
+        } else {
+            self.status = "Crew: no active run.".to_string();
+        }
+    }
+
+    /// Emit an intent from the focused agent via `emit` and apply it. When the
+    /// focused agent can't service the action (`emit` returns `None`) the
+    /// status line explains why instead of dispatching a doomed command.
+    fn crew_apply_focused(&mut self, emit: fn(&CrewView) -> Option<CrewIntent>) {
+        match self.crew.active().and_then(emit) {
+            Some(intent) => self.crew_apply(intent),
+            None => self.status = "Crew: no eligible agent for that action.".to_string(),
+        }
+    }
+
+    fn crew_apply(&mut self, intent: CrewIntent) {
+        let root = self.detection.root_path.clone();
+        let outcome = match self.crew.apply_intent(intent, &root, self.process.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.status = format!("Crew: {err}");
+                return;
+            }
+        };
+        self.status = match outcome {
+            crate::crew::CrewOutcome::NoRun => "Crew: no active run.".to_string(),
+            crate::crew::CrewOutcome::Picked { worktree, .. } => {
+                format!(
+                    "Crew: picked — worktree {} ready to integrate.",
+                    worktree.display()
+                )
+            }
+            crate::crew::CrewOutcome::Discarded(_) => "Crew: agent discarded.".to_string(),
+            crate::crew::CrewOutcome::Cancelled => "Crew: run cancelled.".to_string(),
+            crate::crew::CrewOutcome::Retried(spawn) => {
+                let worktree = spawn.worktree.display().to_string();
+                self.crew.mark_running(spawn.id);
+                format!("Crew: retrying agent in {worktree}.")
+            }
+            crate::crew::CrewOutcome::OpenDiff { worktree, .. } => {
+                format!(
+                    "Crew: diff for {} (open-in-editor pending).",
+                    worktree.display()
+                )
+            }
+            crate::crew::CrewOutcome::OpenTerminal { worktree, .. } => {
+                format!("Crew: terminal in {} (attach pending).", worktree.display())
+            }
+        };
     }
 
     fn mux_split(&mut self, dir: SplitDirection) {
@@ -6731,6 +6856,24 @@ fn palette_entries() -> Vec<PaletteEntry> {
         PaletteEntry::new(DEBUG_SHOW_MUX_STATUS, "Debug: Show Mux Status"),
         PaletteEntry::new(DEBUG_SHOW_EXTENSIONS, "Debug: Show Extensions"),
         PaletteEntry::new(DEBUG_RELOAD_EXTENSIONS, "Debug: Reload Extensions"),
+        PaletteEntry::new(crew_command_ids::RUN_NEW, "Crew: New Run"),
+        PaletteEntry::new(crew_command_ids::RUN_CANCEL, "Crew: Cancel Run"),
+        PaletteEntry::new(crew_command_ids::AGENT_PICK, "Crew: Pick Focused Agent"),
+        PaletteEntry::new(
+            crew_command_ids::AGENT_DISCARD,
+            "Crew: Discard Focused Agent",
+        ),
+        PaletteEntry::new(crew_command_ids::AGENT_RETRY, "Crew: Retry Focused Agent"),
+        PaletteEntry::new(crew_command_ids::AGENT_OPEN_DIFF, "Crew: Open Agent Diff"),
+        PaletteEntry::new(
+            crew_command_ids::AGENT_OPEN_TERMINAL,
+            "Crew: Open Agent Terminal",
+        ),
+        PaletteEntry::new(crew_command_ids::AGENT_FOCUS_NEXT, "Crew: Focus Next Agent"),
+        PaletteEntry::new(
+            crew_command_ids::AGENT_FOCUS_PREVIOUS,
+            "Crew: Focus Previous Agent",
+        ),
         PaletteEntry::new(APP_QUIT, "App: Quit"),
     ]
 }

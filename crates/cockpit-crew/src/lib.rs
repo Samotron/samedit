@@ -29,10 +29,12 @@
 //! [cmux]: https://github.com/manaflow-ai/cmux
 
 pub mod command_ids;
+pub mod orchestrate;
 pub mod run;
 pub mod spec;
 pub mod worktree;
 
+pub use orchestrate::OrchestrateError;
 pub use run::{
     AgentId, AgentRun, AgentState, BaseRef, CrewError, CrewRun, CrewTask, DiffStat, RunId,
     RunOutcome,

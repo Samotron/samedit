@@ -6,6 +6,7 @@
 //! without a display server.
 
 mod app;
+mod crew;
 mod hydration;
 mod launcher;
 mod mux_layout;

@@ -293,6 +293,32 @@ impl AgentRun {
         self.transition(self.state.is_reviewable(), AgentState::Picked)
     }
 
+    /// Internal: reset a finished-but-unpicked agent (`Failed`/`Discarded`)
+    /// back to `Pending` for a fresh attempt, swapping in a new
+    /// branch/worktree/command (the old worktree may be dirty or pruned).
+    fn reset_for_retry(
+        &mut self,
+        branch: String,
+        worktree: PathBuf,
+        command: ProcessSpec,
+    ) -> Result<(), CrewError> {
+        match self.state {
+            AgentState::Failed(_) | AgentState::Discarded => {
+                self.branch = branch;
+                self.worktree = worktree;
+                self.command = command;
+                self.diff = None;
+                self.state = AgentState::Pending;
+                Ok(())
+            }
+            _ => Err(CrewError::IllegalTransition {
+                id: self.id,
+                from: self.state.label(),
+                to: "pending",
+            }),
+        }
+    }
+
     fn transition(&mut self, allowed: bool, to: AgentState) -> Result<(), CrewError> {
         if allowed {
             self.state = to;
@@ -459,6 +485,29 @@ impl CrewRun {
         }
         self.outcome = RunOutcome::Cancelled;
         Ok(())
+    }
+
+    /// Retry a failed or discarded agent: reset it to `Pending` with a fresh
+    /// branch/worktree/command so the orchestrator can re-create its worktree
+    /// and re-spawn it. The run must still be in progress, and the agent must
+    /// be `Failed` or `Discarded` (you can't retry one that's still working or
+    /// already picked).
+    pub fn retry(
+        &mut self,
+        id: AgentId,
+        branch: impl Into<String>,
+        worktree: impl Into<PathBuf>,
+        command: ProcessSpec,
+    ) -> Result<(), CrewError> {
+        if self.outcome != RunOutcome::InProgress {
+            return Err(CrewError::AlreadyDecided(self.id));
+        }
+        let agent = self
+            .agents
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or(CrewError::UnknownAgent(id))?;
+        agent.reset_for_retry(branch.into(), worktree.into(), command)
     }
 }
 
@@ -704,6 +753,57 @@ mod tests {
         a.succeed(DiffStat::default()).unwrap();
         run.pick(AgentId::new(0)).unwrap();
         assert!(matches!(run.cancel(), Err(CrewError::AlreadyDecided(_))));
+    }
+
+    #[test]
+    fn retry_resets_a_failed_agent_to_pending() {
+        let mut run = run_with(2);
+        let a0 = run.agent_mut(AgentId::new(0)).unwrap();
+        a0.start_preparing().unwrap();
+        a0.fail("agent crashed").unwrap();
+
+        run.retry(
+            AgentId::new(0),
+            "crew/r1/0-claude-retry1",
+            PathBuf::from("/wt/r1-0-retry1"),
+            spec(),
+        )
+        .unwrap();
+
+        let a0 = run.agent(AgentId::new(0)).unwrap();
+        assert_eq!(a0.state(), &AgentState::Pending);
+        assert_eq!(a0.branch(), "crew/r1/0-claude-retry1");
+        assert_eq!(a0.worktree(), &PathBuf::from("/wt/r1-0-retry1"));
+        assert!(a0.diff_stat().is_none());
+
+        // It can now be driven to success like a fresh agent.
+        let a0 = run.agent_mut(AgentId::new(0)).unwrap();
+        a0.start_preparing().unwrap();
+        a0.mark_running().unwrap();
+        a0.succeed(DiffStat::default()).unwrap();
+    }
+
+    #[test]
+    fn cannot_retry_a_running_or_picked_agent() {
+        let mut run = run_with(1);
+        let a = run.agent_mut(AgentId::new(0)).unwrap();
+        a.start_preparing().unwrap();
+        a.mark_running().unwrap();
+        // Running → can't retry.
+        assert!(matches!(
+            run.retry(AgentId::new(0), "b", PathBuf::from("/wt/x"), spec()),
+            Err(CrewError::IllegalTransition { .. })
+        ));
+        // Drive to picked, then retry is rejected because the run is decided.
+        run.agent_mut(AgentId::new(0))
+            .unwrap()
+            .succeed(DiffStat::default())
+            .unwrap();
+        run.pick(AgentId::new(0)).unwrap();
+        assert!(matches!(
+            run.retry(AgentId::new(0), "b", PathBuf::from("/wt/x"), spec()),
+            Err(CrewError::AlreadyDecided(_))
+        ));
     }
 
     #[test]

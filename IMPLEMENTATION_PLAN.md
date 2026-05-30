@@ -3202,17 +3202,44 @@ New crate:
   `<prefix>/r<run>/<index>-<name>` branches and worktree paths, command
   resolved per agent. `AgentSpec::from_config` adapts a config entry.
 
-### Future (not yet wired — needs the binary/UI)
+### M14.4 — crew view-model (`cockpit-ui`)  ✅
 
-- **M14.4 — crew view-model** (`cockpit-ui`): the list-of-candidates pane,
-  per-agent diffstat badges, focus model. Headless (assert on the tree).
-- **M14.5 — binary wiring** (`cockpit`): the run-id allocator, the real
-  `ProcessRunner`/PTY spawn per worktree (each agent gets a `cockpit-mux`
-  pane), `crew.*` command handlers, and lowering `pick` onto the existing
-  git integration flow. This is where the non-determinism lives; the core
-  stays a pure state machine.
-- **M14.6 — retry / re-run** a single agent in a fresh worktree without
-  restarting the whole crew.
+- `CrewView` wraps a live `CrewRun` and adds a keyboard focus cursor + row
+  derivation (`CrewAgentRow` with an `AgentStatus` badge, diffstat, and
+  failure message). Intent emitters (`pick_focused`, `discard_focused`,
+  `retry_focused`, `open_diff_focused`, …) return `Option<CrewIntent>` so the
+  binary never dispatches a doomed action — pick only offers itself for a
+  succeeded agent, retry only for a failed/discarded one. Headless; asserts on
+  the row tree (spec §18.8).
+
+### M14.5 — orchestration + binary wiring  ✅
+
+- `cockpit_crew::orchestrate` (headless core): the synchronous git side the
+  binary calls at PTY lifecycle edges — `prepare_worktree`,
+  `finalize_success`, `discard`, `pick`, `cancel` — each keeping the run model
+  and the on-disk worktrees in step (a git failure on prepare rolls the agent
+  into `Failed`; pick prunes only the losers it just discarded). `FakeProcessRunner`
+  tested.
+- `cockpit::crew::CrewController` (binary): the run-id allocator, a `[crew]`
+  config snapshot (set from `apply_user_config`), and the active `CrewView`.
+  `start_run` materialises a plan and prepares the worktrees, handing back
+  `AgentSpawn`s for the app's terminal layer; `apply_intent` lowers a
+  `CrewIntent` onto the orchestrator and reports a `CrewOutcome`. Wired into
+  the command spine: `run_crew_command` routes the `crew.*` ids and the
+  palette lists every Crew command.
+- **Render leg still open:** the live agent PTYs (one `cockpit-mux` pane per
+  worktree), an interactive task-prompt entry for `crew.run.new`, the
+  side-by-side diff pane, and lowering `Picked` onto a real merge. The
+  controller already produces the `AgentSpawn`s / `CrewOutcome`s these need;
+  what remains is the winit-side plumbing, which can't be exercised headlessly.
+
+### M14.6 — single-agent retry  ✅
+
+- `CrewRun::retry` resets a `Failed`/`Discarded` agent to `Pending` with a
+  fresh branch/worktree/command; the controller re-resolves the command from
+  config (with a `-retryN` slug) and re-prepares the worktree, returning a
+  `CrewOutcome::Retried(spawn)` for the app to re-launch — no need to restart
+  the whole crew.
 
 ### Risks
 
